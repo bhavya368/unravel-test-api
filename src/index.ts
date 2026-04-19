@@ -697,6 +697,15 @@ app.get('/data/:collection/:id', async (req: Request, res: Response) => {
 
 // GET campaign Open Graph HTML for share previews (no API key; used by Facebook/crawlers and redirects users to frontend)
 const FRONTEND_BASE_FOR_OG = (process.env.FRONTEND_BASE_URL || process.env.FRONTEND_ORIGIN || '').replace(/\/$/, '');
+// Where thumbnail images are actually hosted. Always the API's own public URL, never the
+// frontend — because the UI proxies /og/ to the API via nginx, so req headers after the
+// proxy see X-Forwarded-Host: unravel.network. We must NOT use that host for resolving
+// /images/* paths (unravel.network doesn't serve those). Falls back to the known Cloud
+// Run URL; override via env in other environments.
+const API_PUBLIC_BASE = (process.env.API_PUBLIC_URL || 'https://unravel-api-297290600394.us-central1.run.app').replace(/\/$/, '');
+// Facebook App ID for share analytics attribution (Meta Ads Manager, Social Issues
+// authorization). Cleared the "Missing Properties: fb:app_id" warning in Sharing Debugger.
+const FB_APP_ID = process.env.FB_APP_ID || '1175176054476751';
 
 /**
  * Resolve a Firestore-stored `thumbnail_url` into an absolute, crawler-fetchable URL.
@@ -726,10 +735,9 @@ app.get('/og/campaign/:id', async (req: Request, res: Response) => {
     const data = doc.data() as Record<string, unknown>;
     const title = (data?.title as string) || 'Campaign';
     const description = String(data?.short_description ?? data?.tagline ?? data?.description ?? title).replace(/<[^>]*>/g, '').slice(0, 200);
-    const forwardedProto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
-    const forwardedHost = String(req.headers['x-forwarded-host'] || req.get('host') || '').split(',')[0].trim();
-    const apiBase = `${forwardedProto}://${forwardedHost}`;
-    const image = resolveThumbnailUrl(data?.thumbnail_url, apiBase);
+    // Always resolve image paths against the API's own public URL (not forwarded host —
+    // requests arrive here via nginx proxy from unravel.network, which doesn't host /images/).
+    const image = resolveThumbnailUrl(data?.thumbnail_url, API_PUBLIC_BASE);
     const canonicalUrl = FRONTEND_BASE_FOR_OG ? `${FRONTEND_BASE_FOR_OG}/campaign/${id}` : `${req.protocol}://${req.get('host')}/campaign/${id}`;
     // Use the canonical frontend URL for FB preview display.
     // Otherwise the OG endpoint URL leaks as the visible "source" domain.
@@ -753,8 +761,11 @@ app.get('/og/campaign/:id', async (req: Request, res: Response) => {
   <meta property="og:title" content="${escapeHtml(title)}">
   <meta property="og:description" content="${escapeHtml(description)}">
   <meta property="og:image" content="${escapeHtml(image)}">
+  <meta property="og:image:secure_url" content="${escapeHtml(image)}">
   <meta property="og:url" content="${escapeHtml(ogPageUrl)}">
   <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Unravel">
+  <meta property="fb:app_id" content="${escapeHtml(FB_APP_ID)}">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="${escapeHtml(title)}">
   <meta name="twitter:description" content="${escapeHtml(description)}">
