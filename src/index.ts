@@ -493,7 +493,14 @@ app.post('/users/profile', async (req: Request, res: Response) => {
       return res.status(401).json({ error: 'Invalid or expired Firebase token' });
     }
 
-    const { firstName, lastName, email } = req.body as Record<string, unknown>;
+    const {
+      firstName,
+      lastName,
+      email,
+      policiesVersion,
+      marketingEmailConsent,
+      marketingSmsConsent,
+    } = req.body as Record<string, unknown>;
     if (firstName == null || lastName == null || email == null) {
       return res.status(400).json({ error: 'firstName, lastName, and email are required' });
     }
@@ -510,16 +517,40 @@ app.post('/users/profile', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'email must match your Firebase sign-in email' });
     }
 
+    // Normalize optional consent fields. Values are only recorded if the client
+    // explicitly sends them — legacy clients without the consent fields create
+    // profiles as before (backwards-compatible). Marketing consent defaults to
+    // false when missing (TCPA/GDPR: no opt-in record = no marketing).
+    const polVersion = typeof policiesVersion === 'string' ? policiesVersion.trim().slice(0, 40) : null;
+    const marketingEmail = marketingEmailConsent === true;
+    const marketingSms = marketingSmsConsent === true;
+    // Capture consent context server-side for audit defense (TCPA / CAN-SPAM / GDPR
+    // record-keeping). Client-supplied IPs cannot be trusted.
+    const consentIp = String(
+      req.headers['x-forwarded-for'] || req.headers['x-real-ip'] || req.socket.remoteAddress || ''
+    ).split(',')[0].trim().slice(0, 64);
+    const consentUserAgent = String(req.headers['user-agent'] || '').slice(0, 500);
+
     const uid = decoded.uid;
     const ref = usersDb.collection('users').doc(uid);
     const snap = await ref.get();
     const now = new Date().toISOString();
-    const payload = {
+    const payload: Record<string, unknown> = {
       firstName: fn,
       lastName: ln,
       email: normEmail,
       updatedAt: now,
     };
+
+    // Current-state consent fields on the user doc (fast read, overwritten on each
+    // update). Only written when the client sends policiesVersion — otherwise we
+    // leave prior values intact (caller may be updating name/email only).
+    if (polVersion) {
+      payload.policiesVersion = polVersion;
+      payload.policiesAcceptedAt = now;
+      payload.marketingEmailConsent = marketingEmail;
+      payload.marketingSmsConsent = marketingSms;
+    }
 
     if (!snap.exists) {
       await ref.set({
@@ -528,6 +559,22 @@ app.post('/users/profile', async (req: Request, res: Response) => {
       });
     } else {
       await ref.update(payload);
+    }
+
+    // Append-only audit log — one document per consent event. Never updated or
+    // deleted. Use this subcollection (not the user doc fields above) as the
+    // authoritative record for TCPA / GDPR consent defense. Only written when
+    // the client explicitly supplied consent data; skips silent updates.
+    if (polVersion) {
+      await ref.collection('consents').add({
+        event: snap.exists ? 'profile_update' : 'signup',
+        policiesVersion: polVersion,
+        marketingEmailConsent: marketingEmail,
+        marketingSmsConsent: marketingSms,
+        ip: consentIp,
+        userAgent: consentUserAgent,
+        recordedAt: now,
+      });
     }
 
     res.json({ ok: true, uid, ...payload });
