@@ -744,6 +744,33 @@ app.get('/data/:collection/:id', async (req: Request, res: Response) => {
 
 // GET campaign Open Graph HTML for share previews (no API key; used by Facebook/crawlers and redirects users to frontend)
 const FRONTEND_BASE_FOR_OG = (process.env.FRONTEND_BASE_URL || process.env.FRONTEND_ORIGIN || '').replace(/\/$/, '');
+// Where thumbnail images are actually hosted. Always the API's own public URL, never the
+// frontend — because the UI proxies /og/ to the API via nginx, so req headers after the
+// proxy see X-Forwarded-Host: unravel.network. We must NOT use that host for resolving
+// /images/* paths (unravel.network doesn't serve those). Falls back to the known Cloud
+// Run URL; override via env in other environments.
+const API_PUBLIC_BASE = (process.env.API_PUBLIC_URL || 'https://unravel-api-297290600394.us-central1.run.app').replace(/\/$/, '');
+// Facebook App ID for share analytics attribution (Meta Ads Manager, Social Issues
+// authorization). Cleared the "Missing Properties: fb:app_id" warning in Sharing Debugger.
+const FB_APP_ID = process.env.FB_APP_ID || '1175176054476751';
+
+/**
+ * Resolve a Firestore-stored `thumbnail_url` into an absolute, crawler-fetchable URL.
+ * Mirrors the UI's `getImageUrl` logic (see unravel-ui/src/pages/CampaignDetailPage.jsx)
+ * so relative paths like "/images/foo.png" or bare filenames like "foo.png" don't get
+ * fed to Facebook/LinkedIn as broken `og:image` values (which cause them to render a
+ * blank preview card with no image).
+ */
+function resolveThumbnailUrl(raw: unknown, apiBase: string): string {
+  const s = typeof raw === 'string' ? raw.trim() : '';
+  const fallback = 'https://via.placeholder.com/800x400?text=Campaign';
+  if (!s) return fallback;
+  if (s.startsWith('http://') || s.startsWith('https://') || s.startsWith('data:')) return s;
+  if (s.startsWith('/')) return `${apiBase}${s}`;
+  if (!s.includes('/') && !s.includes(':')) return `${apiBase}/images/${s}`;
+  return fallback;
+}
+
 app.get('/og/campaign/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
@@ -755,18 +782,22 @@ app.get('/og/campaign/:id', async (req: Request, res: Response) => {
     const data = doc.data() as Record<string, unknown>;
     const title = (data?.title as string) || 'Campaign';
     const description = String(data?.short_description ?? data?.tagline ?? data?.description ?? title).replace(/<[^>]*>/g, '').slice(0, 200);
-    let image = (data?.thumbnail_url as string) || '';
-    if (!image || (!image.startsWith('http://') && !image.startsWith('https://'))) {
-      image = 'https://via.placeholder.com/800x400?text=Campaign';
-    }
+    // Always resolve image paths against the API's own public URL (not forwarded host —
+    // requests arrive here via nginx proxy from unravel.network, which doesn't host /images/).
+    const image = resolveThumbnailUrl(data?.thumbnail_url, API_PUBLIC_BASE);
     const canonicalUrl = FRONTEND_BASE_FOR_OG ? `${FRONTEND_BASE_FOR_OG}/campaign/${id}` : `${req.protocol}://${req.get('host')}/campaign/${id}`;
-    const forwardedProto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
-    const forwardedHost = String(req.headers['x-forwarded-host'] || req.get('host') || '').split(',')[0].trim();
     // Use the canonical frontend URL for FB preview display.
     // Otherwise the OG endpoint URL leaks as the visible "source" domain.
     const ogPageUrl = canonicalUrl;
     const ua = String(req.get('user-agent') || '').toLowerCase();
-    const isCrawler = /(facebookexternalhit|facebot|twitterbot|linkedinbot|slackbot|discordbot|whatsapp|telegrambot|pinterest|googlebot|bingbot|crawler|spider|bot)/i.test(ua);
+    // Expanded crawler match: prior regex missed some real-world share-preview UAs
+    // (Applebot for iMessage, SkypeUriPreview for Teams, embedly for Notion/Substack,
+    // redditbot, Slackbot-LinkExpanding variant, vkShare). Ordering: specific names
+    // first, generic "bot"/"crawler"/"spider" catch-all last.
+    const isCrawler = /(facebookexternalhit|facebot|twitterbot|linkedinbot|slackbot|slack-imgproxy|discordbot|whatsapp|telegrambot|pinterest|googlebot|bingbot|applebot|redditbot|skypeuripreview|embedly|vkshare|w3c_validator|qwantify|yandexbot|duckduckbot|crawler|spider|bot)/i.test(ua);
+    // Diagnostic log so we can confirm which crawler (if any) is hitting /og/campaign/:id in prod.
+    // Safe to leave on — low volume, no PII. Remove once preview-card issue is verified fixed.
+    console.log(`[og/campaign] id=${id} ua="${ua}" crawler=${isCrawler} image=${image}`);
 
     const ogHtml = `<!DOCTYPE html>
 <html lang="en">
@@ -777,8 +808,11 @@ app.get('/og/campaign/:id', async (req: Request, res: Response) => {
   <meta property="og:title" content="${escapeHtml(title)}">
   <meta property="og:description" content="${escapeHtml(description)}">
   <meta property="og:image" content="${escapeHtml(image)}">
+  <meta property="og:image:secure_url" content="${escapeHtml(image)}">
   <meta property="og:url" content="${escapeHtml(ogPageUrl)}">
   <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Unravel">
+  <meta property="fb:app_id" content="${escapeHtml(FB_APP_ID)}">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="${escapeHtml(title)}">
   <meta name="twitter:description" content="${escapeHtml(description)}">
