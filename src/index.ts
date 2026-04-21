@@ -1593,6 +1593,68 @@ function getPrimaryFrontendOrigin(): string {
   return raw.split(',')[0].trim().replace(/\/$/, '');
 }
 
+/**
+ * Admin utility: ensure an approved campaign has a Stripe Product + donation Price stored.
+ * This is used to backfill older approved campaigns that predate Stripe product creation.
+ */
+app.post('/payments/campaign/:campaignId/ensure-stripe-product', async (req: Request, res: Response) => {
+  if (!stripe) {
+    return res.status(503).json({ error: 'Stripe is not configured' });
+  }
+  try {
+    const campaignId = String(req.params.campaignId || '').trim();
+    if (!campaignId) {
+      return res.status(400).json({ error: 'campaignId is required' });
+    }
+
+    const ref = db.collection('campaigns').doc(campaignId);
+    const snap = await ref.get();
+    if (!snap.exists) {
+      return res.status(404).json({ error: 'Campaign not found' });
+    }
+    const campaign = (snap.data() || {}) as Record<string, unknown>;
+    const status = String(campaign.status || '').trim();
+    if (status !== 'Approved') {
+      return res.status(400).json({ error: 'Only approved campaigns can have Stripe products created' });
+    }
+
+    const existingPidRaw = campaign.stripe_product_id;
+    const existingPid =
+      typeof existingPidRaw === 'string' && existingPidRaw.trim().startsWith('prod_')
+        ? existingPidRaw.trim()
+        : null;
+
+    if (existingPid) {
+      const donationPriceId = await getOrCreateStripeDonationPriceId(campaignId, existingPid);
+      return res.json({
+        ok: true,
+        campaignId,
+        stripe_product_id: existingPid,
+        stripe_donation_price_id: donationPriceId,
+        reused: true,
+      });
+    }
+
+    const created = await createStripeProductForApprovedCampaign(campaignId, campaign);
+    await ref.update({
+      stripe_product_id: created.productId,
+      stripe_donation_price_id: created.donationPriceId,
+      updatedAt: new Date().toISOString(),
+    });
+
+    return res.json({
+      ok: true,
+      campaignId,
+      stripe_product_id: created.productId,
+      stripe_donation_price_id: created.donationPriceId,
+      reused: false,
+    });
+  } catch (error: any) {
+    console.error('Ensure Stripe product error:', error);
+    return res.status(500).json({ error: error?.message || 'Failed to ensure Stripe product' });
+  }
+});
+
 // GET - Return Stripe publishable key for frontend (no card data ever on server)
 app.get('/payments/config', (req: Request, res: Response) => {
   const publishableKey = process.env.STRIPE_PUBLISHABLE_KEY;
