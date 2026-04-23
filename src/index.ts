@@ -1842,6 +1842,39 @@ function getFacebookErrorMessage(error: any, step?: string): string {
   return stepPrefix + message;
 }
 
+/** Poster URL for Meta link_data.picture when the first hero slide is a YouTube embed (no imageUrl). */
+function heroSlideYoutubePosterCandidate(slide: unknown): string {
+  if (!slide || typeof slide !== 'object') return '';
+  const o = slide as Record<string, unknown>;
+  const idRaw = typeof o.youtubeVideoId === 'string' ? o.youtubeVideoId.trim() : '';
+  if (/^[\w-]{11}$/.test(idRaw)) {
+    return `https://img.youtube.com/vi/${idRaw}/maxresdefault.jpg`;
+  }
+  const url = typeof o.youtubeUrl === 'string' ? o.youtubeUrl.trim() : '';
+  if (!url) return '';
+  try {
+    let ustr = url;
+    if (!/^https?:\/\//i.test(ustr)) ustr = `https://${ustr}`;
+    const u = new URL(ustr);
+    const host = u.hostname.replace(/^www\./i, '').toLowerCase();
+    let vid = '';
+    if (host === 'youtu.be') {
+      vid = (u.pathname.slice(1).split('/')[0] || '').split('?')[0];
+    } else if (host === 'youtube.com' || host === 'm.youtube.com' || host === 'music.youtube.com') {
+      const v = u.searchParams.get('v');
+      if (v) vid = v;
+      else {
+        const m = u.pathname.match(/\/(?:shorts|embed|v)\/([\w-]{11})/);
+        if (m) vid = m[1];
+      }
+    }
+    if (/^[\w-]{11}$/.test(vid)) return `https://img.youtube.com/vi/${vid}/maxresdefault.jpg`;
+  } catch {
+    /* ignore */
+  }
+  return '';
+}
+
 /** Resolves link_data.picture like all campaign types: campaign thumbnail_url first; slideshow falls back to hero_slideshow[0].imageUrl; optional body thumbnail_url last. Absolutizes paths and rewrites localhost to API_BASE_URL. */
 function resolveCreativeImageUrlForFacebookAd(data: any, thumbnailOverride?: string): string {
   const apiPublicBase = (process.env.API_BASE_URL || '').replace(/\/$/, '');
@@ -1900,8 +1933,11 @@ function resolveCreativeImageUrlForFacebookAd(data: any, thumbnailOverride?: str
   const thumb = String(data?.thumbnail_url ?? '').trim();
   if (thumb) candidates.push(thumb);
   const slides = data?.hero_slideshow;
-  if (Array.isArray(slides) && slides[0]?.imageUrl) {
-    candidates.push(String(slides[0].imageUrl).trim());
+  if (Array.isArray(slides) && slides[0]) {
+    const s0 = slides[0] as Record<string, unknown>;
+    if (s0.imageUrl) candidates.push(String(s0.imageUrl).trim());
+    const ytPoster = heroSlideYoutubePosterCandidate(s0);
+    if (ytPoster) candidates.push(ytPoster);
   }
   if (typeof thumbnailOverride === 'string' && thumbnailOverride.trim()) {
     candidates.push(thumbnailOverride.trim());
