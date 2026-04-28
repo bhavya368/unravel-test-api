@@ -1670,7 +1670,14 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
     return res.status(503).json({ error: 'Stripe is not configured' });
   }
   try {
-    const { amount: amountCents, campaignId, currency = 'usd' } = req.body as { amount?: number; campaignId?: string; currency?: string };
+    const body = req.body as {
+      amount?: number;
+      fixedAmountCents?: number;
+      campaignId?: string;
+      currency?: string;
+      checkoutCancelPath?: string;
+    };
+    const { amount: amountCents, campaignId, currency = 'usd' } = body;
     const cur = (currency || 'usd').toLowerCase();
 
     let stripeProductId: string | undefined;
@@ -1686,15 +1693,30 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
     }
 
     if (stripeProductId) {
-      const priceId = await getOrCreateStripeDonationPriceId(cidTrim, stripeProductId);
       const base = getPrimaryFrontendOrigin();
-      const session = await stripe.checkout.sessions.create({
-        mode: 'payment',
+
+      /** Optional: lock Checkout to an exact donation (e.g. lander preset). Omit for pay-what-you-want on Stripe’s page. */
+      const fixedRaw = body.fixedAmountCents;
+      const fixedParsed =
+        typeof fixedRaw === 'number' && Number.isFinite(fixedRaw) ? Math.round(fixedRaw) : NaN;
+      const useFixedAmount =
+        Number.isFinite(fixedParsed) &&
+        fixedParsed >= DONATION_CHECKOUT_MIN_CENTS &&
+        fixedParsed <= 100_000_000; // $1M cap (cents)
+
+      const cancelRel =
+        typeof body.checkoutCancelPath === 'string' &&
+        body.checkoutCancelPath.startsWith('/') &&
+        body.checkoutCancelPath.length <= 512
+          ? body.checkoutCancelPath.trim()
+          : `/campaign/${encodeURIComponent(cidTrim)}/back`;
+
+      const sessionCommon = {
+        mode: 'payment' as const,
         client_reference_id: cidTrim,
-        line_items: [{ price: priceId, quantity: 1 }],
         success_url: `${base}/campaign/${encodeURIComponent(cidTrim)}?donation=success&session_id={CHECKOUT_SESSION_ID}`,
-        cancel_url: `${base}/campaign/${encodeURIComponent(cidTrim)}/back`,
-        submit_type: 'pay',
+        cancel_url: `${base}${cancelRel}`,
+        submit_type: 'pay' as const,
         custom_text: {
           submit: {
             message: 'Fund this campaign — complete your secure payment below.',
@@ -1710,6 +1732,29 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
             stripe_product_id: stripeProductId,
           },
         },
+      };
+
+      if (useFixedAmount) {
+        const session = await stripe.checkout.sessions.create({
+          ...sessionCommon,
+          line_items: [
+            {
+              price_data: {
+                currency: cur,
+                unit_amount: fixedParsed,
+                product: stripeProductId,
+              },
+              quantity: 1,
+            },
+          ],
+        });
+        return res.json({ checkoutUrl: session.url });
+      }
+
+      const priceId = await getOrCreateStripeDonationPriceId(cidTrim, stripeProductId);
+      const session = await stripe.checkout.sessions.create({
+        ...sessionCommon,
+        line_items: [{ price: priceId, quantity: 1 }],
       });
       return res.json({ checkoutUrl: session.url });
     }
