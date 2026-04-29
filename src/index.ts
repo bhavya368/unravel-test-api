@@ -679,8 +679,56 @@ app.get('/campaigns/approved', async (req: Request, res: Response) => {
   }
 });
 
+/** Sort key: ISO `createdAt` (campaigns / API) or Firestore `created_at` (landers console). */
+function documentCreatedMsForSort(data: Record<string, unknown>): number {
+  const ca = data.createdAt;
+  if (typeof ca === 'string' && ca) {
+    const t = new Date(ca).getTime();
+    if (!Number.isNaN(t)) return t;
+  }
+  const cat = data.created_at;
+  if (cat && typeof cat === 'object' && cat !== null && '_seconds' in cat) {
+    const s = (cat as { _seconds: number; _nanoseconds?: number })._seconds;
+    const n = (cat as { _nanoseconds?: number })._nanoseconds ?? 0;
+    return s * 1000 + Math.floor(n / 1e6);
+  }
+  if (typeof cat === 'string' && cat) {
+    const t = new Date(cat).getTime();
+    if (!Number.isNaN(t)) return t;
+  }
+  return 0;
+}
+
+function landerCreateFields(body: Record<string, unknown>): Record<string, unknown> {
+  const title = String(body.title ?? '').trim();
+  const description = String(body.description ?? '').trim();
+  const read_more_url = String(body.read_more_url ?? body.readMoreUrl ?? '').trim();
+  const image_url = String(body.image_url ?? body.imageUrl ?? '').trim();
+  let status = String(body.status ?? 'Draft').trim();
+  if (status !== 'Draft' && status !== 'Published') status = 'Draft';
+  return { title, description, read_more_url, image_url, status };
+}
+
+function landerPatchFields(body: Record<string, unknown>): Record<string, unknown> {
+  const patch: Record<string, unknown> = {};
+  if (body.title !== undefined) patch.title = String(body.title).trim();
+  if (body.description !== undefined) patch.description = String(body.description).trim();
+  if (body.read_more_url !== undefined || body.readMoreUrl !== undefined) {
+    patch.read_more_url = String(body.read_more_url ?? body.readMoreUrl ?? '').trim();
+  }
+  if (body.image_url !== undefined || body.imageUrl !== undefined) {
+    patch.image_url = String(body.image_url ?? body.imageUrl ?? '').trim();
+  }
+  if (body.status !== undefined) {
+    const s = String(body.status).trim();
+    if (s === 'Draft' || s === 'Published') patch.status = s;
+  }
+  return patch;
+}
+
 // GET all documents from a collection (sorted by newest first)
 // For campaigns, supports filtering by status: ?status=Approved|Rejected|Pending
+// For landers, supports filtering by status: ?status=Draft|Published
 app.get('/data/:collection', async (req: Request, res: Response) => {
   try {
     const { collection } = req.params;
@@ -688,8 +736,8 @@ app.get('/data/:collection', async (req: Request, res: Response) => {
     
     let snapshot;
     
-    // If filtering by status for campaigns, use Firestore query
-    if (collection === 'campaigns' && status) {
+    // If filtering by status for campaigns or landers, use Firestore query
+    if ((collection === 'campaigns' || collection === 'landers') && status) {
       snapshot = await db.collection(collection)
         .where('status', '==', status)
         .get();
@@ -703,10 +751,10 @@ app.get('/data/:collection', async (req: Request, res: Response) => {
       ...doc.data()
     }));
     
-    // Sort by createdAt (newest first), documents without createdAt go to the end
+    // Newest first: createdAt (campaigns) or created_at (landers)
     documents.sort((a: any, b: any) => {
-      const dateA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
-      const dateB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+      const dateA = documentCreatedMsForSort(a as Record<string, unknown>);
+      const dateB = documentCreatedMsForSort(b as Record<string, unknown>);
       return dateB - dateA;
     });
     
@@ -1092,7 +1140,21 @@ app.post('/data/:collection', async (req: Request, res: Response) => {
         }
       }
     }
-    
+
+    // Landers: own schema (snake_case + Firestore timestamps). No campaign moderation fields.
+    if (collection === 'landers') {
+      const lander = landerCreateFields(data as Record<string, unknown>);
+      const doc: Record<string, unknown> = {
+        ...lander,
+        created_at: FieldValue.serverTimestamp(),
+        updated_at: FieldValue.serverTimestamp(),
+      };
+      if (req.firebaseUid) doc.created_by = req.firebaseUid;
+      const docRef = await db.collection('landers').add(doc);
+      res.status(201).json({ id: docRef.id, message: 'Document created' });
+      return;
+    }
+
     const docRef = await db.collection(collection).add({
       ...data,
       ai_moderation_recommendation: aiModerationRecommendation,
@@ -1185,6 +1247,15 @@ app.put('/data/:collection/:id', async (req: Request, res: Response) => {
   try {
     const { collection, id } = req.params;
     const data = req.body as Record<string, unknown>;
+    if (collection === 'landers') {
+      const lander = landerCreateFields(data);
+      await db.collection(collection).doc(id).update({
+        ...lander,
+        updated_at: FieldValue.serverTimestamp(),
+      });
+      res.json({ message: 'Document updated' });
+      return;
+    }
     if (collection === 'campaigns' && data.slideshow_back_button_url !== undefined) {
       data.slideshow_back_button_url = sanitizeSlideshowBackButtonUrl(data.slideshow_back_button_url);
     }
@@ -1206,6 +1277,13 @@ app.patch('/data/:collection/:id', async (req: Request, res: Response) => {
   try {
     const { collection, id } = req.params;
     const data = req.body as Record<string, unknown>;
+    if (collection === 'landers') {
+      const patch = landerPatchFields(data);
+      patch.updated_at = FieldValue.serverTimestamp();
+      await db.collection(collection).doc(id).update(patch);
+      res.json({ message: 'Document updated', id });
+      return;
+    }
     if (collection === 'campaigns' && data.slideshow_back_button_url !== undefined) {
       data.slideshow_back_button_url = sanitizeSlideshowBackButtonUrl(data.slideshow_back_button_url);
     }
