@@ -812,15 +812,38 @@ const FB_APP_ID = process.env.FB_APP_ID || '1175176054476751';
 /**
  * Browser hits on /og/* redirect here (crawlers get HTML). Without FRONTEND_BASE_URL, a local
  * API on :8080 would otherwise redirect to http://localhost:8080/lander/... which does not exist.
+ *
+ * When nginx proxies /og/ to Cloud Run it sets Host to the run.app hostname but passes the
+ * public site in X-Forwarded-Host. Using req.host alone would put the API origin in og:url
+ * and redirects — LinkedIn/Meta often reject or strip previews when og:url does not match the
+ * shared link domain.
  */
 function ogRedirectBase(req: Request): string {
   if (FRONTEND_BASE_FOR_OG) return FRONTEND_BASE_FOR_OG;
+  const xfHost = String(req.get('x-forwarded-host') || '')
+    .split(',')[0]
+    .trim();
+  const xfProtoRaw = String(req.get('x-forwarded-proto') || '')
+    .split(',')[0]
+    .trim()
+    .toLowerCase();
+  if (xfHost) {
+    const proto = xfProtoRaw === 'http' ? 'http' : 'https';
+    return `${proto}://${xfHost}`;
+  }
   const hostRaw = (req.get('host') || '').toLowerCase();
   const host = hostRaw.split(':')[0];
   if (host === 'localhost' || host === '127.0.0.1') {
     return 'http://localhost:5173';
   }
   return `${req.protocol}://${req.get('host')}`;
+}
+
+/** User-agents that should receive OG HTML instead of a redirect (share preview scrapers). */
+function isSharePreviewCrawler(ua: string): boolean {
+  return /(facebookexternalhit|facebot|twitterbot|linkedinbot|slackbot|slack-imgproxy|discordbot|whatsapp|telegrambot|pinterest|googlebot|bingbot|applebot|redditbot|skypeuripreview|embedly|vkshare|w3c_validator|qwantify|yandexbot|duckduckbot|crawler|spider|bot)/i.test(
+    ua,
+  );
 }
 
 /**
@@ -858,12 +881,8 @@ app.get('/og/campaign/:id', async (req: Request, res: Response) => {
     // Use the canonical frontend URL for FB preview display.
     // Otherwise the OG endpoint URL leaks as the visible "source" domain.
     const ogPageUrl = canonicalUrl;
-    const ua = String(req.get('user-agent') || '').toLowerCase();
-    // Expanded crawler match: prior regex missed some real-world share-preview UAs
-    // (Applebot for iMessage, SkypeUriPreview for Teams, embedly for Notion/Substack,
-    // redditbot, Slackbot-LinkExpanding variant, vkShare). Ordering: specific names
-    // first, generic "bot"/"crawler"/"spider" catch-all last.
-    const isCrawler = /(facebookexternalhit|facebot|twitterbot|linkedinbot|slackbot|slack-imgproxy|discordbot|whatsapp|telegrambot|pinterest|googlebot|bingbot|applebot|redditbot|skypeuripreview|embedly|vkshare|w3c_validator|qwantify|yandexbot|duckduckbot|crawler|spider|bot)/i.test(ua);
+    const ua = String(req.get('user-agent') || '');
+    const isCrawler = isSharePreviewCrawler(ua);
     // Diagnostic log so we can confirm which crawler (if any) is hitting /og/campaign/:id in prod.
     // Safe to leave on — low volume, no PII. Remove once preview-card issue is verified fixed.
     console.log(`[og/campaign] id=${id} ua="${ua}" crawler=${isCrawler} image=${image}`);
@@ -949,8 +968,8 @@ app.get('/og/lander/:id', async (req: Request, res: Response) => {
 
     const canonicalUrl = `${ogRedirectBase(req)}/lander/${id}`;
     const ogPageUrl = canonicalUrl;
-    const ua = String(req.get('user-agent') || '').toLowerCase();
-    const isCrawler = /(facebookexternalhit|facebot|twitterbot|linkedinbot|slackbot|slack-imgproxy|discordbot|whatsapp|telegrambot|pinterest|googlebot|bingbot|applebot|redditbot|skypeuripreview|embedly|vkshare|w3c_validator|qwantify|yandexbot|duckduckbot|crawler|spider|bot)/i.test(ua);
+    const ua = String(req.get('user-agent') || '');
+    const isCrawler = isSharePreviewCrawler(ua);
     console.log(`[og/lander] id=${id} ua="${ua}" crawler=${isCrawler} campaignId=${campaignId || 'none'} image=${image}`);
 
     const ogHtml = `<!DOCTYPE html>
