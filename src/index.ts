@@ -791,7 +791,14 @@ app.get('/data/:collection/:id', async (req: Request, res: Response) => {
 });
 
 // GET campaign Open Graph HTML for share previews (no API key; used by Facebook/crawlers and redirects users to frontend)
-const FRONTEND_BASE_FOR_OG = (process.env.FRONTEND_BASE_URL || process.env.FRONTEND_ORIGIN || '').replace(/\/$/, '');
+function normalizeFrontendBaseForOg(raw: unknown): string {
+  const value = typeof raw === 'string' ? raw.trim().replace(/\/$/, '') : '';
+  if (!value) return '';
+  if (/^https?:\/\//i.test(value)) return value;
+  return `https://${value.replace(/^\/+/, '')}`;
+}
+
+const FRONTEND_BASE_FOR_OG = normalizeFrontendBaseForOg(process.env.FRONTEND_BASE_URL || process.env.FRONTEND_ORIGIN);
 // Where thumbnail images are actually hosted. Always the API's own public URL, never the
 // frontend — because the UI proxies /og/ to the API via nginx, so req headers after the
 // proxy see X-Forwarded-Host: unravel.network. We must NOT use that host for resolving
@@ -801,6 +808,20 @@ const API_PUBLIC_BASE = (process.env.API_PUBLIC_URL || 'https://unravel-api-2972
 // Facebook App ID for share analytics attribution (Meta Ads Manager, Social Issues
 // authorization). Cleared the "Missing Properties: fb:app_id" warning in Sharing Debugger.
 const FB_APP_ID = process.env.FB_APP_ID || '1175176054476751';
+
+/**
+ * Browser hits on /og/* redirect here (crawlers get HTML). Without FRONTEND_BASE_URL, a local
+ * API on :8080 would otherwise redirect to http://localhost:8080/lander/... which does not exist.
+ */
+function ogRedirectBase(req: Request): string {
+  if (FRONTEND_BASE_FOR_OG) return FRONTEND_BASE_FOR_OG;
+  const hostRaw = (req.get('host') || '').toLowerCase();
+  const host = hostRaw.split(':')[0];
+  if (host === 'localhost' || host === '127.0.0.1') {
+    return 'http://localhost:5173';
+  }
+  return `${req.protocol}://${req.get('host')}`;
+}
 
 /**
  * Resolve a Firestore-stored `thumbnail_url` into an absolute, crawler-fetchable URL.
@@ -833,7 +854,7 @@ app.get('/og/campaign/:id', async (req: Request, res: Response) => {
     // Always resolve image paths against the API's own public URL (not forwarded host —
     // requests arrive here via nginx proxy from unravel.network, which doesn't host /images/).
     const image = resolveThumbnailUrl(data?.thumbnail_url, API_PUBLIC_BASE);
-    const canonicalUrl = FRONTEND_BASE_FOR_OG ? `${FRONTEND_BASE_FOR_OG}/campaign/${id}` : `${req.protocol}://${req.get('host')}/campaign/${id}`;
+    const canonicalUrl = `${ogRedirectBase(req)}/campaign/${id}`;
     // Use the canonical frontend URL for FB preview display.
     // Otherwise the OG endpoint URL leaks as the visible "source" domain.
     const ogPageUrl = canonicalUrl;
@@ -880,6 +901,92 @@ app.get('/og/campaign/:id', async (req: Request, res: Response) => {
     res.status(500).send('Error loading campaign');
   }
 });
+
+/** Campaign id from a path or full URL containing `/campaign/:id` (matches unravel-ui lander helpers). */
+function extractCampaignIdFromUrl(raw: unknown): string | null {
+  const value = typeof raw === 'string' ? raw.trim() : '';
+  if (!value) return null;
+  const m = value.match(/\/campaign\/([^/?#]+)/);
+  return m ? decodeURIComponent(m[1]) : null;
+}
+
+app.get('/og/lander/:id', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const landerSnap = await db.collection('landers').doc(id).get();
+    if (!landerSnap.exists) {
+      res.status(404).send('Lander not found');
+      return;
+    }
+    const landerData = landerSnap.data() as Record<string, unknown>;
+    const landerStatus = String(landerData?.status ?? '').trim();
+    if (landerStatus !== 'Published') {
+      res.status(404).send('Lander not found');
+      return;
+    }
+
+    const readMore =
+      String(landerData?.read_more_url ?? landerData?.readMoreUrl ?? '').trim();
+    const campaignId = extractCampaignIdFromUrl(readMore);
+
+    let title = (landerData?.title as string) || 'Fund';
+    let description = String(landerData?.description ?? title)
+      .replace(/<[^>]*>/g, '')
+      .slice(0, 200);
+    let image = resolveThumbnailUrl(landerData?.image_url ?? landerData?.imageUrl, API_PUBLIC_BASE);
+
+    if (campaignId) {
+      const campSnap = await db.collection('campaigns').doc(campaignId).get();
+      if (campSnap.exists) {
+        const c = campSnap.data() as Record<string, unknown>;
+        title = (c?.title as string) || title;
+        description = String(c?.short_description ?? c?.tagline ?? c?.description ?? title)
+          .replace(/<[^>]*>/g, '')
+          .slice(0, 200);
+        image = resolveThumbnailUrl(c?.thumbnail_url, API_PUBLIC_BASE);
+      }
+    }
+
+    const canonicalUrl = `${ogRedirectBase(req)}/lander/${id}`;
+    const ogPageUrl = canonicalUrl;
+    const ua = String(req.get('user-agent') || '').toLowerCase();
+    const isCrawler = /(facebookexternalhit|facebot|twitterbot|linkedinbot|slackbot|slack-imgproxy|discordbot|whatsapp|telegrambot|pinterest|googlebot|bingbot|applebot|redditbot|skypeuripreview|embedly|vkshare|w3c_validator|qwantify|yandexbot|duckduckbot|crawler|spider|bot)/i.test(ua);
+    console.log(`[og/lander] id=${id} ua="${ua}" crawler=${isCrawler} campaignId=${campaignId || 'none'} image=${image}`);
+
+    const ogHtml = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${escapeHtml(title)} | Unravel</title>
+  <meta property="og:title" content="${escapeHtml(title)}">
+  <meta property="og:description" content="${escapeHtml(description)}">
+  <meta property="og:image" content="${escapeHtml(image)}">
+  <meta property="og:image:secure_url" content="${escapeHtml(image)}">
+  <meta property="og:url" content="${escapeHtml(ogPageUrl)}">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Unravel">
+  <meta property="fb:app_id" content="${escapeHtml(FB_APP_ID)}">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="${escapeHtml(title)}">
+  <meta name="twitter:description" content="${escapeHtml(description)}">
+  <meta name="twitter:image" content="${escapeHtml(image)}">
+</head>
+<body><p>${escapeHtml(title)}</p></body>
+</html>`;
+    if (isCrawler) {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.setHeader('Cache-Control', 'public, max-age=300');
+      return res.send(ogHtml);
+    }
+
+    return res.redirect(302, canonicalUrl);
+  } catch (error) {
+    console.error('OG lander error:', error);
+    res.status(500).send('Error loading lander');
+  }
+});
+
 function escapeHtml(s: string): string {
   return s
     .replace(/&/g, '&amp;')
