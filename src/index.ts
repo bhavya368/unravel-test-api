@@ -2376,6 +2376,20 @@ app.get('/facebook/campaign/:campaignId/insights', async (req: Request, res: Res
     const rows = Array.isArray(insights) ? insights : (insights ? [insights] : []);
     const dataRows = rows.map((r: any) => r._data || r);
     const summary = dataRows.length > 0 ? dataRows[0] : {};
+
+    // Persist latest impressions/clicks so GET /data/campaigns/:id returns real
+    // numbers without a second Facebook call. Fire-and-forget — never block or
+    // fail the insights response if the write fails.
+    try {
+      await db.collection('campaigns').doc(campaignId).update({
+        facebook_impressions: Number(summary.impressions ?? 0),
+        facebook_clicks: Number(summary.clicks ?? 0),
+        facebook_insights_updated_at: new Date().toISOString(),
+      });
+    } catch (persistErr) {
+      console.error('Failed to persist Facebook insights to campaign:', persistErr);
+    }
+
     return res.json({ campaignId, facebookAdId, insights: summary, rows: dataRows });
   } catch (error: any) {
     const message = error?.message || 'Failed to fetch Facebook insights';
