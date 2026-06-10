@@ -1272,6 +1272,23 @@ app.post('/data/:collection', async (req: Request, res: Response) => {
         else delete data.campaign_sources;
       }
 
+      // Ad preview overrides (optional). Trimmed + length-capped; empty values dropped.
+      if (data.ad_primary_text !== undefined && data.ad_primary_text !== null) {
+        const v = String(data.ad_primary_text).trim().slice(0, 200);
+        if (v) data.ad_primary_text = v;
+        else delete data.ad_primary_text;
+      }
+      if (data.ad_headline !== undefined && data.ad_headline !== null) {
+        const v = String(data.ad_headline).trim().slice(0, 60);
+        if (v) data.ad_headline = v;
+        else delete data.ad_headline;
+      }
+      if (data.ad_image_url !== undefined && data.ad_image_url !== null) {
+        const v = String(data.ad_image_url).trim();
+        if (v) data.ad_image_url = v;
+        else delete data.ad_image_url;
+      }
+
       // Creator UID from verified Firebase token only (not client-supplied)
       delete data.created_by;
       delete data.created_by_uid;
@@ -2234,7 +2251,7 @@ function heroSlideYoutubePosterCandidate(slide: unknown): string {
   return '';
 }
 
-/** Resolves link_data.picture like all campaign types: campaign thumbnail_url first; slideshow falls back to hero_slideshow[0].imageUrl; optional body thumbnail_url last. Absolutizes paths and rewrites localhost to API_BASE_URL. */
+/** Resolves link_data.picture like all campaign types: dedicated ad_image_url first; then campaign thumbnail_url; slideshow falls back to hero_slideshow[0].imageUrl; optional thumbnailOverride last. Absolutizes paths and rewrites localhost to API_BASE_URL. */
 function resolveCreativeImageUrlForFacebookAd(data: any, thumbnailOverride?: string): string {
   const apiPublicBase = (process.env.API_BASE_URL || '').replace(/\/$/, '');
 
@@ -2289,6 +2306,8 @@ function resolveCreativeImageUrlForFacebookAd(data: any, thumbnailOverride?: str
   };
 
   const candidates: string[] = [];
+  const adImageUrl = String(data?.ad_image_url ?? '').trim();
+  if (adImageUrl) candidates.push(adImageUrl);
   const thumb = String(data?.thumbnail_url ?? '').trim();
   if (thumb) candidates.push(thumb);
   const slides = data?.hero_slideshow;
@@ -2339,6 +2358,8 @@ async function publishFacebookAdForCampaign(
 
   const title = (data?.title as string) || 'Campaign';
   const shortDescription = String(data?.short_description ?? data?.tagline ?? data?.description ?? '');
+  const primaryText = String(data?.ad_primary_text ?? '').trim() || shortDescription;
+  const headline = String(data?.ad_headline ?? '').trim() || title;
   const imageUrl = resolveCreativeImageUrlForFacebookAd(data, thumbnailOverride);
   const landingUrl = `${frontendBaseUrl}/campaign/${campaignId}`;
 
@@ -2398,7 +2419,8 @@ status: 'PAUSED',
         page_id: pageId,
         link_data: {
           link: landingUrl,
-          message: shortDescription.slice(0, 125) || title,
+          message: primaryText.slice(0, 125) || title,
+          name: headline.slice(0, 40),
           picture: imageUrl,
           call_to_action: { type: 'LEARN_MORE', value: { link: landingUrl } },
         },
