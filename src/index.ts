@@ -2008,6 +2008,7 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
         payment_intent_data: {
           metadata: checkoutMetadata,
         },
+        allow_promotion_codes: true,
       };
 
       if (useFixedAmount) {
@@ -2074,8 +2075,10 @@ app.post('/payments/record-checkout-session', async (req: Request, res: Response
     if (!campaignId || typeof campaignId !== 'string') {
       return res.status(400).json({ error: 'Invalid session: missing campaign' });
     }
+    // Use the actual amount charged (post-coupon). Stripe already confirmed the
+    // session is paid, so a discounted total below the usual minimum is valid.
     const amountCents = session.amount_total;
-    if (amountCents == null || amountCents < 500) {
+    if (amountCents == null || amountCents < 0) {
       return res.status(400).json({ error: 'Invalid payment amount' });
     }
 
