@@ -634,10 +634,10 @@ app.get('/users/me/campaigns', async (req: Request, res: Response) => {
     const uid = decoded.uid;
     const snapshot = await db.collection('campaigns').where('created_by', '==', uid).get();
 
-    const documents = snapshot.docs.map(doc => ({
-      id: doc.id,
-      ...doc.data()
-    }));
+    const documents = snapshot.docs.map(doc => {
+      const data = { id: doc.id, ...doc.data() } as Record<string, unknown>;
+      return enrichCampaignResponse(data);
+    });
 
     documents.sort((a: any, b: any) => {
       const dateA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
@@ -700,10 +700,10 @@ app.get('/campaigns/approved', async (req: Request, res: Response) => {
       .where('status', '==', 'Approved')
       .get();
 
-    const documents = snapshot.docs.map(doc => ({
-      id: doc.id,
-      ...doc.data()
-    }));
+    const documents = snapshot.docs.map(doc => {
+      const data = { id: doc.id, ...doc.data() } as Record<string, unknown>;
+      return enrichCampaignResponse(data);
+    });
 
     documents.sort((a: any, b: any) => {
       const dateA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
@@ -736,6 +736,184 @@ function documentCreatedMsForSort(data: Record<string, unknown>): number {
     if (!Number.isNaN(t)) return t;
   }
   return 0;
+}
+
+// ============ Campaign duration / countdown ============
+
+const CAMPAIGN_DAY_MS = 24 * 60 * 60 * 1000;
+const CAMPAIGN_HOUR_MS = 60 * 60 * 1000;
+const CAMPAIGN_MAX_DURATION_DAYS = 365;
+
+function campaignTimestampToMs(value: unknown): number | null {
+  if (value == null) return null;
+  if (typeof value === 'object' && value !== null) {
+    if ('_seconds' in value) {
+      const s = (value as { _seconds: number; _nanoseconds?: number })._seconds;
+      const n = (value as { _nanoseconds?: number })._nanoseconds ?? 0;
+      return s * 1000 + Math.floor(n / 1e6);
+    }
+    if ('seconds' in value) {
+      const s = (value as { seconds: number; nanoseconds?: number }).seconds;
+      const n = (value as { nanoseconds?: number }).nanoseconds ?? 0;
+      return s * 1000 + Math.floor(n / 1e6);
+    }
+    return null;
+  }
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  const t = new Date(String(value)).getTime();
+  return Number.isNaN(t) ? null : t;
+}
+
+function getCampaignStartMsFromData(data: Record<string, unknown>): number | null {
+  return (
+    campaignTimestampToMs(data.campaign_starts_at) ??
+    campaignTimestampToMs(data.createdAt) ??
+    campaignTimestampToMs(data.creation_date) ??
+    campaignTimestampToMs(data.created_at)
+  );
+}
+
+function getCampaignDurationMs(data: Record<string, unknown>): number | null {
+  const days = Number(data.duration_days);
+  const hours = Number(data.duration_hours);
+  const hasDays = Number.isFinite(days) && days > 0;
+  const hasHours = Number.isFinite(hours) && hours > 0;
+  if (!hasDays && !hasHours) return null;
+  return (hasDays ? days * CAMPAIGN_DAY_MS : 0) + (hasHours ? hours * CAMPAIGN_HOUR_MS : 0);
+}
+
+function getCampaignEndMsFromData(data: Record<string, unknown>): number | null {
+  const durationMs = getCampaignDurationMs(data);
+  if (durationMs == null) {
+    return campaignTimestampToMs(data.campaign_ends_at);
+  }
+  const startMs = getCampaignStartMsFromData(data);
+  if (startMs == null) return null;
+  return startMs + durationMs;
+}
+
+/** Add computed countdown fields for API responses (does not mutate Firestore). */
+function enrichCampaignResponse(
+  data: Record<string, unknown>,
+  nowMs = Date.now()
+): Record<string, unknown> {
+  const endMs = getCampaignEndMsFromData(data);
+  if (endMs == null) {
+    return { ...data };
+  }
+  const remainingMs = Math.max(0, endMs - nowMs);
+  const ended = remainingMs <= 0;
+  const daysLeft = ended ? 0 : Math.ceil(remainingMs / CAMPAIGN_DAY_MS);
+  return {
+    ...data,
+    campaign_ends_at: new Date(endMs).toISOString(),
+    days_left: daysLeft,
+    campaign_ended: ended,
+  };
+}
+
+type CampaignDurationPatchResult =
+  | { ok: true; patch: Record<string, unknown>; deleteFields: string[] }
+  | { ok: false; error: string };
+
+/**
+ * Validate and normalize campaign duration fields on write.
+ * Sets `campaign_starts_at` on first approval; persists `campaign_ends_at` when duration is set.
+ */
+function applyCampaignDurationPatch(
+  body: Record<string, unknown>,
+  prev: Record<string, unknown>,
+  nowMs = Date.now()
+): CampaignDurationPatchResult {
+  const patch: Record<string, unknown> = { ...body };
+  const deleteFields: string[] = [];
+
+  if (patch.duration_days !== undefined) {
+    const d = Number(patch.duration_days);
+    if (!Number.isInteger(d) || d < 0 || d > CAMPAIGN_MAX_DURATION_DAYS) {
+      return {
+        ok: false,
+        error: `duration_days must be an integer from 0 to ${CAMPAIGN_MAX_DURATION_DAYS}`,
+      };
+    }
+    patch.duration_days = d;
+  }
+
+  if (patch.duration_hours !== undefined) {
+    const h = Number(patch.duration_hours);
+    if (!Number.isInteger(h) || h < 0 || h > 23) {
+      return { ok: false, error: 'duration_hours must be an integer from 0 to 23' };
+    }
+    patch.duration_hours = h;
+  }
+
+  if (patch.show_countdown !== undefined) {
+    patch.show_countdown = Boolean(patch.show_countdown);
+  }
+
+  if (patch.campaign_starts_at !== undefined) {
+    const raw = patch.campaign_starts_at;
+    if (raw === null || raw === '') {
+      delete patch.campaign_starts_at;
+      deleteFields.push('campaign_starts_at');
+    } else {
+      const t = new Date(String(raw)).getTime();
+      if (Number.isNaN(t)) {
+        return { ok: false, error: 'campaign_starts_at must be a valid ISO date string' };
+      }
+      patch.campaign_starts_at = new Date(t).toISOString();
+    }
+  }
+
+  const becomingApproved = patch.status === 'Approved' && prev.status !== 'Approved';
+  if (becomingApproved) {
+    const hasExplicitStart =
+      patch.campaign_starts_at !== undefined
+        ? !deleteFields.includes('campaign_starts_at')
+        : prev.campaign_starts_at != null && prev.campaign_starts_at !== '';
+    if (!hasExplicitStart) {
+      patch.campaign_starts_at = new Date(nowMs).toISOString();
+    }
+  }
+
+  const merged: Record<string, unknown> = { ...prev };
+  for (const [key, value] of Object.entries(patch)) {
+    if (!deleteFields.includes(key)) merged[key] = value;
+  }
+  for (const key of deleteFields) {
+    delete merged[key];
+  }
+
+  const endMs = getCampaignEndMsFromData(merged);
+  const durationTouched =
+    patch.duration_days !== undefined ||
+    patch.duration_hours !== undefined ||
+    patch.campaign_starts_at !== undefined ||
+    deleteFields.includes('campaign_starts_at') ||
+    becomingApproved;
+
+  if (endMs != null) {
+    patch.campaign_ends_at = new Date(endMs).toISOString();
+  } else if (durationTouched) {
+    delete patch.campaign_ends_at;
+    deleteFields.push('campaign_ends_at');
+  }
+
+  return { ok: true, patch, deleteFields };
+}
+
+function buildCampaignUpdatePayload(
+  patch: Record<string, unknown>,
+  deleteFields: string[]
+): Record<string, unknown> {
+  const updatePayload: Record<string, unknown> = {
+    ...patch,
+    updatedAt: new Date().toISOString(),
+  };
+  for (const key of deleteFields) {
+    updatePayload[key] = FieldValue.delete();
+  }
+  return updatePayload;
 }
 
 function landerCreateFields(body: Record<string, unknown>): Record<string, unknown> {
@@ -785,12 +963,10 @@ app.get('/data/:collection', async (req: Request, res: Response) => {
       snapshot = await db.collection(collection).get();
     }
     
-    const documents = snapshot.docs.map(doc => ({
-      id: doc.id,
-      ...doc.data()
-    }));
-    
-    // Newest first: createdAt (campaigns) or created_at (landers)
+    const documents = snapshot.docs.map(doc => {
+      const data = { id: doc.id, ...doc.data() } as Record<string, unknown>;
+      return collection === 'campaigns' ? enrichCampaignResponse(data) : data;
+    });
     documents.sort((a: any, b: any) => {
       const dateA = documentCreatedMsForSort(a as Record<string, unknown>);
       const dateB = documentCreatedMsForSort(b as Record<string, unknown>);
@@ -822,7 +998,10 @@ app.get('/data/:collection/:id', async (req: Request, res: Response) => {
       out.facebook_clicks = data.facebook_clicks ?? 0;
     }
 
-    res.json(out);
+    const response =
+      collection === 'campaigns' ? enrichCampaignResponse(out) : out;
+
+    res.json(response);
   } catch (error) {
     console.error('Error fetching document:', error);
     res.status(500).json({ error: 'Failed to fetch document' });
@@ -1428,7 +1607,7 @@ app.post('/data/:collection', async (req: Request, res: Response) => {
 app.put('/data/:collection/:id', async (req: Request, res: Response) => {
   try {
     const { collection, id } = req.params;
-    const data = req.body as Record<string, unknown>;
+    let data = req.body as Record<string, unknown>;
     if (collection === 'landers') {
       const lander = landerCreateFields(data);
       await db.collection(collection).doc(id).update({
@@ -1438,15 +1617,29 @@ app.put('/data/:collection/:id', async (req: Request, res: Response) => {
       res.json({ message: 'Document updated' });
       return;
     }
-    if (collection === 'campaigns' && data.slideshow_back_button_url !== undefined) {
-      data.slideshow_back_button_url = sanitizeSlideshowBackButtonUrl(data.slideshow_back_button_url);
+
+    let durationDeleteFields: string[] = [];
+    if (collection === 'campaigns') {
+      const ref = db.collection(collection).doc(id);
+      const snap = await ref.get();
+      if (!snap.exists) {
+        return res.status(404).json({ error: 'Document not found' });
+      }
+      const prev = snap.data() as Record<string, unknown>;
+      if (data.slideshow_back_button_url !== undefined) {
+        data.slideshow_back_button_url = sanitizeSlideshowBackButtonUrl(data.slideshow_back_button_url);
+      }
+      const durationResult = applyCampaignDurationPatch(data, prev);
+      if (!durationResult.ok) {
+        return res.status(400).json({ error: durationResult.error });
+      }
+      data = durationResult.patch;
+      durationDeleteFields = durationResult.deleteFields;
     }
 
-    await db.collection(collection).doc(id).update({
-      ...data,
-      updatedAt: new Date().toISOString()
-    });
-    
+    const updatePayload = buildCampaignUpdatePayload(data, durationDeleteFields);
+    await db.collection(collection).doc(id).update(updatePayload);
+
     res.json({ message: 'Document updated' });
   } catch (error) {
     console.error('Error updating document:', error);
@@ -1458,7 +1651,7 @@ app.put('/data/:collection/:id', async (req: Request, res: Response) => {
 app.patch('/data/:collection/:id', async (req: Request, res: Response) => {
   try {
     const { collection, id } = req.params;
-    const data = req.body as Record<string, unknown>;
+    let data = req.body as Record<string, unknown>;
     if (collection === 'landers') {
       const patch = landerPatchFields(data);
       patch.updated_at = FieldValue.serverTimestamp();
@@ -1466,45 +1659,55 @@ app.patch('/data/:collection/:id', async (req: Request, res: Response) => {
       res.json({ message: 'Document updated', id });
       return;
     }
-    if (collection === 'campaigns' && data.slideshow_back_button_url !== undefined) {
-      data.slideshow_back_button_url = sanitizeSlideshowBackButtonUrl(data.slideshow_back_button_url);
-    }
+
     let stripeProductId: string | undefined;
     let stripeDonationPriceId: string | undefined;
+    let durationDeleteFields: string[] = [];
 
-    // Admin approval: create a Stripe Product + pay-what-you-want Price once per campaign
-    if (collection === 'campaigns' && data.status === 'Approved' && stripe) {
+    if (collection === 'campaigns') {
       const ref = db.collection(collection).doc(id);
       const snap = await ref.get();
       if (!snap.exists) {
         return res.status(404).json({ error: 'Document not found' });
       }
       const prev = snap.data() as Record<string, unknown>;
-      const existingPid = prev.stripe_product_id;
-      if (typeof existingPid !== 'string' || !existingPid.trim()) {
-        const merged = { ...prev, ...data };
-        try {
-          const created = await createStripeProductForApprovedCampaign(id, merged);
-          stripeProductId = created.productId;
-          stripeDonationPriceId = created.donationPriceId;
-          console.log(
-            `Stripe product ${created.productId} + donation price ${created.donationPriceId} for approved campaign ${id}`
-          );
-        } catch (err: unknown) {
-          const message = err instanceof Error ? err.message : String(err);
-          console.error('Stripe product creation on approve failed:', err);
-          return res.status(502).json({
-            error: 'Could not create Stripe product; campaign was not updated.',
-            details: message,
-          });
+
+      if (data.slideshow_back_button_url !== undefined) {
+        data.slideshow_back_button_url = sanitizeSlideshowBackButtonUrl(data.slideshow_back_button_url);
+      }
+
+      const durationResult = applyCampaignDurationPatch(data, prev);
+      if (!durationResult.ok) {
+        return res.status(400).json({ error: durationResult.error });
+      }
+      data = durationResult.patch;
+      durationDeleteFields = durationResult.deleteFields;
+
+      // Admin approval: create a Stripe Product + pay-what-you-want Price once per campaign
+      if (data.status === 'Approved' && stripe) {
+        const existingPid = prev.stripe_product_id;
+        if (typeof existingPid !== 'string' || !existingPid.trim()) {
+          const merged = { ...prev, ...data };
+          try {
+            const created = await createStripeProductForApprovedCampaign(id, merged);
+            stripeProductId = created.productId;
+            stripeDonationPriceId = created.donationPriceId;
+            console.log(
+              `Stripe product ${created.productId} + donation price ${created.donationPriceId} for approved campaign ${id}`
+            );
+          } catch (err: unknown) {
+            const message = err instanceof Error ? err.message : String(err);
+            console.error('Stripe product creation on approve failed:', err);
+            return res.status(502).json({
+              error: 'Could not create Stripe product; campaign was not updated.',
+              details: message,
+            });
+          }
         }
       }
     }
 
-    const updatePayload: Record<string, unknown> = {
-      ...data,
-      updatedAt: new Date().toISOString(),
-    };
+    const updatePayload = buildCampaignUpdatePayload(data, durationDeleteFields);
     if (stripeProductId) {
       updatePayload.stripe_product_id = stripeProductId;
     }
@@ -1514,13 +1717,17 @@ app.patch('/data/:collection/:id', async (req: Request, res: Response) => {
 
     await db.collection(collection).doc(id).update(updatePayload);
 
-    res.json({
+    const responseBody: Record<string, unknown> = {
       message: 'Document updated',
       id,
       ...data,
       ...(stripeProductId ? { stripe_product_id: stripeProductId } : {}),
       ...(stripeDonationPriceId ? { stripe_donation_price_id: stripeDonationPriceId } : {}),
-    });
+    };
+
+    res.json(
+      collection === 'campaigns' ? enrichCampaignResponse(responseBody) : responseBody
+    );
   } catch (error) {
     console.error('Error updating document:', error);
     res.status(500).json({ error: 'Failed to update document' });
