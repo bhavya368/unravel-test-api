@@ -420,6 +420,26 @@ app.get('/', (req: Request, res: Response) => {
   res.send('unravel');
 });
 
+/** Public PostHog client config for the frontend (phc_ key is safe to expose). */
+app.get('/config/analytics', (_req: Request, res: Response) => {
+  const key =
+    process.env.POSTHOG_KEY?.trim() ||
+    process.env.VITE_POSTHOG_KEY?.trim() ||
+    '';
+  const host =
+    process.env.POSTHOG_HOST?.trim() ||
+    process.env.VITE_POSTHOG_HOST?.trim() ||
+    'https://us.i.posthog.com';
+  if (!key) {
+    return res.json({ enabled: false });
+  }
+  res.json({
+    enabled: true,
+    posthogKey: key,
+    posthogHost: host,
+  });
+});
+
 // API Key validation - required for all routes below (except /images/ for img src, /og/ for share previews)
 // Use header `x-api-key` only so `Authorization: Bearer <Firebase ID token>` can be used for users/campaigns.
 const validateApiKey = (req: Request, res: Response, next: NextFunction) => {
