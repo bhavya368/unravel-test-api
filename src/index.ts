@@ -9,6 +9,22 @@ import { WebClient } from '@slack/web-api';
 import { VertexAI } from '@google-cloud/vertexai';
 import { Storage } from '@google-cloud/storage';
 import Stripe from 'stripe';
+import { randomUUID } from 'crypto';
+import {
+  computeCumulativePersonalImpactSnapshot,
+  computePerCampaignPersonalImpactSnapshot,
+  formatCompactNumber,
+  normalizeImpactRangeId,
+  type CampaignRow,
+  type ContributionRow,
+} from './impactMetrics';
+import {
+  computeCumulativePersonalImpactResponse,
+  computePerCampaignPersonalImpactResponse,
+  loadSimilarCampaigns,
+  publicCampaignSummary,
+  sanitizeCampaignImpactMetricsPatch,
+} from './impactReport';
 
 declare global {
   namespace Express {
@@ -455,6 +471,10 @@ const validateApiKey = (req: Request, res: Response, next: NextFunction) => {
   if (req.path.startsWith('/og/')) {
     return next();
   }
+  // Public shareable personal impact cards (no API key for recipients)
+  if (req.path.startsWith('/public/impact/')) {
+    return next();
+  }
 
   const apiKey = req.headers['x-api-key'] as string | undefined;
 
@@ -708,6 +728,329 @@ app.get('/users/me/contributions', async (req: Request, res: Response) => {
   } catch (error) {
     console.error('GET /users/me/contributions:', error);
     res.status(500).json({ error: 'Failed to load your contributions' });
+  }
+});
+
+/** Cumulative personal impact for the signed-in user (Scope B — real contributions + campaign metrics). */
+app.get('/users/me/impact', async (req: Request, res: Response) => {
+  try {
+    const uid = await requireFirebaseUid(req, res);
+    if (!uid) return;
+
+    const rangeId = normalizeImpactRangeId(req.query.range);
+    const contributions = await loadUserContributions(uid);
+    const campaignIds = contributions
+      .map((c) => c.campaignId || c.campaign_id)
+      .filter((id): id is string => Boolean(id));
+    const campaignsById = await loadCampaignsByIds(campaignIds);
+
+    const impact = computeCumulativePersonalImpactResponse({
+      contributions,
+      campaignsById,
+      rangeId,
+    });
+
+    res.json({
+      rangeId,
+      impact,
+      isDemo: false,
+    });
+  } catch (error) {
+    console.error('GET /users/me/impact:', error);
+    res.status(500).json({ error: 'Failed to load your impact' });
+  }
+});
+
+/** Per-campaign personal impact for the signed-in user. */
+app.get('/users/me/impact/:campaignId', async (req: Request, res: Response) => {
+  try {
+    const uid = await requireFirebaseUid(req, res);
+    if (!uid) return;
+
+    const campaignId = String(req.params.campaignId || '').trim();
+    if (!campaignId) {
+      return res.status(400).json({ error: 'campaignId is required' });
+    }
+
+    const rangeId = normalizeImpactRangeId(req.query.range);
+    const contributions = await loadUserContributions(uid);
+    const campaignsById = await loadCampaignsByIds([campaignId]);
+    const campaign = campaignsById[campaignId];
+
+    if (!campaign) {
+      return res.status(404).json({ error: 'Campaign not found' });
+    }
+
+    const hasContributions = contributions.some(
+      (c) => (c.campaignId || c.campaign_id) === campaignId
+    );
+
+    if (!hasContributions) {
+      return res.json({
+        rangeId,
+        campaign: publicCampaignSummary(campaign),
+        impact: null,
+        similarCampaigns: [],
+        hasContributions: false,
+        isDemo: false,
+      });
+    }
+
+    const impact = computePerCampaignPersonalImpactResponse({
+      contributions,
+      campaign,
+      rangeId,
+    });
+
+    const backedIds = [
+      ...new Set(
+        contributions.map((c) => c.campaignId || c.campaign_id).filter((id): id is string => Boolean(id))
+      ),
+    ];
+    const backedCampaignsById =
+      backedIds.length > 1 ? await loadCampaignsByIds(backedIds) : campaignsById;
+    const hasOtherInCategory = backedIds.some(
+      (id) =>
+        id !== campaignId &&
+        backedCampaignsById[id]?.category &&
+        backedCampaignsById[id]?.category === campaign.category
+    );
+
+    let similarCampaigns: CampaignRow[] = [];
+    if (hasOtherInCategory) {
+      similarCampaigns = await loadSimilarCampaigns(db, campaignId, campaign.category);
+    }
+
+    res.json({
+      rangeId,
+      campaign: publicCampaignSummary(campaign),
+      impact,
+      similarCampaigns: similarCampaigns.map(publicCampaignSummary),
+      hasContributions: true,
+      isDemo: false,
+    });
+  } catch (error) {
+    console.error('GET /users/me/impact/:campaignId:', error);
+    res.status(500).json({ error: 'Failed to load campaign impact' });
+  }
+});
+
+/** Verify Firebase Bearer token; returns uid or sends 401. */
+async function requireFirebaseUid(req: Request, res: Response): Promise<string | null> {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) {
+    res.status(401).json({ error: 'Authorization: Bearer <Firebase ID token> required' });
+    return null;
+  }
+  const token = authHeader.slice(7).trim();
+  if (!token || token === process.env.API_KEY) {
+    res.status(401).json({ error: 'Use a Firebase ID token' });
+    return null;
+  }
+  try {
+    const decoded = await getAuth().verifyIdToken(token);
+    return decoded.uid;
+  } catch {
+    res.status(401).json({ error: 'Invalid or expired Firebase token' });
+    return null;
+  }
+}
+
+async function loadUserContributions(uid: string): Promise<ContributionRow[]> {
+  const snapshot = await usersDb.collection('users').doc(uid).collection('contributions').get();
+  return snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() })) as ContributionRow[];
+}
+
+async function loadCampaignsByIds(ids: string[]): Promise<Record<string, CampaignRow>> {
+  const unique = [...new Set(ids.filter(Boolean))];
+  const out: Record<string, CampaignRow> = {};
+  await Promise.all(
+    unique.map(async (id) => {
+      const doc = await db.collection('campaigns').doc(id).get();
+      if (doc.exists) {
+        out[id] = { id: doc.id, ...doc.data() } as CampaignRow;
+      }
+    })
+  );
+  return out;
+}
+
+type ShareCardScope = 'cumulative' | 'campaign';
+
+interface ShareCardDoc {
+  ownerUid: string;
+  scope: ShareCardScope;
+  campaignId?: string;
+  displayName: string;
+  showAmount: boolean;
+  metrics: Record<string, unknown>;
+  createdAt: string;
+  revoked: boolean;
+}
+
+/** Create a public share link for personal impact (UE-47). */
+app.post('/users/me/share-cards', async (req: Request, res: Response) => {
+  try {
+    const uid = await requireFirebaseUid(req, res);
+    if (!uid) return;
+
+    const scope = String(req.body?.scope || 'cumulative') as ShareCardScope;
+    if (scope !== 'cumulative' && scope !== 'campaign') {
+      return res.status(400).json({ error: 'scope must be cumulative or campaign' });
+    }
+    const campaignId =
+      scope === 'campaign' ? String(req.body?.campaignId || '').trim() : undefined;
+    if (scope === 'campaign' && !campaignId) {
+      return res.status(400).json({ error: 'campaignId is required for campaign scope' });
+    }
+    const showAmount = Boolean(req.body?.showAmount);
+
+    const contributions = await loadUserContributions(uid);
+    if (!contributions.length) {
+      return res.status(400).json({ error: 'No contributions found — back a campaign first to share impact' });
+    }
+
+    const campaignIds = contributions
+      .map((c) => c.campaignId || c.campaign_id)
+      .filter((id): id is string => Boolean(id));
+    const campaignsById = await loadCampaignsByIds(campaignIds);
+
+    const profileSnap = await usersDb.collection('users').doc(uid).get();
+    const profile = profileSnap.data() as { firstName?: string; lastName?: string } | undefined;
+    const displayName =
+      String(req.body?.displayName || profile?.firstName || 'A backer').trim() || 'A backer';
+
+    let metrics: Record<string, unknown>;
+    let thumbnailUrl: string | null = null;
+    let headlineTitle: string;
+
+    if (scope === 'campaign' && campaignId) {
+      const campaign = campaignsById[campaignId];
+      if (!campaign) {
+        return res.status(404).json({ error: 'Campaign not found' });
+      }
+      const snapshot = computePerCampaignPersonalImpactSnapshot({ contributions, campaign });
+      if (!snapshot) {
+        return res.status(400).json({ error: 'You have not contributed to this campaign' });
+      }
+      metrics = {
+        peopleReached: snapshot.personalReach,
+        personalViews: snapshot.personalViews,
+        personalActions: snapshot.personalActions,
+        reconsidered: snapshot.reconsidered,
+        perceptionShift: snapshot.actualPerceptionShift ?? snapshot.estimatedPerceptionShift,
+        sharePct: snapshot.sharePct,
+        campaignTitle: snapshot.campaignTitle,
+        ...(showAmount ? { totalContributedCents: snapshot.totalContributedCents } : {}),
+      };
+      thumbnailUrl = snapshot.campaignThumbnail;
+      headlineTitle = snapshot.campaignTitle;
+    } else {
+      const snapshot = computeCumulativePersonalImpactSnapshot({ contributions, campaignsById });
+      if (!snapshot.campaignsBacked) {
+        return res.status(400).json({ error: 'No impact data available yet' });
+      }
+      metrics = {
+        peopleReached: snapshot.peopleReached,
+        personalViews: snapshot.personalViews,
+        personalActions: snapshot.personalActions,
+        reconsidered: snapshot.reconsidered,
+        avgPerceptionShift: snapshot.avgPerceptionShift,
+        campaignsBacked: snapshot.campaignsBacked,
+        avgTrustScore: snapshot.avgTrustScore,
+        ...(showAmount ? { totalContributedCents: snapshot.totalContributedCents } : {}),
+      };
+      thumbnailUrl = snapshot.topCampaignThumbnail;
+      headlineTitle = `${displayName}'s impact`;
+    }
+
+    const token = randomUUID();
+    const createdAt = new Date().toISOString();
+    const doc: ShareCardDoc = {
+      ownerUid: uid,
+      scope,
+      ...(campaignId ? { campaignId } : {}),
+      displayName,
+      showAmount,
+      metrics,
+      createdAt,
+      revoked: false,
+    };
+
+    await db.collection('share_cards').doc(token).set({
+      ...doc,
+      headlineTitle,
+      thumbnailUrl,
+    });
+
+    const frontendBase = (process.env.FRONTEND_PUBLIC_URL || 'https://unravel.network').replace(/\/$/, '');
+    res.status(201).json({
+      token,
+      url: `${frontendBase}/impact/share/${token}`,
+      ogUrl: `${API_PUBLIC_BASE}/og/impact/${token}`,
+      scope,
+      displayName,
+      headlineTitle,
+      metrics,
+    });
+  } catch (error) {
+    console.error('POST /users/me/share-cards:', error);
+    res.status(500).json({ error: 'Failed to create share card' });
+  }
+});
+
+/** Revoke a personal impact share link. */
+app.delete('/users/me/share-cards/:token', async (req: Request, res: Response) => {
+  try {
+    const uid = await requireFirebaseUid(req, res);
+    if (!uid) return;
+
+    const { token } = req.params;
+    const ref = db.collection('share_cards').doc(token);
+    const snap = await ref.get();
+    if (!snap.exists) {
+      return res.status(404).json({ error: 'Share card not found' });
+    }
+    const data = snap.data() as ShareCardDoc;
+    if (data.ownerUid !== uid) {
+      return res.status(403).json({ error: 'Not allowed to revoke this share card' });
+    }
+    await ref.update({ revoked: true });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('DELETE /users/me/share-cards/:token:', error);
+    res.status(500).json({ error: 'Failed to revoke share card' });
+  }
+});
+
+/** Public read for a shareable personal impact card (no auth). */
+app.get('/public/impact/:token', async (req: Request, res: Response) => {
+  try {
+    const { token } = req.params;
+    const snap = await db.collection('share_cards').doc(token).get();
+    if (!snap.exists) {
+      return res.status(404).json({ error: 'Share card not found' });
+    }
+    const data = snap.data() as ShareCardDoc & {
+      headlineTitle?: string;
+      thumbnailUrl?: string | null;
+    };
+    if (data.revoked) {
+      return res.status(410).json({ error: 'This share link has been revoked' });
+    }
+
+    res.setHeader('Cache-Control', 'public, max-age=120');
+    res.json({
+      scope: data.scope,
+      displayName: data.displayName,
+      headlineTitle: data.headlineTitle,
+      thumbnailUrl: data.thumbnailUrl,
+      metrics: data.metrics,
+      createdAt: data.createdAt,
+    });
+  } catch (error) {
+    console.error('GET /public/impact/:token:', error);
+    res.status(500).json({ error: 'Failed to load share card' });
   }
 });
 
@@ -1244,6 +1587,75 @@ app.get('/og/lander/:id', async (req: Request, res: Response) => {
   }
 });
 
+app.get('/og/impact/:token', async (req: Request, res: Response) => {
+  try {
+    const { token } = req.params;
+    const snap = await db.collection('share_cards').doc(token).get();
+    if (!snap.exists) {
+      res.status(404).send('Share card not found');
+      return;
+    }
+    const data = snap.data() as ShareCardDoc & {
+      headlineTitle?: string;
+      thumbnailUrl?: string | null;
+    };
+    if (data.revoked) {
+      res.status(410).send('This share link has been revoked');
+      return;
+    }
+
+    const metrics = data.metrics || {};
+    const reached = formatCompactNumber(Number(metrics.peopleReached) || 0);
+    const shift = metrics.perceptionShift ?? metrics.avgPerceptionShift;
+    const shiftLabel = shift != null ? ` · +${shift}% perception shift` : '';
+    const title =
+      data.scope === 'campaign' && metrics.campaignTitle
+        ? `${data.displayName} backed "${metrics.campaignTitle}"`
+        : `${data.displayName}'s impact on Unravel`;
+    const description = `Helped reach ${reached} people${shiftLabel} through evaluated campaigns.`;
+    const image = resolveThumbnailUrl(
+      data.thumbnailUrl,
+      API_PUBLIC_BASE
+    );
+    const canonicalUrl = `${ogRedirectBase(req)}/impact/share/${token}`;
+    const ogPageUrl = canonicalUrl;
+    const ua = String(req.get('user-agent') || '');
+    const isCrawler = isSharePreviewCrawler(ua);
+
+    const ogHtml = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${escapeHtml(title)} | Unravel</title>
+  <meta property="og:title" content="${escapeHtml(title)}">
+  <meta property="og:description" content="${escapeHtml(description)}">
+  <meta property="og:image" content="${escapeHtml(image)}">
+  <meta property="og:image:secure_url" content="${escapeHtml(image)}">
+  <meta property="og:url" content="${escapeHtml(ogPageUrl)}">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Unravel">
+  <meta property="fb:app_id" content="${escapeHtml(FB_APP_ID)}">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="${escapeHtml(title)}">
+  <meta name="twitter:description" content="${escapeHtml(description)}">
+  <meta name="twitter:image" content="${escapeHtml(image)}">
+</head>
+<body><p>${escapeHtml(title)}</p></body>
+</html>`;
+    if (isCrawler) {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.setHeader('Cache-Control', 'public, max-age=300');
+      return res.send(ogHtml);
+    }
+
+    return res.redirect(302, canonicalUrl);
+  } catch (error) {
+    console.error('OG impact error:', error);
+    res.status(500).send('Error loading impact share card');
+  }
+});
+
 function escapeHtml(s: string): string {
   return s
     .replace(/&/g, '&amp;')
@@ -1702,6 +2114,12 @@ app.patch('/data/:collection/:id', async (req: Request, res: Response) => {
       }
       data = durationResult.patch;
       durationDeleteFields = durationResult.deleteFields;
+
+      const impactMetricsResult = sanitizeCampaignImpactMetricsPatch(data);
+      if (impactMetricsResult.error) {
+        return res.status(400).json({ error: impactMetricsResult.error });
+      }
+      Object.assign(data, impactMetricsResult.patch);
 
       // Admin approval: create a Stripe Product + pay-what-you-want Price once per campaign
       if (data.status === 'Approved' && stripe) {
