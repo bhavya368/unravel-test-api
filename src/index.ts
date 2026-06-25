@@ -25,6 +25,7 @@ import {
   publicCampaignSummary,
   sanitizeCampaignImpactMetricsPatch,
 } from './impactReport';
+import { runCampaignReportDrips } from './campaignReportDrips';
 
 declare global {
   namespace Express {
@@ -511,6 +512,28 @@ async function attachFirebaseUser(req: Request, res: Response, next: NextFunctio
 
 app.use(validateApiKey);
 app.use(attachFirebaseUser);
+
+// ============ CAMPAIGN REPORT DRIPS ============
+
+/**
+ * Runs the Klaviyo-triggered report drip sequence:
+ * launch/pre-live, campaign midpoint, and recap. Intended for Cloud Scheduler.
+ */
+app.post('/campaign-report-drips/run', async (req: Request, res: Response) => {
+  try {
+    const dryRun =
+      req.body?.dryRun === true ||
+      req.query.dryRun === 'true' ||
+      req.query.dryRun === '1';
+    const limit = Number(req.body?.limit ?? req.query.limit);
+    const result = await runCampaignReportDrips(db, { dryRun, limit, usersDb });
+    res.status(result.ok ? 200 : 207).json(result);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error('POST /campaign-report-drips/run:', error);
+    res.status(500).json({ error: message || 'Failed to run campaign report drips' });
+  }
+});
 
 // ============ USERS (default Firestore DB) ============
 
