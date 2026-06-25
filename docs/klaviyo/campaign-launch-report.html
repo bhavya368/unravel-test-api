@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Campaign Launch Report</title>
+  </head>
+  <body style="margin:0;padding:0;background:#f6f8fb;font-family:Inter,Arial,sans-serif;color:#0f172a;">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f6f8fb;margin:0;padding:32px 12px;">
+      <tr>
+        <td align="center">
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:640px;background:#ffffff;border:1px solid #e5e7eb;border-radius:24px;overflow:hidden;">
+            <tr>
+              <td style="padding:28px 28px 12px;">
+                <span style="display:inline-block;background:#eaf1ff;color:#2563eb;border-radius:999px;padding:7px 12px;font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;">01 - Launch</span>
+                <div style="height:4px;background:#2563eb;border-radius:999px;margin:18px 0 22px;"></div>
+                <h1 style="font-size:28px;line-height:1.12;margin:0 0 8px;font-weight:900;color:#0f172a;">Your {{ event.campaignTitle|default:'campaign' }} campaign is now live.</h1>
+                <p style="font-size:15px;line-height:1.6;margin:0;color:#475569;">We have launched your campaign and prepared the first report with spend, projected reach, and review context.</p>
+              </td>
+            </tr>
+
+            {% if event.thumbnailUrl %}
+            <tr>
+              <td style="padding:8px 28px 0;">
+                <img src="{{ event.thumbnailUrl }}" alt="{{ event.campaignTitle|default:'Campaign image' }}" width="584" style="display:block;width:100%;max-width:584px;border-radius:18px;object-fit:cover;">
+              </td>
+            </tr>
+            {% endif %}
+
+            <tr>
+              <td style="padding:24px 28px 8px;">
+                <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
+                  <tr>
+                    <td width="50%" style="padding:10px;background:#f8fafc;border-radius:14px;border-right:6px solid #ffffff;">
+                      <div style="font-size:22px;font-weight:900;color:#0f172a;">${{ event.fundingRaisedDollars|default:'0' }}</div>
+                      <div style="font-size:10px;font-weight:800;color:#64748b;letter-spacing:.06em;text-transform:uppercase;">Current Contribution</div>
+                    </td>
+                    <td width="50%" style="padding:10px;background:#f8fafc;border-radius:14px;border-left:6px solid #ffffff;">
+                      <div style="font-size:22px;font-weight:900;color:#0f172a;">{{ event.reach|default:'0' }}</div>
+                      <div style="font-size:10px;font-weight:800;color:#64748b;letter-spacing:.06em;text-transform:uppercase;">Projected Reach</div>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+
+            <tr>
+              <td style="padding:8px 28px 8px;">
+                <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f8fafc;border-radius:18px;">
+                  <tr>
+                    <td style="padding:18px;">
+                      <div style="font-size:12px;font-weight:900;color:#2563eb;letter-spacing:.08em;text-transform:uppercase;margin-bottom:8px;">Launch Report</div>
+                      <p style="font-size:14px;line-height:1.6;color:#475569;margin:0;">Sent the moment your campaign goes live. Confirms the spend, projected attributable reach, and campaign context now in review.</p>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+
+            <tr>
+              <td align="center" style="padding:20px 28px 32px;">
+                <a href="{{ event.campaignUrl }}" style="display:inline-block;background:#2563eb;color:#ffffff;text-decoration:none;font-size:14px;font-weight:900;border-radius:999px;padding:14px 22px;">View Campaign</a>
+                <a href="{{ event.impactUrl }}" style="display:inline-block;color:#2563eb;text-decoration:none;font-size:14px;font-weight:900;margin-left:14px;">Open Report</a>
+              </td>
+            </tr>
+          </table>
+          <p style="font-size:12px;line-height:1.5;color:#94a3b8;margin:18px 0 0;">Unravel campaign reporting</p>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>
