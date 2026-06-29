@@ -30,7 +30,10 @@ export interface CampaignRow {
   amount_raised?: number;
   funding_raised?: number;
   facebook_impressions?: number;
+  facebook_reach?: number;
   facebook_clicks?: number;
+  facebook_inline_link_clicks?: number;
+  facebook_total_actions?: number;
   reach?: number;
   perception_shift?: number;
   perception_shift_actual?: number;
@@ -50,6 +53,7 @@ export interface InsightsPayload {
     impressions?: number;
     reach?: number;
     clicks?: number;
+    inline_link_clicks?: number;
   };
 }
 
@@ -86,11 +90,15 @@ export function getCampaignBudgetCents(campaign: CampaignRow): number {
 
 export function getCampaignReach(campaign: CampaignRow, insights?: InsightsPayload | null): SourcedMetric {
   const raw = insights?.insights ?? insights;
-  const fbReach = Number((raw as { reach?: number; impressions?: number })?.reach ?? (raw as { impressions?: number })?.impressions ?? 0);
+  const fbReach = Number((raw as { reach?: number })?.reach ?? 0);
   if (fbReach > 0) return { value: fbReach, source: 'actual' };
 
-  const stored = Number(campaign?.facebook_impressions ?? campaign?.reach ?? 0);
-  if (stored > 0) return { value: stored, source: 'actual' };
+  const storedReach = Number(campaign?.facebook_reach ?? campaign?.reach ?? 0);
+  if (storedReach > 0) return { value: storedReach, source: 'actual' };
+
+  // Legacy campaigns may only have impressions persisted before reach was tracked.
+  const legacyImpressions = Number(campaign?.facebook_impressions ?? 0);
+  if (legacyImpressions > 0) return { value: legacyImpressions, source: 'actual' };
 
   const budgetDollars = getCampaignBudgetCents(campaign) / 100;
   return { value: Math.round(budgetDollars * REACH_PER_DOLLAR), source: 'estimated' };
@@ -118,11 +126,17 @@ export function getCampaignActions(
   insights?: InsightsPayload | null
 ): SourcedMetric {
   const raw = insights?.insights ?? insights;
-  const clicks = Number((raw as { clicks?: number })?.clicks ?? 0);
+  const inlineClicks = Number((raw as { inline_link_clicks?: number })?.inline_link_clicks ?? 0);
+  const clicks = Number((raw as { clicks?: number })?.clicks ?? 0) || inlineClicks;
   if (clicks > 0) return { value: clicks, source: 'actual' };
 
-  const stored = Number(campaign?.facebook_clicks ?? 0);
-  if (stored > 0) return { value: stored, source: 'actual' };
+  const storedActions = Number(
+    campaign?.facebook_inline_link_clicks ??
+      campaign?.facebook_total_actions ??
+      campaign?.facebook_clicks ??
+      0
+  );
+  if (storedActions > 0) return { value: storedActions, source: 'actual' };
 
   const reach = getCampaignReach(campaign, insights).value;
   return { value: Math.round(reach * 0.033), source: 'estimated' };

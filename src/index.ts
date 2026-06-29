@@ -26,6 +26,12 @@ import {
   sanitizeCampaignImpactMetricsPatch,
 } from './impactReport';
 import { runCampaignReportDrips } from './campaignReportDrips';
+import {
+  fetchFacebookAdInsights,
+  insightsToCampaignPatch,
+  syncAllPublishedCampaignFacebookInsights,
+  syncCampaignFacebookInsights,
+} from './facebookInsights';
 
 declare global {
   namespace Express {
@@ -1380,8 +1386,13 @@ app.get('/data/:collection/:id', async (req: Request, res: Response) => {
     const out: Record<string, unknown> = { id: doc.id, ...data };
 
     if (collection === 'campaigns' && data?.facebook_ad_id) {
+      out.facebook_reach = data.facebook_reach ?? 0;
       out.facebook_impressions = data.facebook_impressions ?? 0;
       out.facebook_clicks = data.facebook_clicks ?? 0;
+      out.facebook_inline_link_clicks = data.facebook_inline_link_clicks ?? 0;
+      out.facebook_frequency = data.facebook_frequency ?? null;
+      out.facebook_spend = data.facebook_spend ?? null;
+      out.facebook_insights_updated_at = data.facebook_insights_updated_at ?? null;
     }
 
     const response =
@@ -3162,36 +3173,97 @@ app.get('/facebook/campaign/:campaignId/insights', async (req: Request, res: Res
       return res.status(404).json({ error: 'Campaign has not been published to Facebook' });
     }
 
-    const bizSdk = require('facebook-nodejs-business-sdk');
-    bizSdk.FacebookAdsApi.init(accessToken);
-    const Ad = bizSdk.Ad;
-    const ad = new Ad(facebookAdId);
+    const { summary, rows } = await fetchFacebookAdInsights(facebookAdId, accessToken);
 
-    const fields = ['impressions', 'reach', 'clicks', 'spend', 'cpc', 'cpm', 'ctr'];
-    const params: Record<string, unknown> = { date_preset: 'maximum' };
-    const insights = await ad.getInsights(fields, params);
-
-    const rows = Array.isArray(insights) ? insights : (insights ? [insights] : []);
-    const dataRows = rows.map((r: any) => r._data || r);
-    const summary = dataRows.length > 0 ? dataRows[0] : {};
-
-    // Persist latest impressions/clicks so GET /data/campaigns/:id returns real
-    // numbers without a second Facebook call. Fire-and-forget — never block or
-    // fail the insights response if the write fails.
+    // Persist latest metrics so GET /data/campaigns/:id and impact reports use real numbers.
     try {
-      await db.collection('campaigns').doc(campaignId).update({
-        facebook_impressions: Number(summary.impressions ?? 0),
-        facebook_clicks: Number(summary.clicks ?? 0),
-        facebook_insights_updated_at: new Date().toISOString(),
-      });
+      await db.collection('campaigns').doc(campaignId).update(insightsToCampaignPatch(summary));
     } catch (persistErr) {
       console.error('Failed to persist Facebook insights to campaign:', persistErr);
     }
 
-    return res.json({ campaignId, facebookAdId, insights: summary, rows: dataRows });
+    return res.json({
+      campaignId,
+      facebookAdId,
+      insights: {
+        impressions: summary.impressions,
+        reach: summary.reach,
+        frequency: summary.frequency,
+        inline_link_clicks: summary.inlineLinkClicks,
+        clicks: summary.clicks,
+        spend: summary.spend,
+        cpc: summary.cpc,
+        cpm: summary.cpm,
+        ctr: summary.ctr,
+        cost_per_inline_link_click: summary.costPerInlineLinkClick,
+        objective: summary.objective,
+        results: summary.objectiveResults,
+        result_rate: summary.objectiveResultRate,
+        video_p75_watched_actions: summary.videoP75Watched,
+        total_actions: summary.totalActions,
+        actions: summary.actions,
+      },
+      rows,
+    });
   } catch (error: any) {
     const message = error?.message || 'Failed to fetch Facebook insights';
     console.error('Facebook insights error:', message, error);
+    return res.status(500).json({ error: message });
+  }
+});
+
+/** Sync Meta ad insights for one published campaign (includes audience breakdowns). */
+app.post('/facebook/campaign/:campaignId/sync-insights', async (req: Request, res: Response) => {
+  const accessToken = process.env.FACEBOOK_ACCESS_TOKEN;
+  if (!accessToken) {
+    return res.status(503).json({ error: 'Facebook is not configured' });
+  }
+  try {
+    const { campaignId } = req.params;
+    const includeBreakdowns = req.body?.includeBreakdowns !== false;
+    const result = await syncCampaignFacebookInsights(db, campaignId, { includeBreakdowns });
+    return res.json({
+      campaignId: result.campaignId,
+      facebookAdId: result.facebookAdId,
+      insights: insightsToCampaignPatch(result.summary),
+      breakdowns: Object.fromEntries(
+        Object.entries(result.breakdowns).map(([key, rows]) => [key, rows?.length ?? 0])
+      ),
+    });
+  } catch (error: any) {
+    const message = error?.message || 'Failed to sync Facebook insights';
+    console.error('Facebook sync-insights error:', message, error);
+    const status = message.includes('not found') ? 404 : 500;
+    return res.status(status).json({ error: message });
+  }
+});
+
+/** Bulk sync Meta insights for all campaigns with facebook_ad_id (Cloud Scheduler / admin). */
+app.post('/facebook/sync-insights', async (req: Request, res: Response) => {
+  const accessToken = process.env.FACEBOOK_ACCESS_TOKEN;
+  if (!accessToken) {
+    return res.status(503).json({ error: 'Facebook is not configured' });
+  }
+  try {
+    const limit = Number(req.body?.limit ?? req.query.limit);
+    const includeBreakdowns = req.body?.includeBreakdowns === true || req.query.includeBreakdowns === 'true';
+    const result = await syncAllPublishedCampaignFacebookInsights(db, { limit, includeBreakdowns });
+    return res.json({
+      synced: result.synced.length,
+      skipped: result.skipped.length,
+      errors: result.errors.length,
+      campaigns: result.synced.map((item) => ({
+        campaignId: item.campaignId,
+        reach: item.summary.reach,
+        impressions: item.summary.impressions,
+        inlineLinkClicks: item.summary.inlineLinkClicks,
+      })),
+      skippedDetails: result.skipped,
+      errorDetails: result.errors,
+    });
+  } catch (error: any) {
+    const message = error?.message || 'Failed to sync Facebook insights';
+    console.error('Facebook bulk sync-insights error:', message, error);
     return res.status(500).json({ error: message });
   }
 });
