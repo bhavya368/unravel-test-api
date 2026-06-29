@@ -65,13 +65,19 @@ export function sanitizeCampaignImpactMetricsPatch(
 
 export function buildInsightsFromCampaign(campaign: CampaignRow): InsightsPayload | null {
   const impressions = Number(campaign.facebook_impressions ?? 0);
-  const clicks = Number(campaign.facebook_clicks ?? 0);
-  if (!impressions && !clicks) return null;
+  const reach = Number(campaign.facebook_reach ?? campaign.reach ?? 0) || impressions;
+  const inlineLinkClicks = Number(campaign.facebook_inline_link_clicks ?? 0);
+  const clicks =
+    Number(campaign.facebook_clicks ?? 0) ||
+    inlineLinkClicks ||
+    Number(campaign.facebook_total_actions ?? 0);
+  if (!impressions && !reach && !clicks) return null;
   return {
     insights: {
       impressions,
-      reach: impressions,
+      reach,
       clicks,
+      inline_link_clicks: inlineLinkClicks || clicks,
     },
   };
 }

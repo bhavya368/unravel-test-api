@@ -32,9 +32,29 @@ Written on successful Stripe checkout when the donor was signed in (`donorUid`).
 |-------|------|--------|
 | `funding_goal` | number | Campaign create / admin |
 | `funding_current` | number | Checkout transactions |
-| `facebook_impressions` | number | `GET /facebook/campaign/:id/insights` |
+| `facebook_reach` | number | Meta insights sync (`GET/POST /facebook/.../insights`) |
+| `facebook_impressions` | number | Same |
 | `facebook_clicks` | number | Same |
+| `facebook_inline_link_clicks` | number | Same — preferred for impact "actions" |
+| `facebook_frequency` | number? | Same |
+| `facebook_spend` | number? | Same |
+| `facebook_cpm` | number? | Same |
+| `facebook_objective` | string? | Same |
+| `facebook_objective_results` | number? | Same |
+| `facebook_video_p75_watched` | number? | Same |
+| `facebook_total_actions` | number? | Sum of Meta `actions` array |
+| `facebook_actions` | array? | `{ action_type, value }[]` from Meta |
 | `facebook_insights_updated_at` | string? | Same |
+
+### `campaigns/{id}/facebook_insight_breakdowns/{type}`
+
+Audience breakdown rows from Meta (`age`, `gender`, `publisher_platform`, `dma`).
+
+| Field | Type | Notes |
+|-------|------|--------|
+| `breakdownType` | string | e.g. `age` |
+| `rows` | array | `{ breakdownValue, impressions, reach, inlineLinkClicks, clicks, spend }[]` |
+| `updatedAt` | string | ISO timestamp |
 | `trust_score` | number | Admin / moderation |
 | `category` | string | Campaign metadata |
 | `thumbnail_url` | string? | Campaign media |
@@ -89,6 +109,9 @@ Created by `POST /users/me/share-cards`. Public read via `GET /public/impact/:to
 | POST | `/users/me/share-cards` | Firebase + API key |
 | GET | `/public/impact/:token` | None |
 | DELETE | `/users/me/share-cards/:token` | Firebase + API key |
+| GET | `/facebook/campaign/:id/insights` | API key |
+| POST | `/facebook/campaign/:id/sync-insights` | API key — full sync + breakdowns |
+| POST | `/facebook/sync-insights` | API key — bulk sync all published campaigns |
 
 `range` query: `all` (default), `30d`, `90d`, `365d`, `month`.
 

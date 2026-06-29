@@ -7,6 +7,7 @@ import {
   getCampaignViews,
   type CampaignRow,
 } from './impactMetrics';
+import { refreshCampaignFacebookInsightsIfStale } from './facebookInsights';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const HOUR_MS = 60 * 60 * 1000;
@@ -478,7 +479,17 @@ export async function runCampaignReportDrips(db: Firestore, options: CampaignRep
       continue;
     }
 
+    let campaignData = campaign.data;
+    const refreshed = await refreshCampaignFacebookInsightsIfStale(db, campaign.id, campaignData);
+    if (refreshed) {
+      const refreshedDoc = await db.collection('campaigns').doc(campaign.id).get();
+      if (refreshedDoc.exists) {
+        campaignData = refreshedDoc.data() as Record<string, unknown>;
+      }
+    }
+
     try {
+      const report = buildReport(campaign.id, campaignData, stage, timing, nowMs);
       await sendKlaviyoReportEvent(profile, report);
       await markStageSent(db, campaign.id, stage, profile, report, nowMs);
       results.push({
