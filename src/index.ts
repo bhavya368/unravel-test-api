@@ -721,6 +721,146 @@ app.get('/users/me/campaigns', async (req: Request, res: Response) => {
   }
 });
 
+// ============ CAMPAIGN DRAFTS ============
+// Drafts are pre-submission work-in-progress campaigns. They live in their own
+// `campaign_drafts` collection so they never enter moderation, Slack, the bias wheel,
+// the public feed, or the admin queue. On submit the client creates a real campaign
+// (which runs the full pipeline) and then deletes the draft.
+
+const DRAFTS_COLLECTION = 'campaign_drafts';
+
+/** Server-controlled fields a client must not set/override on a draft. */
+const DRAFT_PROTECTED_FIELDS = [
+  'id',
+  'created_by',
+  'created_by_uid',
+  'createdAt',
+  'created_at',
+  'updatedAt',
+  'updated_at',
+  'status',
+];
+
+/** Strip server-controlled fields; keep the rest of the form payload as-is for lossless restore. */
+function sanitizeDraftInput(body: Record<string, unknown>): Record<string, unknown> {
+  const clean: Record<string, unknown> = { ...body };
+  for (const field of DRAFT_PROTECTED_FIELDS) {
+    delete clean[field];
+  }
+  return clean;
+}
+
+/** List the current user's drafts, newest updated first. */
+app.get('/users/me/drafts', async (req: Request, res: Response) => {
+  const uid = await requireFirebaseUid(req, res);
+  if (!uid) return;
+  try {
+    const snapshot = await db.collection(DRAFTS_COLLECTION).where('created_by', '==', uid).get();
+    const drafts = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+    drafts.sort((a: Record<string, unknown>, b: Record<string, unknown>) => {
+      const ta = a.updatedAt ? new Date(String(a.updatedAt)).getTime() : 0;
+      const tb = b.updatedAt ? new Date(String(b.updatedAt)).getTime() : 0;
+      return tb - ta;
+    });
+    res.json(drafts);
+  } catch (error) {
+    console.error('GET /users/me/drafts:', error);
+    res.status(500).json({ error: 'Failed to load your drafts' });
+  }
+});
+
+/** Create a new draft owned by the current user. */
+app.post('/users/me/drafts', async (req: Request, res: Response) => {
+  const uid = await requireFirebaseUid(req, res);
+  if (!uid) return;
+  try {
+    const now = new Date().toISOString();
+    const doc = {
+      ...sanitizeDraftInput((req.body ?? {}) as Record<string, unknown>),
+      created_by: uid,
+      created_by_uid: uid,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const ref = await db.collection(DRAFTS_COLLECTION).add(doc);
+    res.status(201).json({ id: ref.id, message: 'Draft created', updatedAt: now });
+  } catch (error) {
+    console.error('POST /users/me/drafts:', error);
+    res.status(500).json({ error: 'Failed to create draft' });
+  }
+});
+
+/** Fetch a single draft (owner only). */
+app.get('/users/me/drafts/:id', async (req: Request, res: Response) => {
+  const uid = await requireFirebaseUid(req, res);
+  if (!uid) return;
+  try {
+    const snap = await db.collection(DRAFTS_COLLECTION).doc(req.params.id).get();
+    if (!snap.exists) {
+      return res.status(404).json({ error: 'Draft not found' });
+    }
+    const data = snap.data() as Record<string, unknown>;
+    if (data.created_by !== uid) {
+      return res.status(403).json({ error: 'You do not have access to this draft' });
+    }
+    res.json({ id: snap.id, ...data });
+  } catch (error) {
+    console.error('GET /users/me/drafts/:id:', error);
+    res.status(500).json({ error: 'Failed to load draft' });
+  }
+});
+
+/** Update a draft (owner only). Replaces form fields; server-controlled fields are protected. */
+app.patch('/users/me/drafts/:id', async (req: Request, res: Response) => {
+  const uid = await requireFirebaseUid(req, res);
+  if (!uid) return;
+  try {
+    const ref = db.collection(DRAFTS_COLLECTION).doc(req.params.id);
+    const snap = await ref.get();
+    if (!snap.exists) {
+      return res.status(404).json({ error: 'Draft not found' });
+    }
+    if ((snap.data() as Record<string, unknown>).created_by !== uid) {
+      return res.status(403).json({ error: 'You do not have access to this draft' });
+    }
+    const now = new Date().toISOString();
+    await ref.set(
+      {
+        ...sanitizeDraftInput((req.body ?? {}) as Record<string, unknown>),
+        created_by: uid,
+        created_by_uid: uid,
+        updatedAt: now,
+      },
+      { merge: true }
+    );
+    res.json({ id: ref.id, message: 'Draft updated', updatedAt: now });
+  } catch (error) {
+    console.error('PATCH /users/me/drafts/:id:', error);
+    res.status(500).json({ error: 'Failed to update draft' });
+  }
+});
+
+/** Delete a draft (owner only). */
+app.delete('/users/me/drafts/:id', async (req: Request, res: Response) => {
+  const uid = await requireFirebaseUid(req, res);
+  if (!uid) return;
+  try {
+    const ref = db.collection(DRAFTS_COLLECTION).doc(req.params.id);
+    const snap = await ref.get();
+    if (!snap.exists) {
+      return res.json({ message: 'Draft deleted' });
+    }
+    if ((snap.data() as Record<string, unknown>).created_by !== uid) {
+      return res.status(403).json({ error: 'You do not have access to this draft' });
+    }
+    await ref.delete();
+    res.json({ message: 'Draft deleted' });
+  } catch (error) {
+    console.error('DELETE /users/me/drafts/:id:', error);
+    res.status(500).json({ error: 'Failed to delete draft' });
+  }
+});
+
 /** Donations made by the current user (Checkout sessions linked via `donorUid` metadata). */
 app.get('/users/me/contributions', async (req: Request, res: Response) => {
   try {
