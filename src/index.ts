@@ -2603,6 +2603,41 @@ app.get('/payments/config', (req: Request, res: Response) => {
   res.json({ publishableKey });
 });
 
+/** Coerce a value to a trimmed Stripe-metadata-safe string (<=500 chars), or undefined. */
+function sanitizeMetaValue(v: unknown): string | undefined {
+  if (typeof v !== 'string') return undefined;
+  const t = v.trim();
+  if (!t) return undefined;
+  return t.length > 500 ? t.slice(0, 500) : t;
+}
+
+/**
+ * Return a Stripe Customer id for the given Firebase user, creating one (stamped with
+ * firebase_uid + email) on first use and caching it on the user profile. Non-fatal:
+ * returns undefined on any error so checkout still proceeds. (UE-154)
+ */
+async function ensureStripeCustomer(uid: string, email?: string): Promise<string | undefined> {
+  if (!stripe) return undefined;
+  try {
+    const userRef = usersDb.collection('users').doc(uid);
+    const snap = await userRef.get();
+    const existing = snap.exists
+      ? (snap.data() as Record<string, unknown>)?.stripe_customer_id
+      : undefined;
+    if (typeof existing === 'string' && existing.trim()) return existing.trim();
+
+    const customer = await stripe.customers.create({
+      ...(email ? { email } : {}),
+      metadata: { firebase_uid: uid },
+    });
+    await userRef.set({ stripe_customer_id: customer.id }, { merge: true });
+    return customer.id;
+  } catch (err) {
+    console.error('ensureStripeCustomer failed (non-fatal):', err);
+    return undefined;
+  }
+}
+
 // POST - Create payment: Stripe Checkout (pay-what-you-want Price on Product) when campaign has stripe_product_id; else PaymentIntent + Elements
 app.post('/payments/create-payment-intent', async (req: Request, res: Response) => {
   if (!stripe) {
@@ -2615,6 +2650,9 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
       campaignId?: string;
       currency?: string;
       checkoutCancelPath?: string;
+      promoCode?: string;
+      posthogDistinctId?: string;
+      utm?: Record<string, unknown>;
     };
     const { amount: amountCents, campaignId, currency = 'usd' } = body;
     const cur = (currency || 'usd').toLowerCase();
@@ -2638,13 +2676,38 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
         typeof req.firebaseEmail === 'string' && req.firebaseEmail.trim()
           ? req.firebaseEmail.trim().toLowerCase()
           : undefined;
+      // UE-154: stamp the Checkout Session with a canonical identity + coupon-tracking
+      // metadata so a redemption is fully recoverable from the webhook.
+      const promoCode = sanitizeMetaValue(body.promoCode);
+      const posthogDistinctId = sanitizeMetaValue(body.posthogDistinctId);
+      const utmIn = body.utm && typeof body.utm === 'object' ? body.utm : {};
+      const utmSource = sanitizeMetaValue(utmIn.utm_source);
+      const utmCampaign = sanitizeMetaValue(utmIn.utm_campaign);
+      const isGuest = !donorUid;
+
+      // Canonical distinct id everywhere: Firebase UID for logged-in users, else the
+      // guest's PostHog distinct id. campaignId is preserved in metadata (below).
+      const canonicalRef = donorUid || posthogDistinctId || undefined;
+
       const checkoutMetadata: Record<string, string> = {
-        campaignId: cidTrim,
+        campaignId: cidTrim, // kept for the existing /payments/record-checkout-session consumer
+        campaign_id: cidTrim, // canonical key per the Eng Brief
         stripe_product_id: stripeProductId,
+        is_guest: isGuest ? 'true' : 'false',
       };
       if (donorUid) {
-        checkoutMetadata.donorUid = donorUid;
+        checkoutMetadata.donorUid = donorUid; // existing key
+        checkoutMetadata.firebase_uid = donorUid; // canonical key per the Eng Brief
       }
+      if (promoCode) checkoutMetadata.promo_code = promoCode;
+      if (posthogDistinctId) checkoutMetadata.posthog_distinct_id = posthogDistinctId;
+      if (utmSource) checkoutMetadata.utm_source = utmSource;
+      if (utmCampaign) checkoutMetadata.utm_campaign = utmCampaign;
+
+      // Stamp a reusable Stripe Customer with firebase_uid + email (logged-in only).
+      const stripeCustomerId = donorUid
+        ? await ensureStripeCustomer(donorUid, donorEmail)
+        : undefined;
 
       /** Optional: lock Checkout to an exact donation (e.g. lander preset). Omit for pay-what-you-want on Stripe’s page. */
       const fixedRaw = body.fixedAmountCents;
@@ -2664,11 +2727,16 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
 
       const sessionCommon = {
         mode: 'payment' as const,
-        client_reference_id: cidTrim,
+        ...(canonicalRef ? { client_reference_id: canonicalRef } : {}),
         success_url: `${base}/campaign/${encodeURIComponent(cidTrim)}?donation=success&session_id={CHECKOUT_SESSION_ID}`,
         cancel_url: `${base}${cancelRel}`,
         submit_type: 'pay' as const,
-        ...(donorEmail ? { customer_email: donorEmail } : {}),
+        // A stamped Customer and customer_email are mutually exclusive in Checkout.
+        ...(stripeCustomerId
+          ? { customer: stripeCustomerId }
+          : donorEmail
+            ? { customer_email: donorEmail }
+            : {}),
         custom_text: {
           submit: {
             message: 'Fund this campaign — complete your secure payment below.',
