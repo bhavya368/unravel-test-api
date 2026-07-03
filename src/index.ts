@@ -9,6 +9,7 @@ import { WebClient } from '@slack/web-api';
 import { VertexAI } from '@google-cloud/vertexai';
 import { Storage } from '@google-cloud/storage';
 import Stripe from 'stripe';
+import { PostHog } from 'posthog-node';
 import { randomUUID } from 'crypto';
 import {
   computeCumulativePersonalImpactSnapshot,
@@ -67,6 +68,169 @@ const storage = new Storage({ projectId: 'unravelreserchagent' });
 // Stripe (optional - only if keys are set)
 const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
 const stripe = stripeSecretKey ? new Stripe(stripeSecretKey) : null;
+
+// Server-side PostHog (UE-155). Uses the public project key (phc_...) — that is exactly
+// what event ingestion needs; the personal/read key is only for the query API. Lazy so
+// missing config is a no-op rather than a crash.
+let posthogClient: PostHog | null = null;
+let posthogInitDone = false;
+function getPostHog(): PostHog | null {
+  if (posthogInitDone) return posthogClient;
+  posthogInitDone = true;
+  const key = (process.env.POSTHOG_KEY || process.env.VITE_POSTHOG_KEY || '').trim();
+  if (!key) {
+    console.warn('[PostHog] POSTHOG_KEY not set — server-side events will be skipped');
+    return null;
+  }
+  const host = (process.env.POSTHOG_HOST || process.env.VITE_POSTHOG_HOST || 'https://us.i.posthog.com').trim();
+  posthogClient = new PostHog(key, { host, flushAt: 1, flushInterval: 0 });
+  return posthogClient;
+}
+
+/** Normalized fields for a coupon-tracking backing, from either webhook event. */
+interface BackingInput {
+  idKey: string; // stable dedup key — the PaymentIntent id (shared by both events)
+  campaignId: string | null;
+  firebaseUid: string | null;
+  distinctId: string | null; // canonical PostHog id (UID or guest distinct_id)
+  isGuest: boolean;
+  email: string | null;
+  stripeCustomerId: string | null;
+  promoCode: string | null;
+  amountTotal: number; // cents, post-discount
+  amountDiscount: number; // cents
+  utmSource: string | null;
+  utmCampaign: string | null;
+  source: string; // which event produced this
+}
+
+/**
+ * UE-155: idempotently persist a `coupon_backings/{idKey}` record and emit exactly one
+ * PostHog `backing_completed` event. Keyed on the PaymentIntent id so the primary event
+ * (checkout.session.completed) and the backstop (payment_intent.succeeded) collapse to
+ * one record + one event. Deliberately does not touch funding_current/contributions.
+ */
+async function upsertBacking(input: BackingInput): Promise<void> {
+  if (!input.idKey) return;
+  const ref = db.collection('coupon_backings').doc(input.idKey);
+
+  let isNew = false;
+  await db.runTransaction(async (t) => {
+    const snap = await t.get(ref);
+    if (snap.exists) return; // already processed (retry or the other event) — no double-count
+    isNew = true;
+    t.set(ref, {
+      payment_intent_id: input.idKey,
+      campaign_id: input.campaignId,
+      firebase_uid: input.firebaseUid,
+      posthog_distinct_id: input.distinctId,
+      stripe_customer_id: input.stripeCustomerId,
+      email: input.email,
+      promo_code: input.promoCode,
+      is_guest: input.isGuest,
+      amount_total: input.amountTotal,
+      amount_discount: input.amountDiscount,
+      utm_source: input.utmSource,
+      utm_campaign: input.utmCampaign,
+      source: input.source,
+      created_at: new Date().toISOString(),
+    });
+  });
+
+  if (!isNew) return; // only the first delivery emits the event
+
+  // Best-effort is_first_backing for logged-in users: any earlier coupon backing?
+  let isFirstBacking = false;
+  if (input.firebaseUid) {
+    try {
+      const prior = await db
+        .collection('coupon_backings')
+        .where('firebase_uid', '==', input.firebaseUid)
+        .limit(2)
+        .get();
+      isFirstBacking = prior.size <= 1; // only the one we just wrote
+    } catch {
+      /* leave false on query error */
+    }
+  }
+
+  const ph = getPostHog();
+  if (ph && input.distinctId) {
+    ph.capture({
+      distinctId: input.distinctId,
+      event: 'backing_completed',
+      properties: {
+        promo_code: input.promoCode,
+        coupon_value: input.amountDiscount,
+        amount_total: input.amountTotal,
+        amount_discount: input.amountDiscount,
+        campaign_id: input.campaignId,
+        is_guest: input.isGuest,
+        is_first_backing: isFirstBacking,
+        utm_source: input.utmSource,
+        utm_campaign: input.utmCampaign,
+      },
+    });
+    try {
+      await ph.flush();
+    } catch {
+      /* non-fatal */
+    }
+  } else {
+    console.warn('[webhook] backing_completed not emitted (no PostHog key or distinctId)');
+  }
+}
+
+const cleanStr = (v: unknown): string | null =>
+  typeof v === 'string' && v.trim() ? v.trim() : null;
+
+/** Primary path: full identity + discount available on the session payload. */
+async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session): Promise<void> {
+  if (session.payment_status !== 'paid') return;
+  const md = session.metadata || {};
+  const firebaseUid = cleanStr(md.firebase_uid) || cleanStr(md.donorUid);
+  await upsertBacking({
+    // Dedup on the PaymentIntent id (shared with the backstop); fall back to session id.
+    idKey: (typeof session.payment_intent === 'string' && session.payment_intent) || session.id,
+    campaignId: cleanStr(md.campaign_id) || cleanStr(md.campaignId),
+    firebaseUid,
+    distinctId: cleanStr(session.client_reference_id) || cleanStr(md.posthog_distinct_id) || firebaseUid,
+    isGuest: md.is_guest === 'true',
+    email: cleanStr(session.customer_details?.email),
+    stripeCustomerId: typeof session.customer === 'string' ? session.customer : cleanStr(session.customer?.id),
+    // Pre-applied lander codes live in metadata. User-typed-code readback is a follow-up ticket.
+    promoCode: cleanStr(md.promo_code),
+    amountTotal: session.amount_total ?? 0,
+    amountDiscount: session.total_details?.amount_discount ?? 0,
+    utmSource: cleanStr(md.utm_source),
+    utmCampaign: cleanStr(md.utm_campaign),
+    source: 'checkout.session.completed',
+  });
+}
+
+/** Backstop: fires if the session event never arrives. PI carries our metadata (set via
+ * payment_intent_data.metadata in UE-154) but no client_reference_id or discount breakdown. */
+async function handlePaymentIntentSucceeded(pi: Stripe.PaymentIntent): Promise<void> {
+  const md = pi.metadata || {};
+  const campaignId = cleanStr(md.campaign_id) || cleanStr(md.campaignId);
+  if (!campaignId) return; // not one of our campaign checkouts
+  const firebaseUid = cleanStr(md.firebase_uid) || cleanStr(md.donorUid);
+  await upsertBacking({
+    idKey: pi.id,
+    campaignId,
+    firebaseUid,
+    distinctId: firebaseUid || cleanStr(md.posthog_distinct_id),
+    isGuest: md.is_guest === 'true',
+    email: cleanStr(pi.receipt_email),
+    stripeCustomerId: typeof pi.customer === 'string' ? pi.customer : cleanStr(pi.customer?.id),
+    promoCode: cleanStr(md.promo_code),
+    amountTotal: pi.amount_received ?? pi.amount ?? 0,
+    amountDiscount: 0, // not available on the PaymentIntent; the session event carries the real value
+    utmSource: cleanStr(md.utm_source),
+    utmCampaign: cleanStr(md.utm_campaign),
+    source: 'payment_intent.succeeded',
+  });
+}
 
 /** Stripe Product.images only accept publicly reachable HTTPS URLs (not http://localhost). */
 function campaignImageUrlsForStripe(thumbnailUrl: unknown, apiBaseUrl: string): string[] {
@@ -436,6 +600,45 @@ app.use(cors({
   credentials: true
 }));
 app.use(morgan('dev'));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UE-155: Stripe webhook. MUST be registered BEFORE express.json() (Stripe
+// signature verification needs the raw request body) and BEFORE validateApiKey
+// (Stripe sends no x-api-key). Reads everything from the event payload — it does
+// NOT re-retrieve/reuse the Checkout Session, so it can't double-count against the
+// existing /payments/record-checkout-session flow.
+// ─────────────────────────────────────────────────────────────────────────────
+app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (req: Request, res: Response) => {
+  if (!stripe) return res.status(503).send('Stripe not configured');
+  const webhookSecret = (process.env.STRIPE_WEBHOOK_SECRET || '').trim();
+  if (!webhookSecret) {
+    console.error('[webhook] STRIPE_WEBHOOK_SECRET not set');
+    return res.status(500).send('Webhook secret not configured');
+  }
+  const sig = req.headers['stripe-signature'];
+  let event: Stripe.Event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body as Buffer, sig as string, webhookSecret);
+  } catch (err: any) {
+    console.error('[webhook] signature verification failed:', err?.message);
+    return res.status(400).send(`Webhook Error: ${err?.message}`);
+  }
+
+  try {
+    if (event.type === 'checkout.session.completed') {
+      await handleCheckoutSessionCompleted(event.data.object as Stripe.Checkout.Session);
+    } else if (event.type === 'payment_intent.succeeded') {
+      await handlePaymentIntentSucceeded(event.data.object as Stripe.PaymentIntent);
+    }
+    // All other events: acknowledged and ignored.
+  } catch (err: any) {
+    // 500 tells Stripe to retry (handled idempotently on redelivery).
+    console.error('[webhook] handler error:', err?.message);
+    return res.status(500).send('handler error');
+  }
+  return res.status(200).json({ received: true });
+});
+
 app.use(express.json({ limit: '50mb' }));  // Increased limit for base64 images
 
 // Health check (no auth required)
