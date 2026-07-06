@@ -3,6 +3,10 @@
  * Field list aligned with the Meta metrics spec (dimensions, breakdowns, metrics, actions).
  */
 import type { Firestore } from 'firebase-admin/firestore';
+import {
+  computeEngagementActions,
+  computePerceptionShiftFromMetaActions,
+} from './impactKpi';
 
 /** Core metrics fetched at ad level for impact reporting. */
 export const META_IMPACT_INSIGHT_FIELDS = [
@@ -48,6 +52,12 @@ export interface NormalizedFacebookInsights {
   objectiveResults: number;
   objectiveResultRate: number;
   videoP75Watched: number;
+  postEngagement: number;
+  videoViews: number;
+  engagementActions: number;
+  perceptionShiftScore: number;
+  perceptionShiftSource: 'actual' | 'estimated';
+  isVideoAd: boolean;
   totalActions: number;
   actions: MetaActionRow[];
   raw: Record<string, unknown>;
@@ -95,16 +105,32 @@ function parseVideoP75(raw: unknown): number {
   return actions.reduce((sum, row) => sum + row.value, 0);
 }
 
+function getActionValue(actions: MetaActionRow[], type: string): number {
+  const key = type.toLowerCase();
+  const row = actions.find((a) => a.action_type.toLowerCase() === key);
+  return row?.value ?? 0;
+}
+
 /** Normalize a single Meta insights API row into impact-report numbers. */
 export function normalizeFacebookInsightRow(row: unknown): NormalizedFacebookInsights {
   const data = insightRowData(row);
   const actions = parseActions(data.actions);
   const inlineLinkClicks = toNumber(data.inline_link_clicks);
   const clicks = toNumber(data.clicks) || inlineLinkClicks;
-  const totalActions = sumActionValues(actions) || clicks;
+  const impressions = toNumber(data.impressions);
+  const videoP75Watched = parseVideoP75(data.video_p75_watched_actions);
+  const postEngagement = getActionValue(actions, 'post_engagement');
+  const videoViews = getActionValue(actions, 'video_view');
+  const engagementActions = computeEngagementActions(actions, {
+    storedPostEngagement: postEngagement,
+    storedVideoViews: videoViews,
+    fallbackInlineClicks: inlineLinkClicks,
+  });
+  const perception = computePerceptionShiftFromMetaActions(actions, impressions, videoP75Watched);
+  const totalActions = engagementActions || sumActionValues(actions) || clicks;
 
   return {
-    impressions: toNumber(data.impressions),
+    impressions,
     reach: toNumber(data.reach),
     frequency: toNumber(data.frequency),
     inlineLinkClicks,
@@ -117,7 +143,13 @@ export function normalizeFacebookInsightRow(row: unknown): NormalizedFacebookIns
     objective: typeof data.objective === 'string' ? data.objective : null,
     objectiveResults: toNumber(data.results),
     objectiveResultRate: toNumber(data.result_rate),
-    videoP75Watched: parseVideoP75(data.video_p75_watched_actions),
+    videoP75Watched,
+    postEngagement,
+    videoViews,
+    engagementActions,
+    perceptionShiftScore: perception.score,
+    perceptionShiftSource: perception.source,
+    isVideoAd: perception.signals.isVideoAd,
     totalActions,
     actions,
     raw: data,
@@ -141,6 +173,12 @@ export function insightsToCampaignPatch(summary: NormalizedFacebookInsights): Re
     facebook_objective_results: summary.objectiveResults,
     facebook_objective_result_rate: summary.objectiveResultRate,
     facebook_video_p75_watched: summary.videoP75Watched,
+    facebook_post_engagement: summary.postEngagement,
+    facebook_video_views: summary.videoViews,
+    facebook_engagement_actions: summary.engagementActions,
+    facebook_perception_shift_score: summary.perceptionShiftScore,
+    facebook_perception_shift_source: summary.perceptionShiftSource,
+    facebook_is_video_ad: summary.isVideoAd,
     facebook_total_actions: summary.totalActions,
     facebook_actions: summary.actions,
     facebook_insights_updated_at: new Date().toISOString(),

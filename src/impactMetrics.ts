@@ -1,5 +1,17 @@
-/** Platform heuristics — matches unravel-ui `impactMetrics.js`. */
+import {
+  computeEngagementActions,
+  computePerceptionShiftFromMetaActions,
+  getCampaignTotalContributionCents,
+  parseFacebookActions,
+  type MetaActionRow,
+} from './impactKpi';
+
+/** Platform heuristics — used when Meta ad data is unavailable. */
 export const REACH_PER_DOLLAR = 10;
+export const AD_VIEWS_PER_DOLLAR = 10;
+export const ACTIONS_PER_AD_VIEW = 0.033;
+
+export { getCampaignTotalContributionCents };
 
 export type MetricSource = 'actual' | 'estimated';
 
@@ -33,6 +45,16 @@ export interface CampaignRow {
   facebook_reach?: number;
   facebook_clicks?: number;
   facebook_inline_link_clicks?: number;
+  facebook_engagement_actions?: number;
+  facebook_post_engagement?: number;
+  facebook_video_views?: number;
+  facebook_video_p75_watched?: number;
+  facebook_perception_shift_score?: number;
+  facebook_perception_shift_source?: string;
+  facebook_is_video_ad?: boolean;
+  facebook_actions?: MetaActionRow[];
+  facebook_out_of_bubble_impressions?: number;
+  facebook_escaped_impressions?: number;
   facebook_total_actions?: number;
   reach?: number;
   perception_shift?: number;
@@ -54,7 +76,27 @@ export interface InsightsPayload {
     reach?: number;
     clicks?: number;
     inline_link_clicks?: number;
+    engagement_actions?: number;
   };
+}
+
+function getStoredFacebookActions(campaign: CampaignRow): MetaActionRow[] {
+  return parseFacebookActions(campaign.facebook_actions);
+}
+
+function getCampaignImpressions(
+  campaign: CampaignRow,
+  insights?: InsightsPayload | null
+): SourcedMetric {
+  const raw = insights?.insights ?? insights;
+  const impressions = Number((raw as { impressions?: number })?.impressions ?? 0);
+  if (impressions > 0) return { value: impressions, source: 'actual' };
+
+  const stored = Number(campaign?.facebook_impressions ?? 0);
+  if (stored > 0) return { value: stored, source: 'actual' };
+
+  const budgetDollars = getCampaignTotalContributionCents(campaign) / 100;
+  return { value: Math.round(budgetDollars * AD_VIEWS_PER_DOLLAR), source: 'estimated' };
 }
 
 function estimatePerceptionShift(trustScore: number | undefined): number {
@@ -70,6 +112,17 @@ export function getCampaignPerceptionShift(campaign: CampaignRow): number {
     (campaign as Record<string, unknown>)?.actual_perception_shift;
   if (actual != null && Number.isFinite(Number(actual))) return Number(actual);
 
+  const storedScore = Number(campaign?.facebook_perception_shift_score ?? 0);
+  if (storedScore > 0) return storedScore;
+
+  const actions = getStoredFacebookActions(campaign);
+  const impressions = Number(campaign?.facebook_impressions ?? 0);
+  const videoP75 = Number(campaign?.facebook_video_p75_watched ?? 0);
+  if (actions.length && impressions > 0) {
+    const computed = computePerceptionShiftFromMetaActions(actions, impressions, videoP75);
+    if (computed.score > 0) return computed.score;
+  }
+
   const estimated =
     campaign?.perception_shift ??
     campaign?.perceptionShift ??
@@ -79,13 +132,57 @@ export function getCampaignPerceptionShift(campaign: CampaignRow): number {
   return estimatePerceptionShift(campaign?.trust_score);
 }
 
+export function getCampaignPerceptionShiftSource(campaign: CampaignRow): MetricSource {
+  const actual =
+    campaign?.perception_shift_actual ??
+    campaign?.perceptionShiftActual ??
+    (campaign as Record<string, unknown>)?.actual_perception_shift;
+  if (actual != null && Number.isFinite(Number(actual))) return 'actual';
+
+  if (
+    Number(campaign?.facebook_perception_shift_score ?? 0) > 0 &&
+    campaign?.facebook_perception_shift_source === 'actual'
+  ) {
+    return 'actual';
+  }
+
+  const actions = getStoredFacebookActions(campaign);
+  if (actions.length && Number(campaign?.facebook_impressions ?? 0) > 0) {
+    return 'actual';
+  }
+
+  return 'estimated';
+}
+
 export function getCampaignBudgetCents(campaign: CampaignRow): number {
-  const goal = Number(campaign?.funding_goal) || 0;
-  const raised =
-    Number(
-      campaign?.funding_current ?? campaign?.amount_raised ?? campaign?.funding_raised ?? 0
-    ) || 0;
-  return Math.max(goal, raised) * 100;
+  return getCampaignTotalContributionCents(campaign);
+}
+
+/** Ad Views = Meta impressions (times the ad was seen). */
+export function getCampaignAdViews(
+  campaign: CampaignRow,
+  insights?: InsightsPayload | null
+): SourcedMetric {
+  return getCampaignImpressions(campaign, insights);
+}
+
+/** Out-of-bubble / Escaped ad views default to total ad views until audience splits are stored. */
+export function getCampaignOutOfBubbleAdViews(
+  campaign: CampaignRow,
+  insights?: InsightsPayload | null
+): SourcedMetric {
+  const stored = Number(campaign?.facebook_out_of_bubble_impressions ?? 0);
+  if (stored > 0) return { value: stored, source: 'actual' };
+  return getCampaignAdViews(campaign, insights);
+}
+
+export function getCampaignEscapedAdViews(
+  campaign: CampaignRow,
+  insights?: InsightsPayload | null
+): SourcedMetric {
+  const stored = Number(campaign?.facebook_escaped_impressions ?? 0);
+  if (stored > 0) return { value: stored, source: 'actual' };
+  return getCampaignAdViews(campaign, insights);
 }
 
 export function getCampaignReach(campaign: CampaignRow, insights?: InsightsPayload | null): SourcedMetric {
@@ -96,11 +193,12 @@ export function getCampaignReach(campaign: CampaignRow, insights?: InsightsPaylo
   const storedReach = Number(campaign?.facebook_reach ?? campaign?.reach ?? 0);
   if (storedReach > 0) return { value: storedReach, source: 'actual' };
 
-  // Legacy campaigns may only have impressions persisted before reach was tracked.
-  const legacyImpressions = Number(campaign?.facebook_impressions ?? 0);
-  if (legacyImpressions > 0) return { value: legacyImpressions, source: 'actual' };
+  const adViews = getCampaignAdViews(campaign, insights);
+  if (adViews.source === 'actual') {
+    return { value: Math.round(adViews.value * 0.92), source: 'actual' };
+  }
 
-  const budgetDollars = getCampaignBudgetCents(campaign) / 100;
+  const budgetDollars = getCampaignTotalContributionCents(campaign) / 100;
   return { value: Math.round(budgetDollars * REACH_PER_DOLLAR), source: 'estimated' };
 }
 
@@ -109,16 +207,7 @@ export function getCampaignViews(
   insights: InsightsPayload | null | undefined,
   reach?: SourcedMetric
 ): SourcedMetric {
-  const raw = insights?.insights ?? insights;
-  const impressions = Number((raw as { impressions?: number })?.impressions ?? 0);
-  if (impressions > 0) return { value: impressions, source: 'actual' };
-
-  const stored = Number(campaign?.facebook_impressions ?? 0);
-  if (stored > 0) return { value: stored, source: 'actual' };
-
-  const r = reach?.value ?? getCampaignReach(campaign, insights).value;
-  const source = reach?.source === 'actual' ? 'actual' : 'estimated';
-  return { value: Math.round(r * 0.92), source };
+  return getCampaignAdViews(campaign, insights);
 }
 
 export function getCampaignActions(
@@ -126,48 +215,74 @@ export function getCampaignActions(
   insights?: InsightsPayload | null
 ): SourcedMetric {
   const raw = insights?.insights ?? insights;
-  const inlineClicks = Number((raw as { inline_link_clicks?: number })?.inline_link_clicks ?? 0);
-  const clicks = Number((raw as { clicks?: number })?.clicks ?? 0) || inlineClicks;
-  if (clicks > 0) return { value: clicks, source: 'actual' };
+  const actions = getStoredFacebookActions(campaign);
+  const computed = computeEngagementActions(actions, {
+    storedPostEngagement: Number(campaign?.facebook_post_engagement ?? 0),
+    storedVideoViews: Number(campaign?.facebook_video_views ?? 0),
+    fallbackInlineClicks: Number(campaign?.facebook_inline_link_clicks ?? campaign?.facebook_clicks ?? 0),
+  });
+  if (actions.length) return { value: computed, source: 'actual' };
 
-  const storedActions = Number(
-    campaign?.facebook_inline_link_clicks ??
-      campaign?.facebook_total_actions ??
-      campaign?.facebook_clicks ??
-      0
-  );
-  if (storedActions > 0) return { value: storedActions, source: 'actual' };
+  const fromInsights = Number((raw as { engagement_actions?: number })?.engagement_actions ?? 0);
+  if (fromInsights > 0) return { value: fromInsights, source: 'actual' };
 
-  const reach = getCampaignReach(campaign, insights).value;
-  return { value: Math.round(reach * 0.033), source: 'estimated' };
+  const storedEngagement = Number(campaign?.facebook_engagement_actions ?? 0);
+  if (storedEngagement > 0) return { value: storedEngagement, source: 'actual' };
+
+  const adViews = getCampaignAdViews(campaign, insights).value;
+  return { value: Math.round(adViews * ACTIONS_PER_AD_VIEW), source: 'estimated' };
 }
 
 export function computePersonalAttribution({
   userContributionCents,
   totalBudgetCents,
+  totalContributionCents,
+  campaignAdViews,
+  campaignOutOfBubbleAdViews,
+  campaignEscapedAdViews,
   campaignReach,
   campaignViews,
   campaignActions,
   perceptionShiftPct,
 }: {
   userContributionCents: number;
-  totalBudgetCents: number;
-  campaignReach: number;
+  totalBudgetCents?: number;
+  totalContributionCents?: number;
+  campaignAdViews?: number;
+  campaignOutOfBubbleAdViews?: number;
+  campaignEscapedAdViews?: number;
+  campaignReach?: number;
   campaignViews?: number;
   campaignActions: number;
   perceptionShiftPct: number;
 }) {
-  const share = totalBudgetCents > 0 ? userContributionCents / totalBudgetCents : 0;
-  const personalReach = Math.round(campaignReach * share);
-  const personalViews = Math.round((campaignViews ?? campaignReach * 0.92) * share);
+  const totalCents =
+    totalContributionCents ?? totalBudgetCents ?? 0;
+  const share =
+    totalCents > 0
+      ? userContributionCents / totalCents
+      : userContributionCents > 0
+        ? 1
+        : 0;
+  const adViews = campaignAdViews ?? campaignViews ?? campaignReach ?? 0;
+  const outOfBubble = campaignOutOfBubbleAdViews ?? adViews;
+  const escaped = campaignEscapedAdViews ?? adViews;
+
+  const personalAdViews = Math.round(adViews * share);
+  const personalOutOfBubbleAdViews = Math.round(outOfBubble * share);
+  const personalEscapedAdViews = Math.round(escaped * share);
   const personalActions = Math.round(campaignActions * share);
   const perceptionShift = Number(perceptionShiftPct) || 0;
-  const reconsidered = Math.round(personalReach * (perceptionShift / 100));
+  const reconsidered = Math.round(personalAdViews * (perceptionShift / 100));
+
   return {
     share,
     sharePct: Math.round(share * 1000) / 10,
-    personalReach,
-    personalViews,
+    personalAdViews,
+    personalOutOfBubbleAdViews,
+    personalEscapedAdViews,
+    personalReach: personalAdViews,
+    personalViews: personalAdViews,
     personalActions,
     reconsidered,
   };
@@ -255,7 +370,7 @@ export function buildCumulativeTimeSeries(
     return da - db;
   });
 
-  let cumReach = 0;
+  let cumAdViews = 0;
   let cumActions = 0;
   let cumShift = 0;
   const points: {
@@ -272,14 +387,19 @@ export function buildCumulativeTimeSeries(
     if (!campaign || !campaignId) continue;
 
     const insights = insightsById[campaignId];
-    const reach = getCampaignReach(campaign, insights ?? undefined).value;
+    const adViews = getCampaignAdViews(campaign, insights ?? undefined).value;
     const actions = getCampaignActions(campaign, insights ?? undefined).value;
-    const budgetCents = getCampaignBudgetCents(campaign);
+    const totalContributionCents = getCampaignTotalContributionCents(campaign);
     const amountCents = Number(c.amount_cents) || 0;
-    const share = budgetCents > 0 ? amountCents / budgetCents : 0;
+    const share =
+      totalContributionCents > 0
+        ? amountCents / totalContributionCents
+        : amountCents > 0
+          ? 1
+          : 0;
     const shift = getCampaignPerceptionShift(campaign);
 
-    cumReach += Math.round(reach * share);
+    cumAdViews += Math.round(adViews * share);
     cumActions += Math.round(actions * share);
     cumShift += shift * share;
 
@@ -289,7 +409,7 @@ export function buildCumulativeTimeSeries(
       label: date
         ? date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
         : '',
-      reach: cumReach,
+      reach: cumAdViews,
       actions: cumActions,
       perceptionShift: points.length ? cumShift / points.length : shift,
     });
@@ -315,7 +435,7 @@ export function buildCampaignTimeSeries(
     if (!Number.isNaN(d.getTime())) created = d;
   }
 
-  const reach = getCampaignReach(campaign, insights ?? undefined).value;
+  const adViews = getCampaignAdViews(campaign, insights ?? undefined).value;
   const actions = getCampaignActions(campaign, insights ?? undefined).value;
   const shift = getCampaignPerceptionShift(campaign);
 
@@ -334,7 +454,7 @@ export function buildCampaignTimeSeries(
         i === buckets
           ? 'Now'
           : d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
-      reach: Math.round(reach * eased),
+      reach: Math.round(adViews * eased),
       actions: Math.round(actions * eased),
       perceptionShift: Math.round(shift * eased * 10) / 10,
       estimated: !insights,
@@ -382,18 +502,20 @@ export function computeCumulativePersonalImpactSnapshot({
     if (!campaign) continue;
 
     totalCents += g.totalCents;
-    const reach = getCampaignReach(campaign);
-    const views = getCampaignViews(campaign, null, reach);
+    const adViews = getCampaignAdViews(campaign);
+    const outOfBubble = getCampaignOutOfBubbleAdViews(campaign);
+    const escaped = getCampaignEscapedAdViews(campaign);
     const actions = getCampaignActions(campaign);
-    const budgetCents = getCampaignBudgetCents(campaign);
+    const totalContributionCents = getCampaignTotalContributionCents(campaign);
     const shift = getCampaignPerceptionShift(campaign);
     const trust = Number(campaign.trust_score) || 0;
 
     const attr = computePersonalAttribution({
       userContributionCents: g.totalCents,
-      totalBudgetCents: budgetCents,
-      campaignReach: reach.value,
-      campaignViews: views.value,
+      totalContributionCents,
+      campaignAdViews: adViews.value,
+      campaignOutOfBubbleAdViews: outOfBubble.value,
+      campaignEscapedAdViews: escaped.value,
       campaignActions: actions.value,
       perceptionShiftPct: shift,
     });
@@ -454,18 +576,20 @@ export function computePerCampaignPersonalImpactSnapshot({
   if (!filtered.length) return null;
 
   const totalCents = filtered.reduce((s, c) => s + (Number(c.amount_cents) || 0), 0);
-  const reach = getCampaignReach(campaign);
-  const views = getCampaignViews(campaign, null, reach);
+  const adViews = getCampaignAdViews(campaign);
+  const outOfBubble = getCampaignOutOfBubbleAdViews(campaign);
+  const escaped = getCampaignEscapedAdViews(campaign);
   const actions = getCampaignActions(campaign);
   const shift = getCampaignPerceptionShift(campaign);
   const actualShift = campaign?.perception_shift_actual ?? campaign?.perceptionShiftActual;
-  const budgetCents = getCampaignBudgetCents(campaign);
+  const totalContributionCents = getCampaignTotalContributionCents(campaign);
 
   const attr = computePersonalAttribution({
     userContributionCents: totalCents,
-    totalBudgetCents: budgetCents,
-    campaignReach: reach.value,
-    campaignViews: views.value,
+    totalContributionCents,
+    campaignAdViews: adViews.value,
+    campaignOutOfBubbleAdViews: outOfBubble.value,
+    campaignEscapedAdViews: escaped.value,
     campaignActions: actions.value,
     perceptionShiftPct: shift,
   });
