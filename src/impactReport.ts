@@ -6,11 +6,13 @@ import {
   computeCumulativePersonalImpactSnapshot,
   computePerCampaignPersonalImpactSnapshot,
   getCampaignActions,
+  getCampaignAdViews,
+  getCampaignOutOfBubbleAdViews,
+  getCampaignEscapedAdViews,
   getCampaignNetRating,
   getCampaignPerceptionShift,
-  getCampaignReach,
-  getCampaignViews,
-  getCampaignBudgetCents,
+  getCampaignPerceptionShiftSource,
+  getCampaignTotalContributionCents,
   computePersonalAttribution,
   filterContributionsByTimeRange,
   buildCumulativeTimeSeries,
@@ -71,13 +73,15 @@ export function buildInsightsFromCampaign(campaign: CampaignRow): InsightsPayloa
     Number(campaign.facebook_clicks ?? 0) ||
     inlineLinkClicks ||
     Number(campaign.facebook_total_actions ?? 0);
-  if (!impressions && !reach && !clicks) return null;
+  const engagementActions = Number(campaign.facebook_engagement_actions ?? 0);
+  if (!impressions && !reach && !clicks && !engagementActions) return null;
   return {
     insights: {
       impressions,
       reach,
       clicks,
       inline_link_clicks: inlineLinkClicks || clicks,
+      engagement_actions: engagementActions || undefined,
     },
   };
 }
@@ -117,23 +121,26 @@ export function computeCumulativePersonalImpactResponse({
 
     totalCents += g.totalCents;
     const insights = insightsById[g.campaignId];
-    const reach = getCampaignReach(campaign, insights);
-    const views = getCampaignViews(campaign, insights, reach);
+    const adViews = getCampaignAdViews(campaign, insights);
+    const outOfBubble = getCampaignOutOfBubbleAdViews(campaign, insights);
+    const escaped = getCampaignEscapedAdViews(campaign, insights);
     const actions = getCampaignActions(campaign, insights);
-    const budgetCents = getCampaignBudgetCents(campaign);
+    const totalContributionCents = getCampaignTotalContributionCents(campaign);
     const shift = getCampaignPerceptionShift(campaign);
+    const shiftSource = getCampaignPerceptionShiftSource(campaign);
     const trust = Number(campaign.trust_score) || 0;
 
     const attr = computePersonalAttribution({
       userContributionCents: g.totalCents,
-      totalBudgetCents: budgetCents,
-      campaignReach: reach.value,
-      campaignViews: views.value,
+      totalContributionCents,
+      campaignAdViews: adViews.value,
+      campaignOutOfBubbleAdViews: outOfBubble.value,
+      campaignEscapedAdViews: escaped.value,
       campaignActions: actions.value,
       perceptionShiftPct: shift,
     });
 
-    totalReach += attr.personalReach;
+    totalReach += attr.personalAdViews;
     totalActions += attr.personalActions;
     shiftSum += shift;
     if (trust) trustSum += trust;
@@ -144,16 +151,21 @@ export function computeCumulativePersonalImpactResponse({
       title: g.title || campaign.title || 'Campaign',
       contributedCents: g.totalCents,
       currency: g.currency,
-      personalReach: attr.personalReach,
-      personalViews: attr.personalViews,
+      personalReach: attr.personalAdViews,
+      personalViews: attr.personalAdViews,
+      personalOutOfBubbleAdViews: attr.personalOutOfBubbleAdViews,
+      personalEscapedAdViews: attr.personalEscapedAdViews,
       personalActions: attr.personalActions,
       perceptionShift: shift,
+      perceptionShiftSource: shiftSource,
+      isVideoAd: Boolean(campaign.facebook_is_video_ad),
       trustScore: trust,
       netRating: getCampaignNetRating(campaign),
       status: campaign.status,
       thumbnailUrl: campaign.thumbnail_url ?? null,
       category: campaign.category ?? null,
-      reachSource: reach.source,
+      reachSource: adViews.source,
+      viewsSource: adViews.source,
     });
   }
 
@@ -193,34 +205,41 @@ export function computePerCampaignPersonalImpactResponse({
 
   const insights = buildInsightsFromCampaign(campaign);
   const totalCents = filtered.reduce((s, c) => s + (Number(c.amount_cents) || 0), 0);
-  const reach = getCampaignReach(campaign, insights);
-  const views = getCampaignViews(campaign, insights, reach);
+  const adViews = getCampaignAdViews(campaign, insights);
+  const outOfBubble = getCampaignOutOfBubbleAdViews(campaign, insights);
+  const escaped = getCampaignEscapedAdViews(campaign, insights);
   const actions = getCampaignActions(campaign, insights);
   const shift = getCampaignPerceptionShift(campaign);
+  const shiftSource = getCampaignPerceptionShiftSource(campaign);
   const actualShift = campaign.perception_shift_actual ?? campaign.perceptionShiftActual;
-  const budgetCents = getCampaignBudgetCents(campaign);
+  const totalContributionCents = getCampaignTotalContributionCents(campaign);
 
   const attr = computePersonalAttribution({
     userContributionCents: totalCents,
-    totalBudgetCents: budgetCents,
-    campaignReach: reach.value,
-    campaignViews: views.value,
+    totalContributionCents,
+    campaignAdViews: adViews.value,
+    campaignOutOfBubbleAdViews: outOfBubble.value,
+    campaignEscapedAdViews: escaped.value,
     campaignActions: actions.value,
     perceptionShiftPct: shift,
   });
 
   return {
     totalContributedCents: totalCents,
-    personalReach: attr.personalReach,
-    personalViews: attr.personalViews,
+    personalReach: attr.personalAdViews,
+    personalViews: attr.personalAdViews,
+    personalOutOfBubbleAdViews: attr.personalOutOfBubbleAdViews,
+    personalEscapedAdViews: attr.personalEscapedAdViews,
     personalActions: attr.personalActions,
     reconsidered: attr.reconsidered,
     sharePct: attr.sharePct,
     estimatedPerceptionShift: shift,
+    perceptionShiftSource: shiftSource,
+    isVideoAd: Boolean(campaign.facebook_is_video_ad),
     actualPerceptionShift: actualShift != null ? Number(actualShift) : null,
     netRating: getCampaignNetRating(campaign),
-    reachSource: reach.source,
-    viewsSource: views.source,
+    reachSource: adViews.source,
+    viewsSource: adViews.source,
     timeSeries: buildCampaignTimeSeries(campaign, insights, rangeId).map((p) => ({
       ...p,
       reach: Math.round(p.reach * attr.share),

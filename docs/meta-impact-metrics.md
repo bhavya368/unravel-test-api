@@ -27,8 +27,8 @@ Stored at `campaigns/{id}/facebook_insight_breakdowns/{type}`:
 |-------------|-----------------|---------------------|
 | `reach` | `facebook_reach` | People reached |
 | `impressions` | `facebook_impressions` | Views |
-| `inline_link_clicks` | `facebook_inline_link_clicks` | Actions (preferred) |
-| `clicks` | `facebook_clicks` | Actions fallback |
+| `inline_link_clicks` | `facebook_inline_link_clicks` | Link-click fallback for Actions |
+| `clicks` | `facebook_clicks` | Reporting / click fallback |
 | `frequency` | `facebook_frequency` | Reporting / email |
 | `spend` | `facebook_spend` | Reporting |
 | `cpm` | `facebook_cpm` | Reporting |
@@ -36,7 +36,7 @@ Stored at `campaigns/{id}/facebook_insight_breakdowns/{type}`:
 | `results` | `facebook_objective_results` | Objective results |
 | `result_rate` | `facebook_objective_result_rate` | Objective result rate |
 | `video_p75_watched_actions` | `facebook_video_p75_watched` | Video engagement |
-| `actions` (array) | `facebook_actions`, `facebook_total_actions` | Engagement breakdown |
+| `actions` (array) | `facebook_actions`, `facebook_total_actions` | Engagement breakdown; Actions counts shares, saves, follows, and link clicks |
 
 ## Sync endpoints
 
