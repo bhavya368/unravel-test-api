@@ -3165,10 +3165,13 @@ app.post('/payments/record-checkout-session', async (req: Request, res: Response
     if (!campaignId || typeof campaignId !== 'string') {
       return res.status(400).json({ error: 'Invalid session: missing campaign' });
     }
-    // Use the actual amount charged (post-coupon). Stripe already confirmed the
-    // session is paid, so a discounted total below the usual minimum is valid.
-    const amountCents = session.amount_total;
-    if (amountCents == null || amountCents < 0) {
+    // Count the GROSS contribution toward the fund, not the post-coupon charge — a
+    // coupon-discounted (even fully-discounted) backing should credit the full amount.
+    // amount_subtotal is pre-discount; fall back to charged + discount. (UE-147)
+    const amountChargedCents = session.amount_total ?? 0; // actually charged, post-coupon
+    const amountDiscountCents = session.total_details?.amount_discount ?? 0;
+    const amountGrossCents = session.amount_subtotal ?? amountChargedCents + amountDiscountCents;
+    if (amountGrossCents < 0) {
       return res.status(400).json({ error: 'Invalid payment amount' });
     }
 
@@ -3206,10 +3209,12 @@ app.post('/payments/record-checkout-session', async (req: Request, res: Response
       const data = campSnap.data() || {};
       campaignTitle = typeof data.title === 'string' && data.title.trim() ? data.title.trim() : 'Campaign';
       const currentFunding = Number(data.funding_current ?? 0) || 0;
-      const newFunding = currentFunding + amountCents / 100;
+      const newFunding = currentFunding + amountGrossCents / 100;
       t.set(recordRef, {
         campaignId: campaignId.trim(),
-        amount_cents: amountCents,
+        amount_cents: amountGrossCents, // gross contribution — what counts toward the fund
+        amount_charged_cents: amountChargedCents, // actually charged after any coupon
+        amount_discount_cents: amountDiscountCents,
         recordedAt,
         invoice_pdf: invoicePdf,
         hosted_invoice_url: hostedInvoiceUrl,
@@ -3229,7 +3234,9 @@ app.post('/payments/record-checkout-session', async (req: Request, res: Response
         sessionId: sid,
         campaignId: campaignId.trim(),
         campaignTitle,
-        amount_cents: amountCents,
+        amount_cents: amountGrossCents, // gross contribution (UE-147)
+        amount_charged_cents: amountChargedCents,
+        amount_discount_cents: amountDiscountCents,
         currency: (session.currency || 'usd').toLowerCase(),
         recordedAt,
         invoice_pdf: invoicePdf,
