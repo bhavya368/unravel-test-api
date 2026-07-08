@@ -6,8 +6,13 @@ import { formatCompactNumber } from './impactMetrics';
 const nodeRequire = createRequire(__filename);
 const FONT_FAMILY = 'Roboto, DejaVu Sans, sans-serif';
 
+const CARD_X = 72;
+const CARD_Y = 48;
+const CARD_WIDTH = 1056;
+const CARD_HEIGHT = 534;
 const CONTENT_X = 120;
 const CONTENT_WIDTH = 960;
+const TITLE_WIDTH = 820;
 
 type RobotoWeight = 500 | 700 | 900;
 
@@ -22,15 +27,16 @@ function getRobotoFontFiles(): string[] {
 }
 
 function measureText(text: string, fontSize: number, weight: RobotoWeight): number {
-  const weightScale = weight >= 900 ? 0.56 : weight >= 700 ? 0.53 : 0.5;
+  const weightScale = weight >= 900 ? 1.08 : weight >= 700 ? 1.02 : 1;
   let width = 0;
   for (const ch of text) {
-    if (ch === ' ') width += fontSize * 0.24;
-    else if (ch === '·' || ch === '—' || ch === ':') width += fontSize * 0.3;
-    else if (ch === ch.toUpperCase() && ch !== ch.toLowerCase()) width += fontSize * weightScale;
-    else width += fontSize * (weightScale - 0.05);
+    if (ch === ' ') width += fontSize * 0.28;
+    else if (/[ilI1'`.,:;]/.test(ch)) width += fontSize * 0.3;
+    else if (/[mwMW]/.test(ch)) width += fontSize * 0.85;
+    else if (/[A-Z]/.test(ch)) width += fontSize * 0.66;
+    else width += fontSize * 0.54;
   }
-  return width;
+  return width * weightScale;
 }
 
 export type ImpactShareCardScope = 'cumulative' | 'campaign';
@@ -97,17 +103,26 @@ function wrapText(
 
 function pickTitleStyle(text: string): { fontSize: number; lineHeight: number; maxLines: number } {
   const candidates = [
-    { fontSize: 40, lineHeight: 46, maxLines: 2 },
-    { fontSize: 34, lineHeight: 40, maxLines: 3 },
-    { fontSize: 28, lineHeight: 34, maxLines: 4 },
+    { fontSize: 36, lineHeight: 42, maxLines: 2 },
+    { fontSize: 31, lineHeight: 37, maxLines: 3 },
+    { fontSize: 27, lineHeight: 32, maxLines: 4 },
   ];
 
   for (const style of candidates) {
-    const lines = wrapText(text, CONTENT_WIDTH, style.fontSize, 900);
+    const lines = wrapText(text, TITLE_WIDTH, style.fontSize, 900);
     if (lines.length <= style.maxLines) return style;
   }
 
   return candidates[candidates.length - 1];
+}
+
+function textBlockHeight(lines: string[], fontSize: number, lineHeight: number): number {
+  if (!lines.length) return 0;
+  return fontSize + (lines.length - 1) * lineHeight;
+}
+
+function baselineFromTop(top: number, fontSize: number): number {
+  return top + fontSize * 0.82;
 }
 
 function multilineText(
@@ -179,26 +194,32 @@ export function buildImpactOgSvg(payload: ImpactShareCardPayload): string {
   const titleStyle = pickTitleStyle(titleText);
   const titleLines = wrapText(
     titleText,
-    CONTENT_WIDTH,
+    TITLE_WIDTH,
     titleStyle.fontSize,
     900,
     titleStyle.maxLines,
   );
   const subtitleLines = wrapText(buildSubtitle(payload), CONTENT_WIDTH, 22, 500, 2);
 
-  const titleStartY = 118;
-  const titleBlockHeight = titleLines.length * titleStyle.lineHeight;
-  const subtitleStartY = titleStartY + titleBlockHeight + (subtitleLines.length ? 10 : 0);
+  const titleTop = 122;
+  const titleStartY = baselineFromTop(titleTop, titleStyle.fontSize);
+  const titleBlockHeight = textBlockHeight(
+    titleLines,
+    titleStyle.fontSize,
+    titleStyle.lineHeight,
+  );
+  const subtitleTop = titleTop + titleBlockHeight + (subtitleLines.length ? 14 : 0);
+  const subtitleStartY = baselineFromTop(subtitleTop, 22);
   const subtitleLineHeight = 28;
-  const subtitleBlockHeight = subtitleLines.length * subtitleLineHeight;
-  const dividerY = Math.max(198, subtitleStartY + subtitleBlockHeight + 14);
-  const metricsTop = dividerY + 16;
+  const subtitleBlockHeight = textBlockHeight(subtitleLines, 22, subtitleLineHeight);
+  const dividerY = Math.max(218, subtitleTop + subtitleBlockHeight + 18);
+  const metricsTop = dividerY + 18;
 
-  const mainBoxHeight = 118;
-  const secondaryTop = metricsTop + mainBoxHeight + 14;
-  const secondaryHeight = 96;
-  const bottomTop = secondaryTop + secondaryHeight + 12;
-  const bottomHeight = 50;
+  const mainBoxHeight = 100;
+  const secondaryTop = metricsTop + mainBoxHeight + 12;
+  const secondaryHeight = 78;
+  const bottomTop = secondaryTop + secondaryHeight + 10;
+  const bottomHeight = 48;
 
   const reached = formatCompactNumber(Number(metrics.peopleReached) || 0);
   const views = formatCompactNumber(Number(metrics.personalViews) || 0);
@@ -206,12 +227,14 @@ export function buildImpactOgSvg(payload: ImpactShareCardPayload): string {
   const reconsidered = formatCompactNumber(Number(metrics.reconsidered) || 0);
   const shift = formatShift(metrics);
 
-  const mainValueY = metricsTop + 72;
-  const mainLabelY = metricsTop + 98;
-  const secondaryValueY = secondaryTop + 58;
-  const secondaryLabelY = secondaryTop + 78;
-  const bottomValueY = bottomTop + 32;
-  const bottomLabelY = bottomTop + 46;
+  const mainValueY = metricsTop + 62;
+  const mainLabelY = metricsTop + 84;
+  const secondaryValueY = secondaryTop + 48;
+  const secondaryLabelY = secondaryTop + 66;
+  const bottomValueY = bottomTop + 30;
+  const bottomLabelY = bottomTop + 43;
+  const footerY = CARD_Y + CARD_HEIGHT - 26;
+  const footerIconY = CARD_Y + CARD_HEIGHT - 28;
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="${IMPACT_OG_WIDTH}" height="${IMPACT_OG_HEIGHT}" viewBox="0 0 ${IMPACT_OG_WIDTH} ${IMPACT_OG_HEIGHT}">
@@ -233,7 +256,7 @@ export function buildImpactOgSvg(payload: ImpactShareCardPayload): string {
   <rect width="${IMPACT_OG_WIDTH}" height="${IMPACT_OG_HEIGHT}" fill="url(#bg)"/>
 
   <g filter="url(#shadow)">
-    <rect x="72" y="48" width="1056" height="534" rx="28" fill="#FFFFFF" stroke="url(#cardBorder)" stroke-width="3"/>
+    <rect x="${CARD_X}" y="${CARD_Y}" width="${CARD_WIDTH}" height="${CARD_HEIGHT}" rx="28" fill="#FFFFFF" stroke="url(#cardBorder)" stroke-width="3"/>
   </g>
 
   <line x1="${CONTENT_X}" y1="${dividerY}" x2="${CONTENT_X + CONTENT_WIDTH}" y2="${dividerY}" stroke="#1A6BBF" stroke-opacity="0.12" stroke-width="2"/>
@@ -272,9 +295,9 @@ export function buildImpactOgSvg(payload: ImpactShareCardPayload): string {
   <text x="${shift ? 846 : 600}" y="${bottomValueY}" text-anchor="middle" fill="#C94F3D" font-family="${FONT_FAMILY}" font-size="26" font-weight="900">~${escapeXml(reconsidered)}</text>
   <text x="${shift ? 846 : 600}" y="${bottomLabelY}" text-anchor="middle" fill="#64748B" font-family="${FONT_FAMILY}" font-size="10" font-weight="700">RECONSIDERED</text>
 
-  <text x="${CONTENT_X}" y="598" fill="#94A3B8" font-family="${FONT_FAMILY}" font-size="18" font-weight="500">The Unravel Network</text>
-  <circle cx="1080" cy="586" r="14" fill="#1A6BBF"/>
-  <path d="M1073 586 L1078 591 L1088 579" fill="none" stroke="#FFFFFF" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="${CONTENT_X}" y="${footerY}" fill="#94A3B8" font-family="${FONT_FAMILY}" font-size="18" font-weight="500">The Unravel Network</text>
+  <circle cx="1080" cy="${footerIconY}" r="14" fill="#1A6BBF"/>
+  <path d="M1073 ${footerIconY} L1078 ${footerIconY + 5} L1088 ${footerIconY - 7}" fill="none" stroke="#FFFFFF" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>`;
 }
 
