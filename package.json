@@ -12,6 +12,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@resvg/resvg-js": "^2.6.2",
     "@google-cloud/storage": "^7.18.0",
     "@google-cloud/vertexai": "^1.10.0",
     "@google/generative-ai": "^0.24.1",

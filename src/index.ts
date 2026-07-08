@@ -33,6 +33,12 @@ import {
   syncAllPublishedCampaignFacebookInsights,
   syncCampaignFacebookInsights,
 } from './facebookInsights';
+import {
+  IMPACT_OG_HEIGHT,
+  IMPACT_OG_WIDTH,
+  type ImpactShareCardPayload,
+  renderImpactOgPng,
+} from './impactOgImage';
 
 declare global {
   namespace Express {
@@ -1125,7 +1131,6 @@ app.get('/users/me/impact', async (req: Request, res: Response) => {
     res.json({
       rangeId,
       impact,
-      isDemo: false,
     });
   } catch (error) {
     console.error('GET /users/me/impact:', error);
@@ -1164,7 +1169,6 @@ app.get('/users/me/impact/:campaignId', async (req: Request, res: Response) => {
         impact: null,
         similarCampaigns: [],
         hasContributions: false,
-        isDemo: false,
       });
     }
 
@@ -1199,7 +1203,6 @@ app.get('/users/me/impact/:campaignId', async (req: Request, res: Response) => {
       impact,
       similarCampaigns: similarCampaigns.map(publicCampaignSummary),
       hasContributions: true,
-      isDemo: false,
     });
   } catch (error) {
     console.error('GET /users/me/impact/:campaignId:', error);
@@ -1964,40 +1967,90 @@ app.get('/og/lander/:id', async (req: Request, res: Response) => {
   }
 });
 
-app.get('/og/impact/:token', async (req: Request, res: Response) => {
+function impactShareCardPayloadFromDoc(
+  data: ShareCardDoc & { headlineTitle?: string },
+): ImpactShareCardPayload {
+  return {
+    scope: data.scope,
+    displayName: data.displayName,
+    headlineTitle: data.headlineTitle,
+    metrics: data.metrics || {},
+  };
+}
+
+function impactOgImageUrl(req: Request, token: string): string {
+  return `${ogRedirectBase(req)}/og/impact/${encodeURIComponent(token)}/image`;
+}
+
+function impactOgTitle(payload: ImpactShareCardPayload): string {
+  const metrics = payload.metrics || {};
+  const campaignTitle =
+    typeof metrics.campaignTitle === 'string' ? metrics.campaignTitle.trim() : '';
+  if (payload.scope === 'campaign' && campaignTitle) {
+    return `${payload.displayName} backed "${campaignTitle}"`;
+  }
+  return `${payload.displayName}'s impact on Unravel`;
+}
+
+function impactOgDescription(payload: ImpactShareCardPayload): string {
+  const metrics = payload.metrics || {};
+  const reached = formatCompactNumber(Number(metrics.peopleReached) || 0);
+  const shift = metrics.perceptionShift ?? metrics.avgPerceptionShift;
+  const shiftLabel = shift != null ? ` · +${shift}% perception shift` : '';
+  return `Helped reach ${reached} people${shiftLabel} through evaluated campaigns.`;
+}
+
+async function loadImpactShareCardForOg(token: string): Promise<
+  | { ok: true; payload: ImpactShareCardPayload }
+  | { ok: false; status: 404 | 410; message: string }
+> {
+  const snap = await db.collection('share_cards').doc(token).get();
+  if (!snap.exists) {
+    return { ok: false, status: 404, message: 'Share card not found' };
+  }
+  const data = snap.data() as ShareCardDoc & { headlineTitle?: string };
+  if (data.revoked) {
+    return { ok: false, status: 410, message: 'This share link has been revoked' };
+  }
+  return { ok: true, payload: impactShareCardPayloadFromDoc(data) };
+}
+
+app.get('/og/impact/:token/image', async (req: Request, res: Response) => {
   try {
     const { token } = req.params;
-    const snap = await db.collection('share_cards').doc(token).get();
-    if (!snap.exists) {
-      res.status(404).send('Share card not found');
-      return;
-    }
-    const data = snap.data() as ShareCardDoc & {
-      headlineTitle?: string;
-      thumbnailUrl?: string | null;
-    };
-    if (data.revoked) {
-      res.status(410).send('This share link has been revoked');
+    const loaded = await loadImpactShareCardForOg(token);
+    if (!loaded.ok) {
+      res.status(loaded.status).send(loaded.message);
       return;
     }
 
-    const metrics = data.metrics || {};
-    const reached = formatCompactNumber(Number(metrics.peopleReached) || 0);
-    const shift = metrics.perceptionShift ?? metrics.avgPerceptionShift;
-    const shiftLabel = shift != null ? ` · +${shift}% perception shift` : '';
-    const title =
-      data.scope === 'campaign' && metrics.campaignTitle
-        ? `${data.displayName} backed "${metrics.campaignTitle}"`
-        : `${data.displayName}'s impact on Unravel`;
-    const description = `Helped reach ${reached} people${shiftLabel} through evaluated campaigns.`;
-    const image = resolveThumbnailUrl(
-      data.thumbnailUrl,
-      API_PUBLIC_BASE
-    );
+    const png = renderImpactOgPng(loaded.payload);
+    res.setHeader('Content-Type', 'image/png');
+    res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
+    res.send(png);
+  } catch (error) {
+    console.error('OG impact image error:', error);
+    res.status(500).send('Error generating impact share image');
+  }
+});
+
+app.get('/og/impact/:token', async (req: Request, res: Response) => {
+  try {
+    const { token } = req.params;
+    const loaded = await loadImpactShareCardForOg(token);
+    if (!loaded.ok) {
+      res.status(loaded.status).send(loaded.message);
+      return;
+    }
+
+    const title = impactOgTitle(loaded.payload);
+    const description = impactOgDescription(loaded.payload);
+    const image = impactOgImageUrl(req, token);
     const canonicalUrl = `${ogRedirectBase(req)}/impact/share/${token}`;
     const ogPageUrl = canonicalUrl;
     const ua = String(req.get('user-agent') || '');
     const isCrawler = isSharePreviewCrawler(ua);
+    console.log(`[og/impact] token=${token} ua="${ua}" crawler=${isCrawler} image=${image}`);
 
     const ogHtml = `<!DOCTYPE html>
 <html lang="en">
@@ -2009,6 +2062,9 @@ app.get('/og/impact/:token', async (req: Request, res: Response) => {
   <meta property="og:description" content="${escapeHtml(description)}">
   <meta property="og:image" content="${escapeHtml(image)}">
   <meta property="og:image:secure_url" content="${escapeHtml(image)}">
+  <meta property="og:image:width" content="${IMPACT_OG_WIDTH}">
+  <meta property="og:image:height" content="${IMPACT_OG_HEIGHT}">
+  <meta property="og:image:type" content="image/png">
   <meta property="og:url" content="${escapeHtml(ogPageUrl)}">
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="Unravel">
