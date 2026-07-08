@@ -286,6 +286,9 @@ function sanitizeSlideshowBackButtonUrl(raw: unknown): string {
 /** Donation Checkout: customer chooses amount on Stripe (min $5, default suggestion $5). */
 const DONATION_CHECKOUT_MIN_CENTS = 500;
 const DONATION_CHECKOUT_PRESET_CENTS = 500;
+/** Stripe's minimum chargeable amount (USD). A coupon that leaves a smaller (non-zero) net
+ * can't be charged, so we reject it cleanly rather than let Stripe 500. */
+const STRIPE_MIN_CHARGE_CENTS = 50;
 
 /** One-off Price with “customer chooses amount” for Checkout (one line item only). */
 async function createDonationPayWhatYouWantPrice(stripeProductId: string): Promise<string> {
@@ -3037,6 +3040,317 @@ async function ensureStripeCustomer(uid: string, email?: string): Promise<string
   }
 }
 
+interface CouponValidationResult {
+  valid: boolean;
+  reason?: string; // machine-readable rejection reason for the client to map to copy
+  code?: string;
+  grossCents?: number;
+  discountCents?: number;
+  netCents?: number;
+}
+
+/**
+ * Validate a coupon against the `coupons` collection for a campaign + contribution amount.
+ * Read-only: redemption counting happens at checkout, so this is safe to call repeatedly.
+ * Returns the computed discount/net/gross when valid, or a machine-readable `reason` when not.
+ * Custom coupon system — replaces Stripe-native promotion codes so we can validate (caps,
+ * expiry, scope) and decide net-vs-zero BEFORE creating a Stripe transaction.
+ */
+async function validateCoupon(
+  rawCode: string,
+  campaignId: string,
+  amountCents: number
+): Promise<CouponValidationResult> {
+  const code = rawCode.trim().toUpperCase();
+  if (!code) return { valid: false, reason: 'missing_code' };
+  if (!Number.isInteger(amountCents) || amountCents <= 0) {
+    return { valid: false, reason: 'invalid_amount' };
+  }
+
+  const snap = await db.collection('coupons').doc(code).get();
+  if (!snap.exists) return { valid: false, reason: 'not_found' };
+  const c = snap.data() as Record<string, unknown>;
+
+  if (c.active !== true) return { valid: false, reason: 'inactive' };
+
+  const expiresAt = typeof c.expires_at === 'string' ? c.expires_at : null;
+  if (expiresAt && new Date(expiresAt).getTime() <= Date.now()) {
+    return { valid: false, reason: 'expired' };
+  }
+
+  // Campaign scope is either the string 'all' or an array of campaign ids.
+  const scope = c.campaign_scope;
+  const inScope = scope === 'all' || (Array.isArray(scope) && scope.includes(campaignId));
+  if (!inScope) return { valid: false, reason: 'not_applicable_to_campaign' };
+
+  // Global redemption cap.
+  const maxRedemptions = typeof c.max_redemptions === 'number' ? c.max_redemptions : null;
+  const timesRedeemed = typeof c.times_redeemed === 'number' ? c.times_redeemed : 0;
+  if (maxRedemptions != null && timesRedeemed >= maxRedemptions) {
+    return { valid: false, reason: 'redemption_limit_reached' };
+  }
+
+  // Compute the discount; it can never exceed the contribution, so net stays >= 0.
+  let discountCents: number;
+  if (c.type === 'amount_off' && typeof c.value === 'number') {
+    discountCents = Math.min(Math.round(c.value), amountCents);
+  } else if (c.type === 'percent_off' && typeof c.value === 'number') {
+    discountCents = Math.min(Math.round((amountCents * c.value) / 100), amountCents);
+  } else {
+    return { valid: false, reason: 'invalid_coupon_config' };
+  }
+
+  return {
+    valid: true,
+    code,
+    grossCents: amountCents,
+    discountCents,
+    netCents: amountCents - discountCents,
+  };
+}
+
+/** Atomically count a coupon redemption. Idempotent per redemptionId (Stripe session id for
+ * paid backings, or a generated id for zero-balance ones). */
+async function recordCouponRedemption(
+  code: string,
+  redemptionId: string,
+  info: { campaignId: string; grossCents: number; discountCents: number; uid?: string; email?: string }
+): Promise<void> {
+  const couponRef = db.collection('coupons').doc(code);
+  const redemptionRef = couponRef.collection('redemptions').doc(redemptionId);
+  await db.runTransaction(async (t) => {
+    const existing = await t.get(redemptionRef);
+    if (existing.exists) return; // already counted (retry) — don't double-count
+    t.set(redemptionRef, {
+      campaignId: info.campaignId,
+      gross_cents: info.grossCents,
+      discount_cents: info.discountCents,
+      ...(info.uid ? { uid: info.uid } : {}),
+      ...(info.email ? { email: info.email } : {}),
+      redeemedAt: new Date().toISOString(),
+    });
+    t.update(couponRef, { times_redeemed: FieldValue.increment(1), updatedAt: new Date().toISOString() });
+  });
+}
+
+/**
+ * Record a coupon-covered backing that required no payment (net $0), skipping Stripe entirely.
+ * Credits the GROSS contribution to the fund, writes the backing + contribution records, counts
+ * the redemption, and emits the PostHog backing_completed event — parity with the Stripe path.
+ * (UE-147 zero-balance path — the custom coupon system's reason for existing: no $0 Stripe order.)
+ */
+async function recordCouponOnlyBacking(input: {
+  campaignId: string;
+  code: string;
+  grossCents: number;
+  discountCents: number;
+  donorUid?: string;
+  donorEmail?: string;
+  posthogDistinctId?: string;
+  utmSource?: string;
+  utmCampaign?: string;
+  isGuest: boolean;
+}): Promise<{ funding_current: number }> {
+  const redemptionId = 'cpn_' + randomUUID();
+  const recordedAt = new Date().toISOString();
+  const campaignRef = db.collection('campaigns').doc(input.campaignId);
+  const recordRef = db.collection('stripe_checkout_records').doc(redemptionId);
+
+  let campaignTitle = 'Campaign';
+  await db.runTransaction(async (t) => {
+    const campSnap = await t.get(campaignRef);
+    if (!campSnap.exists) throw new Error('Campaign not found');
+    const data = campSnap.data() || {};
+    campaignTitle = typeof data.title === 'string' && data.title.trim() ? data.title.trim() : 'Campaign';
+    const currentFunding = Number(data.funding_current ?? 0) || 0;
+    t.update(campaignRef, { funding_current: currentFunding + input.grossCents / 100, updatedAt: recordedAt });
+    t.set(recordRef, {
+      campaignId: input.campaignId,
+      amount_cents: input.grossCents, // gross contribution counts toward the fund
+      amount_charged_cents: 0, // nothing charged — fully coupon-covered
+      amount_discount_cents: input.discountCents,
+      coupon_code: input.code,
+      recordedAt,
+      ...(input.donorUid ? { donor_uid: input.donorUid } : {}),
+      ...(input.donorEmail ? { donor_email: input.donorEmail } : {}),
+    });
+  });
+
+  if (input.donorUid) {
+    await usersDb
+      .collection('users').doc(input.donorUid)
+      .collection('contributions').doc(redemptionId)
+      .set({
+        sessionId: redemptionId,
+        campaignId: input.campaignId,
+        campaignTitle,
+        amount_cents: input.grossCents,
+        amount_charged_cents: 0,
+        amount_discount_cents: input.discountCents,
+        coupon_code: input.code,
+        currency: 'usd',
+        recordedAt,
+      });
+  }
+
+  await recordCouponRedemption(input.code, redemptionId, {
+    campaignId: input.campaignId,
+    grossCents: input.grossCents,
+    discountCents: input.discountCents,
+    uid: input.donorUid,
+    email: input.donorEmail,
+  });
+
+  // Tracking parity with the Stripe path: coupon_backings + PostHog backing_completed.
+  await upsertBacking({
+    idKey: redemptionId,
+    campaignId: input.campaignId,
+    firebaseUid: input.donorUid ?? null,
+    distinctId: input.donorUid || input.posthogDistinctId || null,
+    isGuest: input.isGuest,
+    email: input.donorEmail ?? null,
+    stripeCustomerId: null,
+    promoCode: input.code,
+    amountTotal: 0, // nothing charged
+    amountDiscount: input.discountCents,
+    utmSource: input.utmSource ?? null,
+    utmCampaign: input.utmCampaign ?? null,
+    source: 'coupon_zero_balance',
+  });
+
+  const final = await campaignRef.get();
+  return { funding_current: Number((final.data() || {}).funding_current ?? 0) || 0 };
+}
+
+// POST - Validate a coupon before checkout (custom coupon system). Read-only; does not redeem.
+app.post('/coupons/validate', async (req: Request, res: Response) => {
+  try {
+    const { code, campaignId, amountCents } = req.body as {
+      code?: string;
+      campaignId?: string;
+      amountCents?: number;
+    };
+    if (typeof code !== 'string' || !code.trim()) {
+      return res.status(400).json({ error: 'code is required' });
+    }
+    if (typeof campaignId !== 'string' || !campaignId.trim()) {
+      return res.status(400).json({ error: 'campaignId is required' });
+    }
+    const amount = Number(amountCents);
+    if (!Number.isInteger(amount) || amount <= 0) {
+      return res.status(400).json({ error: 'amountCents must be a positive integer (cents)' });
+    }
+
+    const result = await validateCoupon(code, campaignId.trim(), amount);
+    res.json(result); // only { valid, reason?, code, grossCents, discountCents, netCents } — no internals
+  } catch (error: any) {
+    console.error('Coupon validate error:', error);
+    res.status(500).json({ error: error?.message || 'Failed to validate coupon' });
+  }
+});
+
+// GET - List all coupons (admin). x-api-key gated; the /admin UI is passkey-gated.
+app.get('/coupons', async (_req: Request, res: Response) => {
+  try {
+    const snap = await db.collection('coupons').get();
+    const coupons = snap.docs
+      .map((d) => d.data())
+      .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
+    res.json(coupons);
+  } catch (error: any) {
+    console.error('List coupons error:', error);
+    res.status(500).json({ error: error?.message || 'Failed to list coupons' });
+  }
+});
+
+// POST - Create a coupon (admin). Code is the uppercased doc id.
+app.post('/coupons', async (req: Request, res: Response) => {
+  try {
+    const b = req.body as {
+      code?: string;
+      type?: string;
+      value?: number;
+      currency?: string;
+      campaignScope?: unknown; // 'all' | string[]
+      expiresAt?: string | null;
+      maxRedemptions?: number | null;
+      fundingSource?: string;
+    };
+    const code = typeof b.code === 'string' ? b.code.trim().toUpperCase() : '';
+    if (!code) return res.status(400).json({ error: 'code is required' });
+    if (b.type !== 'amount_off' && b.type !== 'percent_off') {
+      return res.status(400).json({ error: "type must be 'amount_off' or 'percent_off'" });
+    }
+    const value = Number(b.value);
+    if (!Number.isInteger(value) || value <= 0) {
+      return res.status(400).json({ error: 'value must be a positive integer (cents for amount_off, percent for percent_off)' });
+    }
+    if (b.type === 'percent_off' && value > 100) {
+      return res.status(400).json({ error: 'percent_off value must be between 1 and 100' });
+    }
+
+    const ref = db.collection('coupons').doc(code);
+    if ((await ref.get()).exists) {
+      return res.status(409).json({ error: 'A coupon with that code already exists' });
+    }
+
+    const scope = b.campaignScope;
+    const campaign_scope =
+      scope === 'all' || (Array.isArray(scope) && scope.every((s) => typeof s === 'string')) ? scope : 'all';
+
+    const coupon = {
+      code,
+      type: b.type,
+      value,
+      currency: (b.currency || 'usd').toLowerCase(),
+      active: true,
+      campaign_scope,
+      expires_at: typeof b.expiresAt === 'string' && b.expiresAt.trim() ? b.expiresAt.trim() : null,
+      max_redemptions:
+        typeof b.maxRedemptions === 'number' && Number.isInteger(b.maxRedemptions) && b.maxRedemptions > 0
+          ? b.maxRedemptions
+          : null,
+      funding_source: typeof b.fundingSource === 'string' && b.fundingSource.trim() ? b.fundingSource.trim() : null,
+      times_redeemed: 0,
+      created_at: new Date().toISOString(),
+    };
+    await ref.set(coupon);
+    res.status(201).json(coupon);
+  } catch (error: any) {
+    console.error('Create coupon error:', error);
+    res.status(500).json({ error: error?.message || 'Failed to create coupon' });
+  }
+});
+
+// PATCH - Update a coupon (admin) — e.g. activate/deactivate, adjust expiry/cap.
+app.patch('/coupons/:code', async (req: Request, res: Response) => {
+  try {
+    const code = String(req.params.code || '').trim().toUpperCase();
+    const ref = db.collection('coupons').doc(code);
+    if (!(await ref.get()).exists) {
+      return res.status(404).json({ error: 'Coupon not found' });
+    }
+    const b = req.body as { active?: boolean; expiresAt?: string | null; maxRedemptions?: number | null };
+    const patch: Record<string, unknown> = {};
+    if (typeof b.active === 'boolean') patch.active = b.active;
+    if (b.expiresAt === null || typeof b.expiresAt === 'string') {
+      patch.expires_at = b.expiresAt && b.expiresAt.trim() ? b.expiresAt.trim() : null;
+    }
+    if (b.maxRedemptions === null || (typeof b.maxRedemptions === 'number' && Number.isInteger(b.maxRedemptions))) {
+      patch.max_redemptions = b.maxRedemptions ?? null;
+    }
+    if (Object.keys(patch).length === 0) {
+      return res.status(400).json({ error: 'No updatable fields provided (active, expiresAt, maxRedemptions)' });
+    }
+    patch.updatedAt = new Date().toISOString();
+    await ref.update(patch);
+    res.json((await ref.get()).data());
+  } catch (error: any) {
+    console.error('Update coupon error:', error);
+    res.status(500).json({ error: error?.message || 'Failed to update coupon' });
+  }
+});
+
 // POST - Create payment: Stripe Checkout (pay-what-you-want Price on Product) when campaign has stripe_product_id; else PaymentIntent + Elements
 app.post('/payments/create-payment-intent', async (req: Request, res: Response) => {
   if (!stripe) {
@@ -3052,6 +3366,8 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
       promoCode?: string;
       posthogDistinctId?: string;
       utm?: Record<string, unknown>;
+      couponCode?: string;
+      email?: string;
     };
     const { amount: amountCents, campaignId, currency = 'usd' } = body;
     const cur = (currency || 'usd').toLowerCase();
@@ -3071,22 +3387,77 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
     if (stripeProductId) {
       const base = getPrimaryFrontendOrigin();
       const donorUid = typeof req.firebaseUid === 'string' && req.firebaseUid.trim() ? req.firebaseUid.trim() : undefined;
-      const donorEmail =
+      const tokenEmail =
         typeof req.firebaseEmail === 'string' && req.firebaseEmail.trim()
           ? req.firebaseEmail.trim().toLowerCase()
           : undefined;
-      // UE-154: stamp the Checkout Session with a canonical identity + coupon-tracking
-      // metadata so a redemption is fully recoverable from the webhook.
-      const promoCode = sanitizeMetaValue(body.promoCode);
+      const bodyEmail =
+        typeof body.email === 'string' && body.email.trim() ? body.email.trim().toLowerCase() : undefined;
+      // Guest zero-balance backings skip Stripe (no page to collect email), so accept the
+      // lander-collected email as a fallback for receipts + per-user coupon limits.
+      const donorEmail = tokenEmail || bodyEmail || undefined;
+
+      // Acquisition + identity context (UE-154), stamped on the session so a redemption is
+      // fully recoverable from the webhook.
       const posthogDistinctId = sanitizeMetaValue(body.posthogDistinctId);
       const utmIn = body.utm && typeof body.utm === 'object' ? body.utm : {};
       const utmSource = sanitizeMetaValue(utmIn.utm_source);
       const utmCampaign = sanitizeMetaValue(utmIn.utm_campaign);
       const isGuest = !donorUid;
-
-      // Canonical distinct id everywhere: Firebase UID for logged-in users, else the
-      // guest's PostHog distinct id. campaignId is preserved in metadata (below).
+      // Canonical distinct id everywhere: Firebase UID for logged-in users, else the guest's
+      // PostHog distinct id. campaignId is preserved in metadata (below).
       const canonicalRef = donorUid || posthogDistinctId || undefined;
+
+      /** Fixed donation amount = the gross the backer chose. Required to apply a coupon. */
+      const fixedRaw = body.fixedAmountCents;
+      const fixedParsed =
+        typeof fixedRaw === 'number' && Number.isFinite(fixedRaw) ? Math.round(fixedRaw) : NaN;
+      const useFixedAmount =
+        Number.isFinite(fixedParsed) &&
+        fixedParsed >= DONATION_CHECKOUT_MIN_CENTS &&
+        fixedParsed <= 100_000_000; // $1M cap (cents)
+
+      // Custom coupon: validate against our DB (server-authoritative) before Stripe. A coupon
+      // needs a concrete amount to discount, so it only applies to fixed-amount checkouts.
+      const couponCodeIn = typeof body.couponCode === 'string' ? body.couponCode.trim() : '';
+      let coupon: CouponValidationResult | null = null;
+      if (couponCodeIn && useFixedAmount) {
+        coupon = await validateCoupon(couponCodeIn, cidTrim, fixedParsed);
+        if (!coupon.valid) {
+          return res.status(400).json({ error: 'coupon_invalid', reason: coupon.reason });
+        }
+      }
+
+      // Zero-balance: the coupon covers the full contribution → skip Stripe (no $0 order / fee),
+      // credit the gross directly, and return without a redirect.
+      if (coupon && coupon.netCents === 0) {
+        const { funding_current } = await recordCouponOnlyBacking({
+          campaignId: cidTrim,
+          code: coupon.code!,
+          grossCents: coupon.grossCents!,
+          discountCents: coupon.discountCents!,
+          donorUid,
+          donorEmail,
+          posthogDistinctId: posthogDistinctId || undefined,
+          utmSource: utmSource || undefined,
+          utmCampaign: utmCampaign || undefined,
+          isGuest,
+        });
+        return res.json({ ok: true, zeroBalance: true, funding_current });
+      }
+
+      // A coupon that leaves a positive net below Stripe's minimum can't be charged — reject
+      // cleanly so the client can prompt a higher amount (rather than surfacing a Stripe 500).
+      if (coupon && coupon.netCents! > 0 && coupon.netCents! < STRIPE_MIN_CHARGE_CENTS) {
+        return res
+          .status(400)
+          .json({ error: 'coupon_invalid', reason: 'net_below_minimum', netCents: coupon.netCents });
+      }
+
+      // The coupon code is the authoritative promo for tracking; fall back to any passed code.
+      const promoCode = coupon?.code || sanitizeMetaValue(body.promoCode);
+      // Stripe charges the net when a coupon applies, else the full gross.
+      const chargeCents = coupon ? coupon.netCents! : fixedParsed;
 
       const checkoutMetadata: Record<string, string> = {
         campaignId: cidTrim, // kept for the existing /payments/record-checkout-session consumer
@@ -3102,20 +3473,18 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
       if (posthogDistinctId) checkoutMetadata.posthog_distinct_id = posthogDistinctId;
       if (utmSource) checkoutMetadata.utm_source = utmSource;
       if (utmCampaign) checkoutMetadata.utm_campaign = utmCampaign;
+      if (coupon) {
+        // We charge the net, but the fund must still credit the gross — carry both so the
+        // recorder uses gross_cents (Stripe's amount_subtotal would only equal the net here).
+        checkoutMetadata.coupon_code = coupon.code!;
+        checkoutMetadata.gross_cents = String(coupon.grossCents);
+        checkoutMetadata.discount_cents = String(coupon.discountCents);
+      }
 
       // Stamp a reusable Stripe Customer with firebase_uid + email (logged-in only).
       const stripeCustomerId = donorUid
         ? await ensureStripeCustomer(donorUid, donorEmail)
         : undefined;
-
-      /** Optional: lock Checkout to an exact donation (e.g. lander preset). Omit for pay-what-you-want on Stripe’s page. */
-      const fixedRaw = body.fixedAmountCents;
-      const fixedParsed =
-        typeof fixedRaw === 'number' && Number.isFinite(fixedRaw) ? Math.round(fixedRaw) : NaN;
-      const useFixedAmount =
-        Number.isFinite(fixedParsed) &&
-        fixedParsed >= DONATION_CHECKOUT_MIN_CENTS &&
-        fixedParsed <= 100_000_000; // $1M cap (cents)
 
       const cancelRel =
         typeof body.checkoutCancelPath === 'string' &&
@@ -3154,7 +3523,8 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
         payment_intent_data: {
           metadata: checkoutMetadata,
         },
-        allow_promotion_codes: true,
+        // Coupons are applied by the platform before Stripe (custom system), so Stripe-native
+        // promotion codes are intentionally not enabled here.
       };
 
       if (useFixedAmount) {
@@ -3164,7 +3534,7 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
             {
               price_data: {
                 currency: cur,
-                unit_amount: fixedParsed,
+                unit_amount: chargeCents,
                 product: stripeProductId,
               },
               quantity: 1,
@@ -3221,12 +3591,20 @@ app.post('/payments/record-checkout-session', async (req: Request, res: Response
     if (!campaignId || typeof campaignId !== 'string') {
       return res.status(400).json({ error: 'Invalid session: missing campaign' });
     }
-    // Count the GROSS contribution toward the fund, not the post-coupon charge — a
-    // coupon-discounted (even fully-discounted) backing should credit the full amount.
-    // amount_subtotal is pre-discount; fall back to charged + discount. (UE-147)
+    // Count the GROSS contribution toward the fund, not the post-coupon charge. For custom
+    // coupons we charge the net directly, so Stripe's amount_subtotal equals the net — the
+    // true gross/discount ride in metadata. Fall back to Stripe's fields otherwise. (UE-147)
+    const md = session.metadata || {};
+    const metaGross = md.gross_cents != null ? Number(md.gross_cents) : NaN;
+    const metaDiscount = md.discount_cents != null ? Number(md.discount_cents) : NaN;
+    const couponCode = typeof md.coupon_code === 'string' && md.coupon_code.trim() ? md.coupon_code.trim() : null;
     const amountChargedCents = session.amount_total ?? 0; // actually charged, post-coupon
-    const amountDiscountCents = session.total_details?.amount_discount ?? 0;
-    const amountGrossCents = session.amount_subtotal ?? amountChargedCents + amountDiscountCents;
+    const amountDiscountCents = Number.isFinite(metaDiscount)
+      ? metaDiscount
+      : session.total_details?.amount_discount ?? 0;
+    const amountGrossCents = Number.isFinite(metaGross)
+      ? metaGross
+      : session.amount_subtotal ?? amountChargedCents + amountDiscountCents;
     if (amountGrossCents < 0) {
       return res.status(400).json({ error: 'Invalid payment amount' });
     }
@@ -3275,6 +3653,7 @@ app.post('/payments/record-checkout-session', async (req: Request, res: Response
         invoice_pdf: invoicePdf,
         hosted_invoice_url: hostedInvoiceUrl,
         invoice_number: invoiceNumber,
+        ...(couponCode ? { coupon_code: couponCode } : {}),
         ...(donorUid ? { donor_uid: donorUid } : {}),
       });
       t.update(campaignRef, {
@@ -3298,6 +3677,18 @@ app.post('/payments/record-checkout-session', async (req: Request, res: Response
         invoice_pdf: invoicePdf,
         hosted_invoice_url: hostedInvoiceUrl,
         invoice_number: invoiceNumber,
+        ...(couponCode ? { coupon_code: couponCode } : {}),
+      });
+    }
+
+    // Count the coupon redemption once per session (partial-discount Stripe path).
+    if (wroteNewRecord && couponCode) {
+      await recordCouponRedemption(couponCode, sid, {
+        campaignId: campaignId.trim(),
+        grossCents: amountGrossCents,
+        discountCents: amountDiscountCents,
+        uid: donorUid,
+        email: session.customer_details?.email || undefined,
       });
     }
 
