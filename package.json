@@ -12,10 +12,11 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@resvg/resvg-js": "^2.6.2",
+    "@fontsource/roboto": "^5.2.10",
     "@google-cloud/storage": "^7.18.0",
     "@google-cloud/vertexai": "^1.10.0",
     "@google/generative-ai": "^0.24.1",
+    "@resvg/resvg-js": "^2.6.2",
     "@slack/web-api": "^7.13.0",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",

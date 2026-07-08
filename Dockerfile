@@ -10,6 +10,9 @@ COPY package*.json ./
 # Install all dependencies (including dev dependencies for build)
 RUN npm ci
 
+# Fonts for OG image rendering (fallback if embedded fonts fail)
+RUN apk add --no-cache fontconfig ttf-dejavu
+
 # Copy TypeScript config
 COPY tsconfig.json ./
 

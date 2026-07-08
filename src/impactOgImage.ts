@@ -1,5 +1,20 @@
+import path from 'path';
+import { createRequire } from 'module';
 import { Resvg } from '@resvg/resvg-js';
 import { formatCompactNumber } from './impactMetrics';
+
+const nodeRequire = createRequire(__filename);
+const FONT_FAMILY = 'Roboto, DejaVu Sans, sans-serif';
+
+function getRobotoFontFiles(): string[] {
+  const base = path.join(
+    path.dirname(nodeRequire.resolve('@fontsource/roboto/package.json')),
+    'files',
+  );
+  return [400, 500, 700, 900].map((weight) =>
+    path.join(base, `roboto-latin-${weight}-normal.woff`),
+  );
+}
 
 export type ImpactShareCardScope = 'cumulative' | 'campaign';
 
@@ -109,37 +124,37 @@ export function buildImpactOgSvg(payload: ImpactShareCardPayload): string {
     <circle cx="10" cy="10" r="4" fill="#1A6BBF"/>
     <circle cx="22" cy="6" r="3" fill="#1A6BBF" fill-opacity="0.75"/>
     <circle cx="30" cy="14" r="2.5" fill="#1A6BBF" fill-opacity="0.55"/>
-    <text x="44" y="16" fill="#1A6BBF" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif" font-size="18" font-weight="700" letter-spacing="2.2">PERSONAL IMPACT</text>
+    <text x="44" y="16" fill="#1A6BBF" font-family="${FONT_FAMILY}" font-size="18" font-weight="700">PERSONAL IMPACT</text>
   </g>
 
-  <text x="120" y="154" fill="#0F172A" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif" font-size="44" font-weight="800">${escapeXml(title)}</text>
-  <text x="120" y="186" fill="#64748B" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif" font-size="22" font-weight="500">${escapeXml(subtitle)}</text>
+  <text x="120" y="154" fill="#0F172A" font-family="${FONT_FAMILY}" font-size="44" font-weight="900">${escapeXml(title)}</text>
+  <text x="120" y="186" fill="#64748B" font-family="${FONT_FAMILY}" font-size="22" font-weight="500">${escapeXml(subtitle)}</text>
 
   <rect x="120" y="228" width="960" height="132" rx="18" fill="#FFFFFF" stroke="#1A6BBF" stroke-opacity="0.18" stroke-width="2"/>
-  <text x="600" y="302" text-anchor="middle" fill="#1A6BBF" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif" font-size="64" font-weight="800">${escapeXml(reached)}</text>
-  <text x="600" y="338" text-anchor="middle" fill="#64748B" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif" font-size="16" font-weight="700" letter-spacing="1.8">PEOPLE REACHED ON THEIR BEHALF</text>
+  <text x="600" y="302" text-anchor="middle" fill="#1A6BBF" font-family="${FONT_FAMILY}" font-size="64" font-weight="900">${escapeXml(reached)}</text>
+  <text x="600" y="338" text-anchor="middle" fill="#64748B" font-family="${FONT_FAMILY}" font-size="16" font-weight="700">PEOPLE REACHED ON THEIR BEHALF</text>
 
   <rect x="120" y="384" width="468" height="108" rx="16" fill="#FFFFFF" fill-opacity="0.92" stroke="#1A6BBF" stroke-opacity="0.12" stroke-width="2"/>
-  <text x="354" y="442" text-anchor="middle" fill="#0F172A" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif" font-size="40" font-weight="800">${escapeXml(views)}</text>
-  <text x="354" y="472" text-anchor="middle" fill="#64748B" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif" font-size="13" font-weight="700" letter-spacing="1.6">VIEWS</text>
+  <text x="354" y="442" text-anchor="middle" fill="#0F172A" font-family="${FONT_FAMILY}" font-size="40" font-weight="900">${escapeXml(views)}</text>
+  <text x="354" y="472" text-anchor="middle" fill="#64748B" font-family="${FONT_FAMILY}" font-size="13" font-weight="700">VIEWS</text>
 
   <rect x="612" y="384" width="468" height="108" rx="16" fill="#FFFFFF" fill-opacity="0.92" stroke="#1A6BBF" stroke-opacity="0.12" stroke-width="2"/>
-  <text x="846" y="442" text-anchor="middle" fill="#0F172A" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif" font-size="40" font-weight="800">${escapeXml(actions)}</text>
-  <text x="846" y="472" text-anchor="middle" fill="#64748B" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif" font-size="13" font-weight="700" letter-spacing="1.6">ACTIONS</text>
+  <text x="846" y="442" text-anchor="middle" fill="#0F172A" font-family="${FONT_FAMILY}" font-size="40" font-weight="900">${escapeXml(actions)}</text>
+  <text x="846" y="472" text-anchor="middle" fill="#64748B" font-family="${FONT_FAMILY}" font-size="13" font-weight="700">ACTIONS</text>
 
   ${
     shift
       ? `<rect x="120" y="510" width="468" height="56" rx="14" fill="#FBEDEA"/>
-  <text x="354" y="548" text-anchor="middle" fill="#C94F3D" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif" font-size="30" font-weight="800">${escapeXml(shift)}</text>
-  <text x="354" y="572" text-anchor="middle" fill="#64748B" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif" font-size="11" font-weight="700" letter-spacing="1.4">PERCEPTION SHIFT</text>`
+  <text x="354" y="548" text-anchor="middle" fill="#C94F3D" font-family="${FONT_FAMILY}" font-size="30" font-weight="900">${escapeXml(shift)}</text>
+  <text x="354" y="572" text-anchor="middle" fill="#64748B" font-family="${FONT_FAMILY}" font-size="11" font-weight="700">PERCEPTION SHIFT</text>`
       : ''
   }
 
   <rect x="${shift ? 612 : 120}" y="510" width="${shift ? 468 : 960}" height="56" rx="14" fill="#FBEDEA"/>
-  <text x="${shift ? 846 : 600}" y="548" text-anchor="middle" fill="#C94F3D" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif" font-size="30" font-weight="800">~${escapeXml(reconsidered)}</text>
-  <text x="${shift ? 846 : 600}" y="572" text-anchor="middle" fill="#64748B" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif" font-size="11" font-weight="700" letter-spacing="1.4">RECONSIDERED</text>
+  <text x="${shift ? 846 : 600}" y="548" text-anchor="middle" fill="#C94F3D" font-family="${FONT_FAMILY}" font-size="30" font-weight="900">~${escapeXml(reconsidered)}</text>
+  <text x="${shift ? 846 : 600}" y="572" text-anchor="middle" fill="#64748B" font-family="${FONT_FAMILY}" font-size="11" font-weight="700">RECONSIDERED</text>
 
-  <text x="120" y="598" fill="#94A3B8" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif" font-size="18" font-weight="600">The Unravel Network</text>
+  <text x="120" y="598" fill="#94A3B8" font-family="${FONT_FAMILY}" font-size="18" font-weight="500">The Unravel Network</text>
   <circle cx="1080" cy="586" r="14" fill="#1A6BBF"/>
   <path d="M1073 586 L1078 591 L1088 579" fill="none" stroke="#FFFFFF" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>`;
@@ -149,6 +164,11 @@ export function renderImpactOgPng(payload: ImpactShareCardPayload): Buffer {
   const svg = buildImpactOgSvg(payload);
   const resvg = new Resvg(svg, {
     fitTo: { mode: 'width', value: IMPACT_OG_WIDTH },
+    font: {
+      fontFiles: getRobotoFontFiles(),
+      loadSystemFonts: true,
+      defaultFontFamily: FONT_FAMILY,
+    },
   });
   return Buffer.from(resvg.render().asPng());
 }
