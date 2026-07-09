@@ -2251,6 +2251,80 @@ async function deleteGeneratedImagesFromGcs(imageUrls: string[]): Promise<void> 
   }
 }
 
+/** Sanitize campaign text/media fields on create and patch (not applied on generic PUT). */
+function sanitizeCampaignContentFields(data: Record<string, unknown>): void {
+  if (data.slideshow_back_button_url !== undefined) {
+    data.slideshow_back_button_url = sanitizeSlideshowBackButtonUrl(data.slideshow_back_button_url);
+  }
+
+  if (data.campaign_sources !== undefined && data.campaign_sources !== null) {
+    const lines = Array.isArray(data.campaign_sources)
+      ? data.campaign_sources
+      : String(data.campaign_sources).split('\n');
+    const cleaned = lines
+      .map((s: unknown) => String(s).trim().slice(0, 500))
+      .filter(Boolean)
+      .slice(0, 30);
+    if (cleaned.length > 0) data.campaign_sources = cleaned;
+    else delete data.campaign_sources;
+  }
+
+  if (data.ad_primary_text !== undefined && data.ad_primary_text !== null) {
+    const v = String(data.ad_primary_text).trim().slice(0, 200);
+    if (v) data.ad_primary_text = v;
+    else delete data.ad_primary_text;
+  }
+  if (data.ad_headline !== undefined && data.ad_headline !== null) {
+    const v = String(data.ad_headline).trim().slice(0, 60);
+    if (v) data.ad_headline = v;
+    else delete data.ad_headline;
+  }
+  if (data.ad_image_url !== undefined && data.ad_image_url !== null) {
+    const v = String(data.ad_image_url).trim();
+    if (v) data.ad_image_url = v;
+    else delete data.ad_image_url;
+  }
+
+  if (data.hero_slideshow !== undefined) {
+    if (!Array.isArray(data.hero_slideshow)) {
+      delete data.hero_slideshow;
+    } else {
+      data.hero_slideshow = (data.hero_slideshow as unknown[])
+        .map((slide) => {
+          if (!slide || typeof slide !== 'object') return null;
+          const s = slide as Record<string, unknown>;
+          const description = String(s.description ?? '').trim().slice(0, 2000);
+          const youtubeVideoId = s.youtubeVideoId
+            ? String(s.youtubeVideoId).trim().slice(0, 32)
+            : undefined;
+          const youtubeUrl = s.youtubeUrl ? String(s.youtubeUrl).trim().slice(0, 500) : undefined;
+          const imageUrl = s.imageUrl ? String(s.imageUrl).trim().slice(0, 2048) : undefined;
+          if (!description) return null;
+          if (youtubeVideoId || youtubeUrl) {
+            const out: Record<string, string> = { description };
+            if (youtubeUrl) out.youtubeUrl = youtubeUrl;
+            if (youtubeVideoId) out.youtubeVideoId = youtubeVideoId;
+            return out;
+          }
+          if (imageUrl) return { description, imageUrl };
+          return null;
+        })
+        .filter(Boolean)
+        .slice(0, 30);
+    }
+  }
+
+  if (data.thumbnail_url !== undefined && data.thumbnail_url !== null) {
+    const v = String(data.thumbnail_url).trim();
+    if (v) data.thumbnail_url = v;
+    else delete data.thumbnail_url;
+  }
+
+  if (data.short_description !== undefined && data.short_description !== null) {
+    data.short_description = String(data.short_description).trim().slice(0, 500);
+  }
+}
+
 // POST - Create a new document
 app.post('/data/:collection', async (req: Request, res: Response) => {
   try {
@@ -2302,39 +2376,7 @@ app.post('/data/:collection', async (req: Request, res: Response) => {
       }
       delete data.unusedGeneratedImageUrls; // do not store in Firestore
 
-      if (data.slideshow_back_button_url !== undefined) {
-        data.slideshow_back_button_url = sanitizeSlideshowBackButtonUrl(data.slideshow_back_button_url);
-      }
-
-      // Creator-listed sources (optional); ignore bad shapes for legacy clients
-      if (data.campaign_sources !== undefined && data.campaign_sources !== null) {
-        const lines = Array.isArray(data.campaign_sources)
-          ? data.campaign_sources
-          : String(data.campaign_sources).split('\n');
-        const cleaned = lines
-          .map((s: unknown) => String(s).trim().slice(0, 500))
-          .filter(Boolean)
-          .slice(0, 30);
-        if (cleaned.length > 0) data.campaign_sources = cleaned;
-        else delete data.campaign_sources;
-      }
-
-      // Ad preview overrides (optional). Trimmed + length-capped; empty values dropped.
-      if (data.ad_primary_text !== undefined && data.ad_primary_text !== null) {
-        const v = String(data.ad_primary_text).trim().slice(0, 200);
-        if (v) data.ad_primary_text = v;
-        else delete data.ad_primary_text;
-      }
-      if (data.ad_headline !== undefined && data.ad_headline !== null) {
-        const v = String(data.ad_headline).trim().slice(0, 60);
-        if (v) data.ad_headline = v;
-        else delete data.ad_headline;
-      }
-      if (data.ad_image_url !== undefined && data.ad_image_url !== null) {
-        const v = String(data.ad_image_url).trim();
-        if (v) data.ad_image_url = v;
-        else delete data.ad_image_url;
-      }
+      sanitizeCampaignContentFields(data);
 
       // Creator UID from verified Firebase token only (not client-supplied)
       delete data.created_by;
@@ -2494,9 +2536,7 @@ app.put('/data/:collection/:id', async (req: Request, res: Response) => {
         return res.status(404).json({ error: 'Document not found' });
       }
       const prev = snap.data() as Record<string, unknown>;
-      if (data.slideshow_back_button_url !== undefined) {
-        data.slideshow_back_button_url = sanitizeSlideshowBackButtonUrl(data.slideshow_back_button_url);
-      }
+      sanitizeCampaignContentFields(data);
       const durationResult = applyCampaignDurationPatch(data, prev);
       if (!durationResult.ok) {
         return res.status(400).json({ error: durationResult.error });
@@ -2540,9 +2580,15 @@ app.patch('/data/:collection/:id', async (req: Request, res: Response) => {
       }
       const prev = snap.data() as Record<string, unknown>;
 
-      if (data.slideshow_back_button_url !== undefined) {
-        data.slideshow_back_button_url = sanitizeSlideshowBackButtonUrl(data.slideshow_back_button_url);
+      const unusedGeneratedImageUrls = data.unusedGeneratedImageUrls;
+      if (Array.isArray(unusedGeneratedImageUrls) && unusedGeneratedImageUrls.length > 0) {
+        deleteGeneratedImagesFromGcs(unusedGeneratedImageUrls).catch((err) =>
+          console.error('Delete unused images failed:', err)
+        );
       }
+      delete data.unusedGeneratedImageUrls;
+
+      sanitizeCampaignContentFields(data);
 
       const durationResult = applyCampaignDurationPatch(data, prev);
       if (!durationResult.ok) {
