@@ -756,6 +756,129 @@ app.post('/campaign-report-drips/run', async (req: Request, res: Response) => {
 
 // ============ USERS (default Firestore DB) ============
 
+const USERNAMES_COLLECTION = 'usernames';
+
+const RESERVED_USERNAMES = new Set([
+  'admin',
+  'unravel',
+  'support',
+  'help',
+  'api',
+  'www',
+  'mail',
+  'root',
+  'system',
+  'moderator',
+  'staff',
+  'account',
+  'settings',
+  'login',
+  'signup',
+]);
+
+type NormalizedUsername = { username: string; usernameLower: string };
+
+function defaultUsernameFromName(firstName: string, lastName: string): NormalizedUsername {
+  const fn = String(firstName || '').trim();
+  const ln = String(lastName || '').trim();
+  const username = `${fn} ${ln}`.trim().slice(0, 30);
+  const usernameLower = `${fn}${ln}`.replace(/[^a-zA-Z0-9]/g, '').toLowerCase().slice(0, 30);
+  return {
+    username: username || fn || ln || 'user',
+    usernameLower: usernameLower || 'user',
+  };
+}
+
+function normalizeUsername(raw: unknown): NormalizedUsername | null {
+  const username = String(raw || '').trim().slice(0, 30);
+  if (!username) return null;
+  const usernameLower = username.replace(/\s+/g, '').toLowerCase();
+  if (usernameLower.length < 2 || usernameLower.length > 30) return null;
+  if (!/^[a-z0-9][a-z0-9_\-\s]*[a-z0-9]$|^[a-z0-9]{1,2}$/i.test(username.replace(/\s+/g, ''))) return null;
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9_\-\s]*$/.test(username)) return null;
+  if (RESERVED_USERNAMES.has(usernameLower)) return null;
+  return { username, usernameLower };
+}
+
+function resolveUsernameInput(
+  usernameInput: unknown,
+  firstName: string,
+  lastName: string
+): NormalizedUsername | { error: string } {
+  const trimmed = usernameInput == null ? '' : String(usernameInput).trim();
+  if (!trimmed) return defaultUsernameFromName(firstName, lastName);
+  const normalized = normalizeUsername(trimmed);
+  if (!normalized) {
+    return {
+      error:
+        'Username must be 2–30 characters and use only letters, numbers, spaces, underscores, or hyphens.',
+    };
+  }
+  return normalized;
+}
+
+async function claimUsernameForUser(
+  uid: string,
+  target: NormalizedUsername,
+  existingUsernameLower?: string | null
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (existingUsernameLower === target.usernameLower) {
+    return { ok: true };
+  }
+
+  const usernameRef = usersDb.collection(USERNAMES_COLLECTION).doc(target.usernameLower);
+
+  try {
+    await usersDb.runTransaction(async (tx) => {
+      const usernameSnap = await tx.get(usernameRef);
+      if (usernameSnap.exists) {
+        const owner = String(usernameSnap.data()?.uid || '');
+        if (owner && owner !== uid) {
+          throw new Error('USERNAME_TAKEN');
+        }
+      }
+      if (existingUsernameLower && existingUsernameLower !== target.usernameLower) {
+        const oldRef = usersDb.collection(USERNAMES_COLLECTION).doc(existingUsernameLower);
+        const oldSnap = await tx.get(oldRef);
+        if (oldSnap.exists && String(oldSnap.data()?.uid || '') === uid) {
+          tx.delete(oldRef);
+        }
+      }
+      tx.set(usernameRef, {
+        uid,
+        username: target.username,
+        usernameLower: target.usernameLower,
+        updatedAt: new Date().toISOString(),
+      });
+    });
+    return { ok: true };
+  } catch (error) {
+    if (error instanceof Error && error.message === 'USERNAME_TAKEN') {
+      return { ok: false, error: 'This username is already taken. Please choose another.' };
+    }
+    throw error;
+  }
+}
+
+/** Check whether a username is available (no auth; requires x-api-key). */
+app.get('/users/username/available', async (req: Request, res: Response) => {
+  try {
+    const raw = String(req.query.username || '').trim();
+    if (!raw) {
+      return res.status(400).json({ available: false, reason: 'invalid' });
+    }
+    const normalized = normalizeUsername(raw);
+    if (!normalized) {
+      return res.json({ available: false, reason: 'invalid' });
+    }
+    const snap = await usersDb.collection(USERNAMES_COLLECTION).doc(normalized.usernameLower).get();
+    res.json({ available: !snap.exists, reason: snap.exists ? 'taken' : undefined });
+  } catch (error) {
+    console.error('GET /users/username/available:', error);
+    res.status(500).json({ error: 'Failed to check username' });
+  }
+});
+
 /** Create or update profile after sign-up. Requires Firebase ID token + x-api-key. */
 app.post('/users/profile', async (req: Request, res: Response) => {
   try {
@@ -779,6 +902,7 @@ app.post('/users/profile', async (req: Request, res: Response) => {
       firstName,
       lastName,
       email,
+      username,
       policiesVersion,
       marketingEmailConsent,
       marketingSmsConsent,
@@ -816,6 +940,7 @@ app.post('/users/profile', async (req: Request, res: Response) => {
     const uid = decoded.uid;
     const ref = usersDb.collection('users').doc(uid);
     const snap = await ref.get();
+    const existingData = snap.exists ? snap.data() : undefined;
     const now = new Date().toISOString();
     const payload: Record<string, unknown> = {
       firstName: fn,
@@ -823,6 +948,23 @@ app.post('/users/profile', async (req: Request, res: Response) => {
       email: normEmail,
       updatedAt: now,
     };
+
+    if (Object.prototype.hasOwnProperty.call(req.body as object, 'username')) {
+      const resolved = resolveUsernameInput(username, fn, ln);
+      if ('error' in resolved) {
+        return res.status(400).json({ error: resolved.error });
+      }
+      const claim = await claimUsernameForUser(
+        uid,
+        resolved,
+        typeof existingData?.usernameLower === 'string' ? existingData.usernameLower : null
+      );
+      if (!claim.ok) {
+        return res.status(409).json({ error: claim.error });
+      }
+      payload.username = resolved.username;
+      payload.usernameLower = resolved.usernameLower;
+    }
 
     // Current-state consent fields on the user doc (fast read, overwritten on each
     // update). Only written when the client sends policiesVersion — otherwise we
@@ -916,10 +1058,9 @@ app.get('/users/me/campaigns', async (req: Request, res: Response) => {
     const uid = decoded.uid;
     const snapshot = await db.collection('campaigns').where('created_by', '==', uid).get();
 
-    const documents = snapshot.docs.map(doc => {
-      const data = { id: doc.id, ...doc.data() } as Record<string, unknown>;
-      return enrichCampaignResponse(data);
-    });
+    const documents = await enrichCampaignCreators(
+      snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }) as Record<string, unknown>)
+    );
 
     documents.sort((a: any, b: any) => {
       const dateA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
@@ -1442,10 +1583,9 @@ app.get('/campaigns/approved', async (req: Request, res: Response) => {
       .where('status', '==', 'Approved')
       .get();
 
-    const documents = snapshot.docs.map(doc => {
-      const data = { id: doc.id, ...doc.data() } as Record<string, unknown>;
-      return enrichCampaignResponse(data);
-    });
+    const documents = await enrichCampaignCreators(
+      snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }) as Record<string, unknown>)
+    );
 
     documents.sort((a: any, b: any) => {
       const dateA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
@@ -1552,6 +1692,113 @@ function enrichCampaignResponse(
     days_left: daysLeft,
     campaign_ended: ended,
   };
+}
+
+/** Build public creator display fields from a user profile doc. Prefer username. */
+function creatorFieldsFromUserProfile(userData: Record<string, unknown> | null | undefined): {
+  creator_username?: string;
+  creator_first_name?: string;
+  creator_last_name?: string;
+  creator?: string;
+  creator_name?: string;
+  creator_email?: string;
+} {
+  if (!userData) return {};
+  const username = String(userData.username ?? '').trim();
+  const firstName = String(userData.firstName ?? '').trim();
+  const lastName = String(userData.lastName ?? '').trim();
+  const fullName = `${firstName} ${lastName}`.trim();
+  const email = String(userData.email ?? '').trim().toLowerCase();
+  const display = username || fullName;
+  const out: Record<string, string> = {};
+  if (username) out.creator_username = username;
+  if (firstName) out.creator_first_name = firstName;
+  if (lastName) out.creator_last_name = lastName;
+  if (display) {
+    out.creator = display;
+    out.creator_name = display;
+  }
+  if (email) out.creator_email = email;
+  return out;
+}
+
+function campaignHasCreatorDisplay(data: Record<string, unknown>): boolean {
+  const username = String(data.creator_username ?? '').trim();
+  const name = String(data.creator_name ?? data.creator ?? '').trim();
+  const parts = [data.creator_first_name, data.creator_last_name]
+    .map((v) => String(v ?? '').trim())
+    .filter(Boolean)
+    .join(' ');
+  return Boolean(username || name || parts);
+}
+
+/**
+ * Fill missing creator display fields from users/{created_by}.
+ * Prefer username when present. Response-only (does not write Firestore).
+ */
+async function enrichCampaignCreators(
+  campaigns: Record<string, unknown>[]
+): Promise<Record<string, unknown>[]> {
+  const uidsNeeded = new Set<string>();
+  for (const c of campaigns) {
+    if (c.admin_created) continue;
+    const uid = String(c.created_by ?? c.created_by_uid ?? '').trim();
+    if (!uid) continue;
+    // Always try to attach username when missing, even if a name snapshot exists.
+    const hasUsername = Boolean(String(c.creator_username ?? '').trim());
+    if (!hasUsername || !campaignHasCreatorDisplay(c)) {
+      uidsNeeded.add(uid);
+    }
+  }
+
+  const byUid = new Map<string, Record<string, unknown>>();
+  if (uidsNeeded.size > 0) {
+    const refs = [...uidsNeeded].map((uid) => usersDb.collection('users').doc(uid));
+    // Firestore getAll accepts up to a batch of refs
+    const snaps = await usersDb.getAll(...refs);
+    for (const snap of snaps) {
+      if (snap.exists) {
+        byUid.set(snap.id, snap.data() as Record<string, unknown>);
+      }
+    }
+  }
+
+  return campaigns.map((c) => {
+    const data = { ...c };
+    if (data.admin_created) return enrichCampaignResponse(data);
+
+    const uid = String(data.created_by ?? data.created_by_uid ?? '').trim();
+    const user = uid ? byUid.get(uid) : undefined;
+    if (user) {
+      const fields = creatorFieldsFromUserProfile(user);
+      // Prefer live username for public display when available.
+      if (fields.creator_username) {
+        data.creator_username = fields.creator_username;
+        data.creator = fields.creator_username;
+        data.creator_name = fields.creator_username;
+      } else if (!campaignHasCreatorDisplay(data)) {
+        Object.assign(data, fields);
+      }
+      if (!data.creator_first_name && fields.creator_first_name) {
+        data.creator_first_name = fields.creator_first_name;
+      }
+      if (!data.creator_last_name && fields.creator_last_name) {
+        data.creator_last_name = fields.creator_last_name;
+      }
+      if (!data.creator_email && fields.creator_email) {
+        data.creator_email = fields.creator_email;
+      }
+    }
+
+    // Prefer stored username over a name-only snapshot when both exist.
+    const storedUsername = String(data.creator_username ?? '').trim();
+    if (storedUsername) {
+      data.creator = storedUsername;
+      data.creator_name = storedUsername;
+    }
+
+    return enrichCampaignResponse(data);
+  });
 }
 
 type CampaignDurationPatchResult =
@@ -1705,10 +1952,11 @@ app.get('/data/:collection', async (req: Request, res: Response) => {
       snapshot = await db.collection(collection).get();
     }
     
-    const documents = snapshot.docs.map(doc => {
-      const data = { id: doc.id, ...doc.data() } as Record<string, unknown>;
-      return collection === 'campaigns' ? enrichCampaignResponse(data) : data;
-    });
+    const rawDocs = snapshot.docs.map(
+      (doc) => ({ id: doc.id, ...doc.data() }) as Record<string, unknown>
+    );
+    const documents =
+      collection === 'campaigns' ? await enrichCampaignCreators(rawDocs) : rawDocs;
     documents.sort((a: any, b: any) => {
       const dateA = documentCreatedMsForSort(a as Record<string, unknown>);
       const dateB = documentCreatedMsForSort(b as Record<string, unknown>);
@@ -1746,7 +1994,9 @@ app.get('/data/:collection/:id', async (req: Request, res: Response) => {
     }
 
     const response =
-      collection === 'campaigns' ? enrichCampaignResponse(out) : out;
+      collection === 'campaigns'
+        ? (await enrichCampaignCreators([out]))[0]
+        : out;
 
     res.json(response);
   } catch (error) {
@@ -2379,7 +2629,12 @@ app.post('/data/:collection', async (req: Request, res: Response) => {
 
       sanitizeCampaignContentFields(data);
 
-      // Creator UID from verified Firebase token only (not client-supplied)
+      // Creator UID from verified Firebase token only (not client-supplied).
+      // Admin-created campaigns may set a public display name via creator_name.
+      const isAdminCreated = data.admin_created === true || data.admin_created === 'true';
+      const adminCreatorDisplay = isAdminCreated
+        ? String(data.creator_name ?? data.creator ?? '').trim().slice(0, 120)
+        : '';
       delete data.created_by;
       delete data.created_by_uid;
       delete data.creator;
@@ -2387,28 +2642,39 @@ app.post('/data/:collection', async (req: Request, res: Response) => {
       delete data.creator_first_name;
       delete data.creator_last_name;
       delete data.creator_email;
+      delete data.creator_username;
       if (req.firebaseUid) {
         data.created_by = req.firebaseUid;
         data.created_by_uid = req.firebaseUid;
 
         // Snapshot creator profile for display on campaign cards/detail pages.
-        // Ownership remains tied to `created_by` UID.
+        // Ownership remains tied to `created_by` UID. Prefer username when set.
         try {
           const userDoc = await usersDb.collection('users').doc(req.firebaseUid).get();
           const userData = userDoc.exists ? (userDoc.data() as Record<string, unknown>) : null;
-          const firstName = String(userData?.firstName ?? '').trim();
-          const lastName = String(userData?.lastName ?? '').trim();
-          const fullName = `${firstName} ${lastName}`.trim();
-          const email = String(userData?.email ?? req.firebaseEmail ?? '').trim().toLowerCase();
-          if (firstName) data.creator_first_name = firstName;
-          if (lastName) data.creator_last_name = lastName;
-          if (fullName) {
-            data.creator = fullName;
-            data.creator_name = fullName;
+          const fields = creatorFieldsFromUserProfile(userData);
+          if (!fields.creator_email && req.firebaseEmail) {
+            fields.creator_email = String(req.firebaseEmail).trim().toLowerCase();
           }
-          if (email) data.creator_email = email;
+          Object.assign(data, fields);
         } catch (creatorProfileErr) {
           console.error('Failed to attach creator profile snapshot:', creatorProfileErr);
+        }
+      }
+
+      if (isAdminCreated) {
+        data.admin_created = true;
+        // Public "by …" for admin campaigns uses the admin-entered display name only
+        // (not the signed-in admin's personal username/profile).
+        delete data.creator_username;
+        delete data.creator_first_name;
+        delete data.creator_last_name;
+        if (adminCreatorDisplay) {
+          data.creator = adminCreatorDisplay;
+          data.creator_name = adminCreatorDisplay;
+        } else {
+          delete data.creator;
+          delete data.creator_name;
         }
       }
     }
@@ -2603,6 +2869,18 @@ app.patch('/data/:collection/:id', async (req: Request, res: Response) => {
         return res.status(400).json({ error: impactMetricsResult.error });
       }
       Object.assign(data, impactMetricsResult.patch);
+
+      // Admin editor: allow setting/clearing the public creator display name.
+      if (data.creator_name !== undefined || data.creator !== undefined) {
+        const display = String(data.creator_name ?? data.creator ?? '').trim().slice(0, 120);
+        if (display) {
+          data.creator_name = display;
+          data.creator = display;
+        } else {
+          data.creator_name = FieldValue.delete();
+          data.creator = FieldValue.delete();
+        }
+      }
 
       // Admin approval: create a Stripe Product + pay-what-you-want Price once per campaign
       if (data.status === 'Approved' && stripe) {
