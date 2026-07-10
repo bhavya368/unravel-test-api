@@ -27,6 +27,7 @@ import {
   sanitizeCampaignImpactMetricsPatch,
 } from './impactReport';
 import { runCampaignReportDrips } from './campaignReportDrips';
+import { sendContributionReceipt } from './contributionReceipt';
 import {
   fetchFacebookAdInsights,
   insightsToCampaignPatch,
@@ -3105,7 +3106,8 @@ interface CouponValidationResult {
 async function validateCoupon(
   rawCode: string,
   campaignId: string,
-  amountCents: number
+  amountCents: number,
+  donor?: { uid?: string; email?: string }
 ): Promise<CouponValidationResult> {
   const code = rawCode.trim().toUpperCase();
   if (!code) return { valid: false, reason: 'missing_code' };
@@ -3134,6 +3136,21 @@ async function validateCoupon(
   const timesRedeemed = typeof c.times_redeemed === 'number' ? c.times_redeemed : 0;
   if (maxRedemptions != null && timesRedeemed >= maxRedemptions) {
     return { valid: false, reason: 'redemption_limit_reached' };
+  }
+
+  // Per-user limit (opt-in): a code flagged once_per_user may be redeemed only once per
+  // identity — by Firebase uid for signed-in users, else by email (lander guests). Enforced
+  // when we know who the donor is (checkout); redemptions are keyed off completed backings.
+  if (c.once_per_user === true && donor && (donor.uid || donor.email)) {
+    const priorSnap = await db.collection('stripe_checkout_records').where('coupon_code', '==', code).get();
+    const already = priorSnap.docs.some((d) => {
+      const r = d.data() as Record<string, unknown>;
+      return (
+        (!!donor.uid && r.donor_uid === donor.uid) ||
+        (!!donor.email && typeof r.donor_email === 'string' && r.donor_email === donor.email)
+      );
+    });
+    if (already) return { valid: false, reason: 'already_redeemed_by_user' };
   }
 
   // Compute the discount; it can never exceed the contribution, so net stays >= 0.
@@ -3185,6 +3202,20 @@ async function recordCouponRedemption(
  * the redemption, and emits the PostHog backing_completed event — parity with the Stripe path.
  * (UE-147 zero-balance path — the custom coupon system's reason for existing: no $0 Stripe order.)
  */
+/** Sequential receipt number: UNRVL-YYYY-###### (per-year counter in `counters/receipts_YYYY`). */
+async function nextReceiptNumber(): Promise<string> {
+  const year = new Date().getFullYear();
+  const counterRef = db.collection('counters').doc(`receipts_${year}`);
+  const seq = await db.runTransaction(async (t) => {
+    const snap = await t.get(counterRef);
+    const current = snap.exists ? Number((snap.data() as Record<string, unknown>)?.value || 0) : 0;
+    const next = current + 1;
+    t.set(counterRef, { value: next, updatedAt: new Date().toISOString() }, { merge: true });
+    return next;
+  });
+  return `UNRVL-${year}-${String(seq).padStart(6, '0')}`;
+}
+
 async function recordCouponOnlyBacking(input: {
   campaignId: string;
   code: string;
@@ -3192,6 +3223,7 @@ async function recordCouponOnlyBacking(input: {
   discountCents: number;
   donorUid?: string;
   donorEmail?: string;
+  donorName?: string;
   posthogDistinctId?: string;
   utmSource?: string;
   utmCampaign?: string;
@@ -3203,11 +3235,17 @@ async function recordCouponOnlyBacking(input: {
   const recordRef = db.collection('stripe_checkout_records').doc(redemptionId);
 
   let campaignTitle = 'Campaign';
+  let campaignCategory: string | null = null;
+  let campaignImageUrl: string | null = null;
+  let campaignTrustScore: number | null = null;
   await db.runTransaction(async (t) => {
     const campSnap = await t.get(campaignRef);
     if (!campSnap.exists) throw new Error('Campaign not found');
     const data = campSnap.data() || {};
     campaignTitle = typeof data.title === 'string' && data.title.trim() ? data.title.trim() : 'Campaign';
+    campaignCategory = typeof data.category === 'string' ? data.category : null;
+    campaignImageUrl = typeof data.thumbnail_url === 'string' ? data.thumbnail_url : null;
+    campaignTrustScore = typeof data.trust_score === 'number' ? data.trust_score : null;
     const currentFunding = Number(data.funding_current ?? 0) || 0;
     t.update(campaignRef, { funding_current: currentFunding + input.grossCents / 100, updatedAt: recordedAt });
     t.set(recordRef, {
@@ -3219,6 +3257,7 @@ async function recordCouponOnlyBacking(input: {
       recordedAt,
       ...(input.donorUid ? { donor_uid: input.donorUid } : {}),
       ...(input.donorEmail ? { donor_email: input.donorEmail } : {}),
+      ...(input.donorName ? { donor_name: input.donorName } : {}),
     });
   });
 
@@ -3264,6 +3303,31 @@ async function recordCouponOnlyBacking(input: {
     source: 'coupon_zero_balance',
   });
 
+  // Receipt + trust report email (best-effort — never block the backing on email delivery).
+  if (input.donorEmail) {
+    try {
+      await sendContributionReceipt({
+        campaignId: input.campaignId,
+        campaignTitle,
+        campaignCategory,
+        campaignImageUrl,
+        trustScore: campaignTrustScore,
+        grossCents: input.grossCents,
+        discountCents: input.discountCents,
+        chargedCents: 0,
+        couponCode: input.code,
+        donorEmail: input.donorEmail,
+        donorName: input.donorName,
+        paymentMethodLabel: 'Coupon (no card)',
+        receiptNumber: await nextReceiptNumber(),
+        paidAtIso: recordedAt,
+        frontendBaseUrl: getPrimaryFrontendOrigin(),
+      });
+    } catch (e) {
+      console.error('[receipt] coupon-only send failed:', e instanceof Error ? e.message : e);
+    }
+  }
+
   const final = await campaignRef.get();
   return { funding_current: Number((final.data() || {}).funding_current ?? 0) || 0 };
 }
@@ -3271,10 +3335,12 @@ async function recordCouponOnlyBacking(input: {
 // POST - Validate a coupon before checkout (custom coupon system). Read-only; does not redeem.
 app.post('/coupons/validate', async (req: Request, res: Response) => {
   try {
-    const { code, campaignId, amountCents } = req.body as {
+    const { code, campaignId, amountCents, uid, email } = req.body as {
       code?: string;
       campaignId?: string;
       amountCents?: number;
+      uid?: string;
+      email?: string;
     };
     if (typeof code !== 'string' || !code.trim()) {
       return res.status(400).json({ error: 'code is required' });
@@ -3287,7 +3353,11 @@ app.post('/coupons/validate', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'amountCents must be a positive integer (cents)' });
     }
 
-    const result = await validateCoupon(code, campaignId.trim(), amount);
+    const donor = {
+      uid: typeof uid === 'string' && uid.trim() ? uid.trim() : undefined,
+      email: typeof email === 'string' && email.trim() ? email.trim().toLowerCase() : undefined,
+    };
+    const result = await validateCoupon(code, campaignId.trim(), amount, donor);
     res.json(result); // only { valid, reason?, code, grossCents, discountCents, netCents } — no internals
   } catch (error: any) {
     console.error('Coupon validate error:', error);
@@ -3317,10 +3387,11 @@ app.post('/coupons', async (req: Request, res: Response) => {
       type?: string;
       value?: number;
       currency?: string;
-      campaignScope?: unknown; // 'all' | string[]
+      campaignScope?: unknown; // 'all' | string | string[]
       expiresAt?: string | null;
       maxRedemptions?: number | null;
       fundingSource?: string;
+      oncePerUser?: boolean;
     };
     const code = typeof b.code === 'string' ? b.code.trim().toUpperCase() : '';
     if (!code) return res.status(400).json({ error: 'code is required' });
@@ -3340,9 +3411,17 @@ app.post('/coupons', async (req: Request, res: Response) => {
       return res.status(409).json({ error: 'A coupon with that code already exists' });
     }
 
+    // Scope is 'all', a single campaign id (string), or an array of ids. Normalize a bare
+    // campaign-id string to a one-element array so validateCoupon's array check matches it.
     const scope = b.campaignScope;
-    const campaign_scope =
-      scope === 'all' || (Array.isArray(scope) && scope.every((s) => typeof s === 'string')) ? scope : 'all';
+    let campaign_scope: 'all' | string[];
+    if (Array.isArray(scope) && scope.length && scope.every((s) => typeof s === 'string')) {
+      campaign_scope = scope as string[];
+    } else if (typeof scope === 'string' && scope.trim() && scope.trim() !== 'all') {
+      campaign_scope = [scope.trim()];
+    } else {
+      campaign_scope = 'all';
+    }
 
     const coupon = {
       code,
@@ -3357,6 +3436,7 @@ app.post('/coupons', async (req: Request, res: Response) => {
           ? b.maxRedemptions
           : null,
       funding_source: typeof b.fundingSource === 'string' && b.fundingSource.trim() ? b.fundingSource.trim() : null,
+      once_per_user: b.oncePerUser === true,
       times_redeemed: 0,
       created_at: new Date().toISOString(),
     };
@@ -3397,6 +3477,23 @@ app.patch('/coupons/:code', async (req: Request, res: Response) => {
   }
 });
 
+// DELETE - permanently remove a coupon. Past redemptions in stripe_checkout_records are kept
+// (they reference the code as a string), so reporting/traceability is unaffected.
+app.delete('/coupons/:code', async (req: Request, res: Response) => {
+  try {
+    const code = String(req.params.code || '').trim().toUpperCase();
+    const ref = db.collection('coupons').doc(code);
+    if (!(await ref.get()).exists) {
+      return res.status(404).json({ error: 'Coupon not found' });
+    }
+    await ref.delete();
+    res.json({ ok: true, code });
+  } catch (error: any) {
+    console.error('Delete coupon error:', error);
+    res.status(500).json({ error: error?.message || 'Failed to delete coupon' });
+  }
+});
+
 // POST - Create payment: Stripe Checkout (pay-what-you-want Price on Product) when campaign has stripe_product_id; else PaymentIntent + Elements
 app.post('/payments/create-payment-intent', async (req: Request, res: Response) => {
   if (!stripe) {
@@ -3414,6 +3511,7 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
       utm?: Record<string, unknown>;
       couponCode?: string;
       email?: string;
+      name?: string;
     };
     const { amount: amountCents, campaignId, currency = 'usd' } = body;
     const cur = (currency || 'usd').toLowerCase();
@@ -3442,6 +3540,9 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
       // Guest zero-balance backings skip Stripe (no page to collect email), so accept the
       // lander-collected email as a fallback for receipts + per-user coupon limits.
       const donorEmail = tokenEmail || bodyEmail || undefined;
+      // Full name for the receipt + trust-score email. Guests supply it on the lander form.
+      const donorName =
+        typeof body.name === 'string' && body.name.trim() ? body.name.trim() : undefined;
 
       // Acquisition + identity context (UE-154), stamped on the session so a redemption is
       // fully recoverable from the webhook.
@@ -3468,7 +3569,7 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
       const couponCodeIn = typeof body.couponCode === 'string' ? body.couponCode.trim() : '';
       let coupon: CouponValidationResult | null = null;
       if (couponCodeIn && useFixedAmount) {
-        coupon = await validateCoupon(couponCodeIn, cidTrim, fixedParsed);
+        coupon = await validateCoupon(couponCodeIn, cidTrim, fixedParsed, { uid: donorUid, email: donorEmail });
         if (!coupon.valid) {
           return res.status(400).json({ error: 'coupon_invalid', reason: coupon.reason });
         }
@@ -3484,6 +3585,7 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
           discountCents: coupon.discountCents!,
           donorUid,
           donorEmail,
+          donorName,
           posthogDistinctId: posthogDistinctId || undefined,
           utmSource: utmSource || undefined,
           utmCampaign: utmCampaign || undefined,
@@ -3669,12 +3771,19 @@ app.post('/payments/record-checkout-session', async (req: Request, res: Response
     const donorUid =
       metadataDonorUid ||
       (typeof req.firebaseUid === 'string' && req.firebaseUid.trim() ? req.firebaseUid.trim() : undefined);
+    // Email Stripe collected at checkout — kept for receipts + coupon↔user traceability,
+    // especially for guests (who have no uid).
+    const donorEmail =
+      (session.customer_details?.email || session.customer_email || '').trim().toLowerCase() || undefined;
     const recordedAt = new Date().toISOString();
 
     const recordRef = db.collection('stripe_checkout_records').doc(sid);
     const campaignRef = db.collection('campaigns').doc(campaignId.trim());
 
     let campaignTitle = 'Campaign';
+    let campaignCategory: string | null = null;
+    let campaignImageUrl: string | null = null;
+    let campaignTrustScore: number | null = null;
     let wroteNewRecord = false;
 
     await db.runTransaction(async (t) => {
@@ -3688,6 +3797,9 @@ app.post('/payments/record-checkout-session', async (req: Request, res: Response
       }
       const data = campSnap.data() || {};
       campaignTitle = typeof data.title === 'string' && data.title.trim() ? data.title.trim() : 'Campaign';
+      campaignCategory = typeof data.category === 'string' ? data.category : null;
+      campaignImageUrl = typeof data.thumbnail_url === 'string' ? data.thumbnail_url : null;
+      campaignTrustScore = typeof data.trust_score === 'number' ? data.trust_score : null;
       const currentFunding = Number(data.funding_current ?? 0) || 0;
       const newFunding = currentFunding + amountGrossCents / 100;
       t.set(recordRef, {
@@ -3701,6 +3813,7 @@ app.post('/payments/record-checkout-session', async (req: Request, res: Response
         invoice_number: invoiceNumber,
         ...(couponCode ? { coupon_code: couponCode } : {}),
         ...(donorUid ? { donor_uid: donorUid } : {}),
+        ...(donorEmail ? { donor_email: donorEmail } : {}),
       });
       t.update(campaignRef, {
         funding_current: newFunding,
@@ -3736,6 +3849,32 @@ app.post('/payments/record-checkout-session', async (req: Request, res: Response
         uid: donorUid,
         email: session.customer_details?.email || undefined,
       });
+    }
+
+    // Receipt + trust report email — once per session (guarded by wroteNewRecord so a webhook
+    // + client double-fire doesn't double-send). Best-effort; never fails the recording.
+    if (wroteNewRecord && donorEmail) {
+      try {
+        await sendContributionReceipt({
+          campaignId: campaignId.trim(),
+          campaignTitle,
+          campaignCategory,
+          campaignImageUrl,
+          trustScore: campaignTrustScore,
+          grossCents: amountGrossCents,
+          discountCents: amountDiscountCents,
+          chargedCents: amountChargedCents,
+          couponCode: couponCode || null,
+          donorEmail,
+          donorName: session.customer_details?.name || undefined,
+          paymentMethodLabel: 'Card',
+          receiptNumber: await nextReceiptNumber(),
+          paidAtIso: recordedAt,
+          frontendBaseUrl: getPrimaryFrontendOrigin(),
+        });
+      } catch (e) {
+        console.error('[receipt] paid send failed:', e instanceof Error ? e.message : e);
+      }
     }
 
     const final = await campaignRef.get();
