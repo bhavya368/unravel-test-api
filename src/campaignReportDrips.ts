@@ -1,12 +1,15 @@
 import { FieldValue, type Firestore } from 'firebase-admin/firestore';
 import {
+  computePersonalAttribution,
   getCampaignActions,
   getCampaignBudgetCents,
   getCampaignPerceptionShift,
   getCampaignReach,
   getCampaignViews,
+  REACH_PER_DOLLAR,
   type CampaignRow,
 } from './impactMetrics';
+import { getCampaignTotalContributionCents } from './impactKpi';
 import { refreshCampaignFacebookInsightsIfStale } from './facebookInsights';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -23,7 +26,7 @@ interface CampaignReportDripOptions {
   usersDb?: Firestore;
 }
 
-interface CreatorProfile {
+interface RecipientProfile {
   email: string;
   firstName?: string;
   lastName?: string;
@@ -39,12 +42,14 @@ interface CampaignTiming {
   percentComplete: number | null;
 }
 
+/** Base campaign fields shared by all report stages. */
 interface CampaignReport {
   stage: CampaignReportStage;
   stageLabel: string;
   metricName: string;
   campaignId: string;
   campaignTitle: string;
+  campaign_name: string;
   campaignUrl: string;
   impactUrl: string;
   thumbnailUrl: string | null;
@@ -67,6 +72,45 @@ interface CampaignReport {
   elapsedDays: number | null;
   percentComplete: number | null;
   generatedAt: string;
+  pooled_amount: string;
+  total_backers: number;
+  projected_collective_reach: number;
+}
+
+/** Per-backer payload for launch / mid / recap (Klaviyo template bind names). */
+interface BackerStageReport extends CampaignReport {
+  contribution_amount: string;
+  projected_reach: number;
+  contributionAmountCents: number;
+  /** Mid: personal reach attributed so far. */
+  reached_so_far?: number;
+  /** Mid: personal actions attributed so far. */
+  actions_so_far?: number;
+  /** Mid: personal reached / projected × 100 (0–100). */
+  percent_to_goal?: number;
+  /** Mid: campaign reach so far. */
+  collective_reach_so_far?: number;
+  /** Mid: perception shift % (alias of perceptionShift). */
+  perception_shift_mid?: number;
+  /** Recap: final personal attributed reach. */
+  final_reach?: number;
+  /** Recap: personal actions attributed. */
+  actions_sparked?: number;
+  /** Recap / shared: perception shift % (snake_case for templates). */
+  perception_shift?: number;
+  /** Recap: final campaign reach. */
+  final_collective_reach?: number;
+  /** Recap: pooled spend display string. */
+  total_spend?: string;
+}
+
+interface CampaignBacker {
+  email: string;
+  firstName?: string;
+  lastName?: string;
+  fullName?: string;
+  contributionCents: number;
+  donorUid?: string;
 }
 
 interface RunItem {
@@ -75,6 +119,8 @@ interface RunItem {
   stage?: CampaignReportStage;
   metricName?: string;
   email?: string;
+  emails?: string[];
+  recipientCount?: number;
   sent?: boolean;
   dryRun?: boolean;
   skipped?: string;
@@ -150,6 +196,14 @@ function stageIsSent(campaign: Record<string, unknown>, stage: CampaignReportSta
   return Boolean(stageState?.sentAt);
 }
 
+function getStageRecipientEmails(campaign: Record<string, unknown>, stage: CampaignReportStage): string[] {
+  const drips = campaign.campaign_report_drips as Record<string, unknown> | undefined;
+  const stageState = drips?.[stage] as Record<string, unknown> | undefined;
+  const raw = stageState?.recipientEmails;
+  if (!Array.isArray(raw)) return [];
+  return raw.map((e) => String(e).trim().toLowerCase()).filter(Boolean);
+}
+
 function nextDueStage(
   campaign: Record<string, unknown>,
   timing: CampaignTiming,
@@ -186,6 +240,18 @@ function asDollars(value: unknown): number {
   return Number.isFinite(n) ? Math.round(n * 100) / 100 : 0;
 }
 
+function formatUsdFromCents(cents: number): string {
+  const dollars = Math.max(0, cents) / 100;
+  if (Number.isInteger(dollars)) return `$${dollars.toLocaleString('en-US')}`;
+  return `$${dollars.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+function formatUsdFromDollars(dollars: number): string {
+  const n = Math.max(0, Number(dollars) || 0);
+  if (Number.isInteger(n)) return `$${n.toLocaleString('en-US')}`;
+  return `$${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
 function getFrontendOrigin(): string {
   const raw =
     process.env.FRONTEND_ORIGIN ||
@@ -194,7 +260,7 @@ function getFrontendOrigin(): string {
   return raw.split(',')[0].trim().replace(/\/$/, '');
 }
 
-function getCreatorProfileFromCampaign(campaign: Record<string, unknown>): CreatorProfile | null {
+function getCreatorProfileFromCampaign(campaign: Record<string, unknown>): RecipientProfile | null {
   const email = String(campaign.creator_email || '').trim().toLowerCase();
   if (!email) return null;
   const firstName = String(campaign.creator_first_name || '').trim();
@@ -211,7 +277,7 @@ function getCreatorProfileFromCampaign(campaign: Record<string, unknown>): Creat
 async function getCreatorProfile(
   campaign: Record<string, unknown>,
   usersDb?: Firestore
-): Promise<CreatorProfile | null> {
+): Promise<RecipientProfile | null> {
   const snapshotProfile = getCreatorProfileFromCampaign(campaign);
   if (snapshotProfile || !usersDb) return snapshotProfile;
 
@@ -253,7 +319,8 @@ function buildReport(
   campaign: Record<string, unknown>,
   stage: CampaignReportStage,
   timing: CampaignTiming,
-  nowMs: number
+  nowMs: number,
+  totalBackers: number
 ): CampaignReport {
   const campaignRow = { id: campaignId, ...campaign } as CampaignRow;
   const reach = getCampaignReach(campaignRow);
@@ -265,13 +332,15 @@ function buildReport(
   );
   const budgetDollars = Math.round((getCampaignBudgetCents(campaignRow) / 100) * 100) / 100;
   const frontendOrigin = getFrontendOrigin();
+  const campaignTitle = String(campaign.title || 'Campaign');
 
   return {
     stage,
     stageLabel: stageLabel(stage),
     metricName: metricNameForStage(stage),
     campaignId,
-    campaignTitle: String(campaign.title || 'Campaign'),
+    campaignTitle,
+    campaign_name: campaignTitle,
     campaignUrl: `${frontendOrigin}/campaign/${encodeURIComponent(campaignId)}`,
     impactUrl: `${frontendOrigin}/campaign/${encodeURIComponent(campaignId)}/impact`,
     thumbnailUrl: typeof campaign.thumbnail_url === 'string' ? campaign.thumbnail_url : null,
@@ -300,10 +369,166 @@ function buildReport(
     elapsedDays: timing.elapsedDays,
     percentComplete: timing.percentComplete,
     generatedAt: new Date(nowMs).toISOString(),
+    pooled_amount: formatUsdFromDollars(fundingRaisedDollars),
+    total_backers: totalBackers,
+    projected_collective_reach: reach.value,
   };
 }
 
-async function sendKlaviyoReportEvent(profile: CreatorProfile, report: CampaignReport): Promise<void> {
+function estimatedFullCampaignReach(campaign: Record<string, unknown>, currentReach: number): number {
+  const budgetDollars = getCampaignTotalContributionCents(campaign as CampaignRow) / 100;
+  const fromBudget = Math.round(budgetDollars * REACH_PER_DOLLAR);
+  return Math.max(currentReach, fromBudget);
+}
+
+function buildBackerStageReport(
+  base: CampaignReport,
+  backer: CampaignBacker,
+  campaign: Record<string, unknown>
+): BackerStageReport {
+  const campaignRow = { id: base.campaignId, ...campaign } as CampaignRow;
+  const totalContributionCents = getCampaignTotalContributionCents(campaignRow);
+  const actions = getCampaignActions(campaignRow);
+  const frontendOrigin = getFrontendOrigin();
+
+  const soFarAttr = computePersonalAttribution({
+    userContributionCents: backer.contributionCents,
+    totalContributionCents,
+    campaignReach: base.reach,
+    campaignViews: base.views,
+    campaignActions: actions.value,
+    perceptionShiftPct: base.perceptionShift,
+  });
+
+  const projectedCampaignReach = estimatedFullCampaignReach(campaign, base.reach);
+  const projectedAttr = computePersonalAttribution({
+    userContributionCents: backer.contributionCents,
+    totalContributionCents,
+    campaignReach: projectedCampaignReach,
+    campaignViews: base.views,
+    campaignActions: actions.value,
+    perceptionShiftPct: base.perceptionShift,
+  });
+
+  const projectedReach = projectedAttr.personalReach;
+  const reachedSoFar = soFarAttr.personalReach;
+  const percentToGoal =
+    projectedReach > 0
+      ? Math.max(0, Math.min(100, Math.round((reachedSoFar / projectedReach) * 1000) / 10))
+      : 0;
+
+  const shared: BackerStageReport = {
+    ...base,
+    contribution_amount: formatUsdFromCents(backer.contributionCents),
+    projected_reach: projectedReach,
+    contributionAmountCents: backer.contributionCents,
+    projected_collective_reach: projectedCampaignReach,
+    // Backer impact page (personal), not campaign-level creator report.
+    impactUrl: `${frontendOrigin}/account/impact/${encodeURIComponent(base.campaignId)}`,
+  };
+
+  if (base.stage === 'mid') {
+    return {
+      ...shared,
+      // At mid, "projected" personal target vs progress so far.
+      projected_reach: projectedReach,
+      reached_so_far: reachedSoFar,
+      actions_so_far: soFarAttr.personalActions,
+      percent_to_goal: percentToGoal,
+      collective_reach_so_far: base.reach,
+      perception_shift_mid: base.perceptionShift,
+    };
+  }
+
+  if (base.stage === 'recap') {
+    return {
+      ...shared,
+      // At recap, current campaign metrics are final.
+      projected_reach: projectedReach,
+      final_reach: reachedSoFar,
+      actions_sparked: soFarAttr.personalActions,
+      perception_shift: base.perceptionShift,
+      final_collective_reach: base.reach,
+      total_spend: base.pooled_amount,
+      total_backers: base.total_backers,
+    };
+  }
+
+  // Launch: projected personal reach (often estimated from budget before ads run).
+  return {
+    ...shared,
+    projected_reach: projectedReach,
+  };
+}
+
+/**
+ * Load unique backers for a campaign from stripe_checkout_records (paid + coupon-only).
+ * Aggregates multiple contributions per email.
+ */
+async function loadCampaignBackers(
+  db: Firestore,
+  campaignId: string,
+  usersDb?: Firestore
+): Promise<CampaignBacker[]> {
+  const snapshot = await db.collection('stripe_checkout_records').where('campaignId', '==', campaignId).get();
+  const byEmail = new Map<string, CampaignBacker>();
+
+  for (const doc of snapshot.docs) {
+    const data = doc.data() as Record<string, unknown>;
+    const amountCents = Math.max(0, Number(data.amount_cents) || 0);
+    const donorUid = String(data.donor_uid || '').trim() || undefined;
+    let email = String(data.donor_email || '').trim().toLowerCase();
+    let firstName = String(data.donor_name || '')
+      .trim()
+      .split(/\s+/)[0];
+    let lastName = String(data.donor_name || '')
+      .trim()
+      .split(/\s+/)
+      .slice(1)
+      .join(' ');
+    let fullName = String(data.donor_name || '').trim();
+
+    if ((!email || !fullName) && donorUid && usersDb) {
+      const userDoc = await usersDb.collection('users').doc(donorUid).get();
+      if (userDoc.exists) {
+        const user = userDoc.data() as Record<string, unknown>;
+        if (!email) email = String(user.email || '').trim().toLowerCase();
+        const fn = String(user.firstName || '').trim();
+        const ln = String(user.lastName || '').trim();
+        if (!firstName && fn) firstName = fn;
+        if (!lastName && ln) lastName = ln;
+        if (!fullName) fullName = `${fn} ${ln}`.trim();
+      }
+    }
+
+    if (!email) continue;
+
+    const prev = byEmail.get(email);
+    if (prev) {
+      prev.contributionCents += amountCents;
+      if (!prev.donorUid && donorUid) prev.donorUid = donorUid;
+      if (!prev.firstName && firstName) prev.firstName = firstName;
+      if (!prev.lastName && lastName) prev.lastName = lastName;
+      if (!prev.fullName && fullName) prev.fullName = fullName;
+    } else {
+      byEmail.set(email, {
+        email,
+        contributionCents: amountCents,
+        ...(donorUid ? { donorUid } : {}),
+        ...(firstName ? { firstName } : {}),
+        ...(lastName ? { lastName } : {}),
+        ...(fullName ? { fullName } : {}),
+      });
+    }
+  }
+
+  return [...byEmail.values()].sort((a, b) => a.email.localeCompare(b.email));
+}
+
+async function sendKlaviyoReportEvent(
+  profile: RecipientProfile,
+  report: CampaignReport | BackerStageReport
+): Promise<void> {
   const apiKey = process.env.KLAVIYO_API_KEY?.trim();
   if (!apiKey) {
     throw new Error('KLAVIYO_API_KEY is not configured');
@@ -385,18 +610,39 @@ async function markStageSent(
   db: Firestore,
   campaignId: string,
   stage: CampaignReportStage,
-  profile: CreatorProfile,
+  recipientEmails: string[],
   report: CampaignReport,
   nowMs: number
 ): Promise<void> {
   await db.collection('campaigns').doc(campaignId).update({
     [`campaign_report_drips.${stage}.sentAt`]: new Date(nowMs).toISOString(),
-    [`campaign_report_drips.${stage}.recipientEmail`]: profile.email,
+    [`campaign_report_drips.${stage}.recipientEmail`]: recipientEmails[0] || null,
+    [`campaign_report_drips.${stage}.recipientEmails`]: recipientEmails,
+    [`campaign_report_drips.${stage}.recipientCount`]: recipientEmails.length,
     [`campaign_report_drips.${stage}.metricName`]: report.metricName,
     [`campaign_report_drips.${stage}.report`]: report,
     [`campaign_report_drips.${stage}.sendingAt`]: FieldValue.delete(),
     [`campaign_report_drips.${stage}.sendingExpiresAt`]: FieldValue.delete(),
     [`campaign_report_drips.${stage}.lastError`]: FieldValue.delete(),
+    updatedAt: new Date(nowMs).toISOString(),
+  });
+}
+
+async function markStagePartialProgress(
+  db: Firestore,
+  campaignId: string,
+  stage: CampaignReportStage,
+  recipientEmails: string[],
+  error: string,
+  nowMs: number
+): Promise<void> {
+  await db.collection('campaigns').doc(campaignId).update({
+    [`campaign_report_drips.${stage}.recipientEmails`]: recipientEmails,
+    [`campaign_report_drips.${stage}.recipientCount`]: recipientEmails.length,
+    [`campaign_report_drips.${stage}.lastError`]: error.slice(0, 1000),
+    [`campaign_report_drips.${stage}.failedAt`]: new Date(nowMs).toISOString(),
+    [`campaign_report_drips.${stage}.sendingAt`]: FieldValue.delete(),
+    [`campaign_report_drips.${stage}.sendingExpiresAt`]: FieldValue.delete(),
     updatedAt: new Date(nowMs).toISOString(),
   });
 }
@@ -416,6 +662,7 @@ async function markStageFailed(
     updatedAt: new Date(nowMs).toISOString(),
   });
 }
+
 
 export async function runCampaignReportDrips(db: Firestore, options: CampaignReportDripOptions = {}) {
   const nowMs = options.nowMs ?? Date.now();
@@ -444,75 +691,111 @@ export async function runCampaignReportDrips(db: Firestore, options: CampaignRep
     const stage = nextDueStage(campaign.data, timing, nowMs);
     if (!stage) continue;
 
-    const profile = await getCreatorProfile(campaign.data, options.usersDb);
-    if (!profile) {
-      results.push({
-        campaignId: campaign.id,
-        title,
-        stage,
-        skipped: 'Campaign has no creator_email',
-      });
-      continue;
-    }
+    // Launch + mid + recap → each backer with personal impact fields.
+    if (stage === 'launch' || stage === 'mid' || stage === 'recap') {
+      const backers = await loadCampaignBackers(db, campaign.id, options.usersDb);
+      const alreadySent = new Set(getStageRecipientEmails(campaign.data, stage));
+      const pending = backers.filter((b) => !alreadySent.has(b.email));
+      const basePreview = buildReport(campaign.id, campaign.data, stage, timing, nowMs, backers.length);
 
-    const report = buildReport(campaign.id, campaign.data, stage, timing, nowMs);
-    if (options.dryRun) {
-      results.push({
-        campaignId: campaign.id,
-        title,
-        stage,
-        metricName: report.metricName,
-        email: profile.email,
-        dryRun: true,
-      });
-      continue;
-    }
-
-    const claimed = await claimStage(db, campaign.id, stage, nowMs);
-    if (!claimed) {
-      results.push({
-        campaignId: campaign.id,
-        title,
-        stage,
-        skipped: 'Already sent or currently sending',
-      });
-      continue;
-    }
-
-    let campaignData = campaign.data;
-    const refreshed = await refreshCampaignFacebookInsightsIfStale(db, campaign.id, campaignData);
-    if (refreshed) {
-      const refreshedDoc = await db.collection('campaigns').doc(campaign.id).get();
-      if (refreshedDoc.exists) {
-        campaignData = refreshedDoc.data() as Record<string, unknown>;
+      if (options.dryRun) {
+        results.push({
+          campaignId: campaign.id,
+          title,
+          stage,
+          metricName: basePreview.metricName,
+          emails: pending.map((b) => b.email),
+          recipientCount: pending.length,
+          dryRun: true,
+          ...(pending.length === 0
+            ? { skipped: backers.length === 0 ? 'No backers with email' : 'All backers already sent' }
+            : {}),
+        });
+        continue;
       }
-    }
 
-    try {
-      const report = buildReport(campaign.id, campaignData, stage, timing, nowMs);
-      await sendKlaviyoReportEvent(profile, report);
-      await markStageSent(db, campaign.id, stage, profile, report, nowMs);
-      results.push({
-        campaignId: campaign.id,
-        title,
-        stage,
-        metricName: report.metricName,
-        email: profile.email,
-        sent: true,
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      await markStageFailed(db, campaign.id, stage, message, nowMs).catch((markError) => {
-        console.error('Failed to mark campaign report drip failure:', markError);
-      });
-      results.push({
-        campaignId: campaign.id,
-        title,
-        stage,
-        metricName: report.metricName,
-        email: profile.email,
-        error: message,
-      });
+      const claimed = await claimStage(db, campaign.id, stage, nowMs);
+      if (!claimed) {
+        results.push({
+          campaignId: campaign.id,
+          title,
+          stage,
+          skipped: 'Already sent or currently sending',
+        });
+        continue;
+      }
+
+      let campaignData = campaign.data;
+      const refreshed = await refreshCampaignFacebookInsightsIfStale(db, campaign.id, campaignData);
+      if (refreshed) {
+        const refreshedDoc = await db.collection('campaigns').doc(campaign.id).get();
+        if (refreshedDoc.exists) {
+          campaignData = refreshedDoc.data() as Record<string, unknown>;
+        }
+      }
+
+      const baseReport = buildReport(campaign.id, campaignData, stage, timing, nowMs, backers.length);
+
+      // No eligible recipients — mark complete so we don't retry forever.
+      if (pending.length === 0) {
+        const allEmails = [...alreadySent];
+        await markStageSent(db, campaign.id, stage, allEmails, baseReport, nowMs);
+        results.push({
+          campaignId: campaign.id,
+          title,
+          stage,
+          metricName: baseReport.metricName,
+          emails: allEmails,
+          recipientCount: allEmails.length,
+          sent: true,
+          skipped: backers.length === 0 ? 'No backers with email' : 'All backers already sent',
+        });
+        continue;
+      }
+
+      const sentEmails = [...alreadySent];
+      try {
+        for (const backer of pending) {
+          const report = buildBackerStageReport(baseReport, backer, campaignData);
+          await sendKlaviyoReportEvent(
+            {
+              email: backer.email,
+              ...(backer.firstName ? { firstName: backer.firstName } : {}),
+              ...(backer.lastName ? { lastName: backer.lastName } : {}),
+              ...(backer.fullName ? { fullName: backer.fullName } : {}),
+            },
+            report
+          );
+          sentEmails.push(backer.email);
+        }
+        await markStageSent(db, campaign.id, stage, sentEmails, baseReport, nowMs);
+        results.push({
+          campaignId: campaign.id,
+          title,
+          stage,
+          metricName: baseReport.metricName,
+          emails: sentEmails,
+          recipientCount: sentEmails.length,
+          sent: true,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await markStagePartialProgress(db, campaign.id, stage, sentEmails, message, nowMs).catch(
+          (markError) => {
+            console.error('Failed to mark campaign report drip partial progress:', markError);
+          }
+        );
+        results.push({
+          campaignId: campaign.id,
+          title,
+          stage,
+          metricName: baseReport.metricName,
+          emails: sentEmails,
+          recipientCount: sentEmails.length,
+          error: message,
+        });
+      }
+      continue;
     }
   }
 

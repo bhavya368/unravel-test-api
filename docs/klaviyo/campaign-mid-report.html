@@ -1,106 +1,181 @@
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Campaign Progress Report</title>
-  </head>
-  <body style="margin:0;padding:0;background:#f6f8fb;font-family:Inter,Arial,sans-serif;color:#0f172a;">
-    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f6f8fb;margin:0;padding:32px 12px;">
-      <tr>
-        <td align="center">
-          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:640px;background:#ffffff;border:1px solid #e5e7eb;border-radius:24px;overflow:hidden;">
-            <tr>
-              <td style="padding:28px 28px 12px;">
-                <span style="display:inline-block;background:#fff4db;color:#b7791f;border-radius:999px;padding:7px 12px;font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;">02 - Mid-Campaign</span>
-                <div style="height:4px;background:#e6a23c;border-radius:999px;margin:18px 0 22px;"></div>
-                <h1 style="font-size:28px;line-height:1.12;margin:0 0 8px;font-weight:900;color:#0f172a;">Your campaign is {{ event.percentComplete|default:'50' }}% through and on pace.</h1>
-                <p style="font-size:15px;line-height:1.6;margin:0;color:#475569;">Here is the midpoint view of delivery, audience response, and early impact signals for {{ event.campaignTitle|default:'your campaign' }}.</p>
-              </td>
-            </tr>
+<!DOCTYPE html>
+<html lang="en" xmlns="http://www.w3.org/1999/xhtml" xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:v="urn:schemas-microsoft-com:vml">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="IE=edge" http-equiv="X-UA-Compatible"/>
+<title>Halfway through — your contribution is traveling</title>
+<!--[if mso]><noscript><xml><o:OfficeDocumentSettings><o:PixelsPerInch>96</o:PixelsPerInch></o:OfficeDocumentSettings></xml></noscript><![endif]-->
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;700;800&family=Noto+Sans:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  body,table,td,a{ -webkit-text-size-adjust:100%; -ms-text-size-adjust:100%; }
+  table,td{ mso-table-lspace:0pt; mso-table-rspace:0pt; }
+  img{ -ms-interpolation-mode:bicubic; border:0; outline:none; text-decoration:none; display:block; }
+  body{ margin:0; padding:0; width:100%!important; background:#f6f7f8; }
+  a{ text-decoration:none; }
+  @media only screen and (max-width:620px){
+    .container{ width:100%!important; }
+    .stack{ display:block!important; width:100%!important; }
+  }
+</style>
+</head>
+<body style="margin:0; padding:0; background:#f6f7f8;">
+<!--
+  Metric: Unravel Campaign Mid Campaign Report
+  Fired once per backer from unravel-api campaignReportDrips (mid stage).
 
-            <tr>
-              <td style="padding:20px 28px 8px;">
-                <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="height:132px;">
-                  <tr valign="bottom">
-                    <td width="25%" align="center" style="padding:0 5px;">
-                      <div style="height:42px;background:#2f67bd;border-radius:4px 4px 0 0;"></div>
-                      <div style="font-size:10px;font-weight:800;color:#64748b;margin-top:8px;">W1</div>
-                    </td>
-                    <td width="25%" align="center" style="padding:0 5px;">
-                      <div style="height:58px;background:#2f67bd;border-radius:4px 4px 0 0;"></div>
-                      <div style="font-size:10px;font-weight:800;color:#64748b;margin-top:8px;">W2</div>
-                    </td>
-                    <td width="25%" align="center" style="padding:0 5px;">
-                      <div style="height:74px;background:#e6a23c;border-radius:4px 4px 0 0;"></div>
-                      <div style="font-size:10px;font-weight:800;color:#64748b;margin-top:8px;">W3</div>
-                    </td>
-                    <td width="25%" align="center" style="padding:0 5px;">
-                      <div style="height:46px;background:#e5e7eb;border-radius:4px 4px 0 0;"></div>
-                      <div style="font-size:10px;font-weight:800;color:#64748b;margin-top:8px;">W4</div>
-                    </td>
-                  </tr>
-                </table>
-              </td>
-            </tr>
+  Event properties:
+    first_name (profile)
+    event.campaign_name / event.campaignTitle
+    event.contribution_amount
+    event.projected_reach
+    event.reached_so_far
+    event.actions_so_far
+    event.percent_to_goal          (bar width + label)
+    event.collective_reach_so_far / event.reach
+    event.perception_shift_mid / event.perceptionShift
+    event.thumbnailUrl
+    event.impactUrl
+    event.campaignUrl
+-->
+<div style="display:none; max-height:0; overflow:hidden; mso-hide:all; font-size:1px; line-height:1px; color:#f6f7f8;">The midpoint view of how far your share has reached.</div>
+<table border="0" cellpadding="0" cellspacing="0" role="presentation" style="background:#f6f7f8;" width="100%">
+  <tr>
+    <td align="center" style="padding:32px 12px;">
+      <table border="0" cellpadding="0" cellspacing="0" class="container" role="presentation" style="width:600px; max-width:600px; background:#ffffff; border:1px solid #e7eef3; border-radius:20px; overflow:hidden;" width="600">
+        <tr>
+          <td style="padding:28px 28px 0;">
+            <table border="0" cellpadding="0" cellspacing="0" role="presentation" width="100%">
+              <tr>
+                <td align="left" style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:11px; font-weight:800; letter-spacing:1px; text-transform:uppercase; color:#1a8cd8;">
+                  <span style="background:#e8f5fd; border-radius:20px; padding:7px 13px; display:inline-block;">02 — Mid-campaign</span>
+                </td>
+                <td align="right" style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:13px; font-weight:800; color:#0d161b;">Unravel</td>
+              </tr>
+            </table>
+            <div style="height:4px; background:#2b9dee; border-radius:999px; margin:18px 0 0; font-size:0; line-height:0;">&nbsp;</div>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:22px 28px 0;">
+            <div style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:26px; font-weight:800; letter-spacing:-0.5px; line-height:1.18; color:#0d161b; margin:0 0 10px;">Halfway through — your {{ event.contribution_amount|default:'$0' }} is traveling, {{ first_name|default:'there' }}.</div>
+            <div style="font-family:'Noto Sans', Arial, Helvetica, sans-serif; font-size:15px; line-height:1.6; color:#4c799a;">The midpoint view of how far your share — and the community's — has reached so far for <strong style="color:#0d161b">{{ event.campaign_name|default:event.campaignTitle|default:'your campaign' }}</strong>.</div>
+          </td>
+        </tr>
 
-            <tr>
-              <td style="padding:16px 28px 8px;">
-                <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
-                  <tr>
-                    <td width="50%" style="padding:10px;background:#f8fafc;border-radius:14px;border-right:6px solid #ffffff;">
-                      <div style="font-size:22px;font-weight:900;color:#0f172a;">{{ event.reach|default:'0' }}</div>
-                      <div style="font-size:10px;font-weight:800;color:#64748b;letter-spacing:.06em;text-transform:uppercase;">Reach So Far</div>
-                    </td>
-                    <td width="50%" style="padding:10px;background:#f8fafc;border-radius:14px;border-left:6px solid #ffffff;">
-                      <div style="font-size:22px;font-weight:900;color:#0f172a;">{{ event.actions|default:'0' }}</div>
-                      <div style="font-size:10px;font-weight:800;color:#64748b;letter-spacing:.06em;text-transform:uppercase;">Actions</div>
-                    </td>
-                  </tr>
-                </table>
-              </td>
-            </tr>
+        {% if event.thumbnailUrl %}
+        <tr>
+          <td style="padding:18px 28px 0;">
+            <table border="0" cellpadding="0" cellspacing="0" role="presentation" width="100%">
+              <tr>
+                <td style="border-radius:16px; overflow:hidden;">
+                  <img alt="{{ event.campaign_name|default:event.campaignTitle|default:'Campaign' }}" src="{{ event.thumbnailUrl }}" style="width:100%; height:auto; display:block; border-radius:16px;" width="544"/>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+        {% endif %}
 
-            <tr>
-              <td style="padding:8px 28px;">
-                <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
-                  <tr>
-                    <td width="50%" style="padding:10px;background:#f8fafc;border-radius:14px;border-right:6px solid #ffffff;">
-                      <div style="font-size:22px;font-weight:900;color:#0f172a;">+{{ event.perceptionShift|default:'0' }}%</div>
-                      <div style="font-size:10px;font-weight:800;color:#64748b;letter-spacing:.06em;text-transform:uppercase;">Mid-Shift</div>
-                    </td>
-                    <td width="50%" style="padding:10px;background:#f8fafc;border-radius:14px;border-left:6px solid #ffffff;">
-                      <div style="font-size:22px;font-weight:900;color:#0f172a;">{{ event.elapsedDays|default:'0' }}</div>
-                      <div style="font-size:10px;font-weight:800;color:#64748b;letter-spacing:.06em;text-transform:uppercase;">Days Elapsed</div>
-                    </td>
-                  </tr>
-                </table>
-              </td>
-            </tr>
+        <tr>
+          <td style="padding:18px 28px 0;">
+            <table border="0" cellpadding="0" cellspacing="0" role="presentation" style="background:#f0f9ff; border:1px solid #cdebfb; border-radius:18px;" width="100%">
+              <tr>
+                <td style="padding:22px;">
+                  <div style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:11px; font-weight:800; letter-spacing:0.8px; text-transform:uppercase; color:#1a8cd8;">Your impact, so far</div>
+                  <div style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:14px; font-weight:700; color:#0d161b; margin-top:3px; margin-bottom:16px;">{{ first_name|default:'there' }} · {{ event.contribution_amount|default:'$0' }} contributed</div>
+                  <table border="0" cellpadding="0" cellspacing="0" role="presentation" width="100%">
+                    <tr>
+                      <td style="width:92px;" valign="middle" width="92">
+                        <table border="0" cellpadding="0" cellspacing="0" role="presentation">
+                          <tr>
+                            <td align="center" height="84" style="width:84px; height:84px; background:#2b9dee; border-radius:42px; font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:15px; font-weight:800; color:#ffffff;" valign="middle" width="84">{{ event.contribution_amount|default:'$0' }}</td>
+                          </tr>
+                        </table>
+                      </td>
+                      <td style="padding-left:18px;" valign="middle">
+                        <div style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:32px; font-weight:800; letter-spacing:-1px; line-height:1; color:#0d161b;">~{{ event.reached_so_far|default:'0' }}</div>
+                        <div style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:11px; font-weight:800; letter-spacing:0.6px; text-transform:uppercase; color:#1a8cd8; margin-top:6px;">People reached by your share</div>
+                      </td>
+                    </tr>
+                  </table>
+                  <div style="font-family:'Noto Sans', Arial, Helvetica, sans-serif; font-size:13px; line-height:1.55; color:#4c799a; margin-top:14px;">On track to ~{{ event.projected_reach|default:'0' }}. Your {{ event.contribution_amount|default:'$0' }} has already sparked an estimated <strong style="color:#0d161b">{{ event.actions_so_far|default:'0' }} actions</strong> inside the communities it touched.</div>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
 
-            <tr>
-              <td style="padding:8px 28px 8px;">
-                <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#f8fafc;border-radius:18px;">
-                  <tr>
-                    <td style="padding:18px;">
-                      <div style="font-size:12px;font-weight:900;color:#b7791f;letter-spacing:.08em;text-transform:uppercase;margin-bottom:8px;">Progress Report</div>
-                      <p style="font-size:14px;line-height:1.6;color:#475569;margin:0;">Shows delivery versus forecast, audience profile, early perception shift, and which creative signals are performing best.</p>
-                    </td>
-                  </tr>
-                </table>
-              </td>
-            </tr>
+        <tr>
+          <td style="padding:14px 28px 0;">
+            <table border="0" cellpadding="0" cellspacing="0" role="presentation" style="background:#e6eef4; border-radius:999px;" width="100%">
+              <tr>
+                <td style="background:#2b9dee; height:10px; line-height:10px; font-size:0; border-radius:999px;" width="{{ event.percent_to_goal|default:'0' }}%">&nbsp;</td>
+                <td style="font-size:0; line-height:10px;">&nbsp;</td>
+              </tr>
+            </table>
+            <div style="font-family:'Noto Sans', Arial, Helvetica, sans-serif; font-size:12px; color:#4c799a; margin-top:8px;">{{ event.percent_to_goal|default:'0' }}% of your projected reach — on pace.</div>
+          </td>
+        </tr>
 
-            <tr>
-              <td align="center" style="padding:20px 28px 32px;">
-                <a href="{{ event.impactUrl }}" style="display:inline-block;background:#e6a23c;color:#111827;text-decoration:none;font-size:14px;font-weight:900;border-radius:999px;padding:14px 22px;">View Progress Report</a>
-                <a href="{{ event.campaignUrl }}" style="display:inline-block;color:#b7791f;text-decoration:none;font-size:14px;font-weight:900;margin-left:14px;">Open Campaign</a>
-              </td>
-            </tr>
-          </table>
-          <p style="font-size:12px;line-height:1.5;color:#94a3b8;margin:18px 0 0;">Unravel campaign reporting</p>
-        </td>
-      </tr>
-    </table>
-  </body>
+        <tr>
+          <td style="padding:16px 28px 0;">
+            <table border="0" cellpadding="0" cellspacing="0" role="presentation" width="100%">
+              <tr>
+                <td class="stack" style="padding:0 6px 0 0;" valign="top" width="50%">
+                  <table border="0" cellpadding="0" cellspacing="0" role="presentation" style="background:#f6f9fb; border:1px solid #e7eef3; border-radius:13px;" width="100%">
+                    <tr>
+                      <td style="padding:15px 16px;">
+                        <div style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:21px; font-weight:800; color:#0d161b;">{{ event.collective_reach_so_far|default:event.reach|default:'0' }}</div>
+                        <div style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:10px; font-weight:800; letter-spacing:0.5px; text-transform:uppercase; color:#4c799a; margin-top:4px;">Collective reach so far</div>
+                      </td>
+                    </tr>
+                  </table>
+                </td>
+                <td class="stack" style="padding:0 0 0 6px;" valign="top" width="50%">
+                  <table border="0" cellpadding="0" cellspacing="0" role="presentation" style="background:#f6f9fb; border:1px solid #e7eef3; border-radius:13px;" width="100%">
+                    <tr>
+                      <td style="padding:15px 16px;">
+                        <div style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:21px; font-weight:800; color:#0f9e6e;">+{{ event.perception_shift_mid|default:event.perceptionShift|default:'0' }}%</div>
+                        <div style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:10px; font-weight:800; letter-spacing:0.5px; text-transform:uppercase; color:#4c799a; margin-top:4px;">Mid-campaign perception shift</div>
+                      </td>
+                    </tr>
+                  </table>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+
+        <tr>
+          <td style="padding:20px 28px 0;">
+            <table border="0" cellpadding="0" cellspacing="0" role="presentation" style="margin:0 auto;" width="100%">
+              <tr>
+                <td align="center" bgcolor="#2b9dee" style="border-radius:999px;">
+                  <a href="{{ event.impactUrl }}" style="display:block; padding:15px 28px; font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:15px; font-weight:800; color:#ffffff; text-decoration:none; border-radius:999px;">See your live impact &rarr;</a>
+                </td>
+              </tr>
+            </table>
+            <div style="text-align:center; margin-top:14px;">
+              <a href="{{ event.campaignUrl }}" style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:13px; font-weight:800; color:#1a8cd8;">Open report</a>
+            </div>
+          </td>
+        </tr>
+        <tr>
+          <td style="font-size:0; line-height:0; height:30px;">&nbsp;</td>
+        </tr>
+      </table>
+      <table border="0" cellpadding="0" cellspacing="0" class="container" role="presentation" style="width:600px; max-width:600px;" width="600">
+        <tr>
+          <td style="padding:18px 12px 0; text-align:center; font-family:'Noto Sans', Arial, Helvetica, sans-serif; font-size:11px; line-height:1.6; color:#94a3b8;">
+            Unravel · Reverberate, Inc. — Mid-campaign report<br/>
+            You're receiving this because you backed a campaign on Unravel.
+            <a href="{% unsubscribe %}" style="color:#94a3b8; text-decoration:underline;">Unsubscribe</a>
+          </td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+</table>
+</body>
 </html>
