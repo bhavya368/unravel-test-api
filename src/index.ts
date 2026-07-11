@@ -736,7 +736,8 @@ app.use(attachFirebaseUser);
 
 /**
  * Runs the Klaviyo-triggered report drip sequence:
- * launch/pre-live, campaign midpoint, and recap. Intended for Cloud Scheduler.
+ * launch + mid + recap (one event per backer with personal contribution/reach).
+ * Intended for Cloud Scheduler. Does not modify site impact report calculations.
  */
 app.post('/campaign-report-drips/run', async (req: Request, res: Response) => {
   try {
