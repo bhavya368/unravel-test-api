@@ -12,7 +12,7 @@
 // overall value for v1; the layered breakdown + PDF are deferred to the UUTS epic.
 
 /** Ad-amplification share of the gross contribution. Remainder is the platform fee. */
-const AD_AMPLIFICATION_SPLIT = 0.8;
+export const AD_AMPLIFICATION_SPLIT = 0.8;
 /** Projected reach model: ~10 people reached per $1 of amplification budget. */
 const REACH_PEOPLE_PER_DOLLAR = 10;
 /** Klaviyo metric name — bind the receipt flow/template to this. */

@@ -27,7 +27,7 @@ import {
   sanitizeCampaignImpactMetricsPatch,
 } from './impactReport';
 import { runCampaignReportDrips } from './campaignReportDrips';
-import { sendContributionReceipt } from './contributionReceipt';
+import { sendContributionReceipt, AD_AMPLIFICATION_SPLIT } from './contributionReceipt';
 import {
   fetchFacebookAdInsights,
   insightsToCampaignPatch,
@@ -3883,8 +3883,6 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
 
       // The coupon code is the authoritative promo for tracking; fall back to any passed code.
       const promoCode = coupon?.code || sanitizeMetaValue(body.promoCode);
-      // Stripe charges the net when a coupon applies, else the full gross.
-      const chargeCents = coupon ? coupon.netCents! : fixedParsed;
 
       const checkoutMetadata: Record<string, string> = {
         campaignId: cidTrim, // kept for the existing /payments/record-checkout-session consumer
@@ -3955,18 +3953,54 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
       };
 
       if (useFixedAmount) {
+        // Show the receipt-style breakdown on Stripe's checkout page: two line items that sum to
+        // the GROSS (80% ad amplification / 20% platform fee), plus a discount line for any
+        // coupon — so Stripe renders subtotal (gross) → discount → total (net), like the receipt.
+        const adBudgetCents = Math.round(fixedParsed * AD_AMPLIFICATION_SPLIT);
+        const platformFeeCents = fixedParsed - adBudgetCents; // exact remainder ≈ 20%
+        const feePct = Math.round((1 - AD_AMPLIFICATION_SPLIT) * 100);
+        const line_items = [
+          {
+            quantity: 1,
+            price_data: {
+              currency: cur,
+              unit_amount: adBudgetCents,
+              product_data: {
+                name: 'Ad amplification budget',
+                description: 'Deployed in full to social platforms to boost your campaign.',
+              },
+            },
+          },
+          {
+            quantity: 1,
+            price_data: {
+              currency: cur,
+              unit_amount: platformFeeCents,
+              product_data: {
+                name: `Platform fee (${feePct}%)`,
+                description: 'Campaign review, ad operations, distribution, moderation & Unravel operations.',
+              },
+            },
+          },
+        ];
+
+        // A coupon reduces the total via a one-off Stripe discount so Stripe shows the discount
+        // line and charges the net; the campaign fund still credits the gross (metadata.gross_cents).
+        let discounts: { coupon: string }[] | undefined;
+        if (coupon && coupon.discountCents! > 0) {
+          const stripeCoupon = await stripe.coupons.create({
+            amount_off: coupon.discountCents!,
+            currency: cur,
+            duration: 'once',
+            name: `Coupon ${coupon.code}`,
+          });
+          discounts = [{ coupon: stripeCoupon.id }];
+        }
+
         const session = await stripe.checkout.sessions.create({
           ...sessionCommon,
-          line_items: [
-            {
-              price_data: {
-                currency: cur,
-                unit_amount: chargeCents,
-                product: stripeProductId,
-              },
-              quantity: 1,
-            },
-          ],
+          line_items,
+          ...(discounts ? { discounts } : {}),
         });
         return res.json({ checkoutUrl: session.url });
       }
