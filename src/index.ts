@@ -40,6 +40,13 @@ import {
   type ImpactShareCardPayload,
   renderImpactOgPng,
 } from './impactOgImage';
+import {
+  getPublishedTrustReport,
+  getTrustReportVersion,
+  listTrustReportVersions,
+  publishTrustReport,
+  upsertTrustReport,
+} from './trustReport';
 
 declare global {
   namespace Express {
@@ -1932,6 +1939,197 @@ function landerPatchFields(body: Record<string, unknown>): Record<string, unknow
   }
   return patch;
 }
+
+// ============ UUTS TRUST REPORT (Phase 0 / UE-167) ============
+// Firestore: trust_reports/{campaignId} + versions subcollection.
+// Does not modify legacy campaign.trust_score.
+
+/** GET published trust report payload for public Surfaces & Review / report / email / PDF. */
+app.get('/data/campaigns/:id/trust-report', async (req: Request, res: Response) => {
+  try {
+    const campaignId = String(req.params.id || '').trim();
+    if (!campaignId) {
+      return res.status(400).json({ error: 'Campaign id is required' });
+    }
+    const campaignSnap = await db.collection('campaigns').doc(campaignId).get();
+    if (!campaignSnap.exists) {
+      return res.status(404).json({ error: 'Campaign not found' });
+    }
+    const campaign = { id: campaignSnap.id, ...(campaignSnap.data() as Record<string, unknown>) };
+    const report = await getPublishedTrustReport(db, campaignId, campaign);
+    if (!report) {
+      return res.status(404).json({ error: 'Trust report not found' });
+    }
+    res.json(report);
+  } catch (error) {
+    console.error('GET /data/campaigns/:id/trust-report:', error);
+    res.status(500).json({ error: 'Failed to fetch trust report' });
+  }
+});
+
+/** GET latest or specific version (includes drafts) — admin / moderation. ?versionId= */
+app.get('/data/campaigns/:id/trust-report/admin', async (req: Request, res: Response) => {
+  try {
+    const campaignId = String(req.params.id || '').trim();
+    if (!campaignId) {
+      return res.status(400).json({ error: 'Campaign id is required' });
+    }
+    const campaignSnap = await db.collection('campaigns').doc(campaignId).get();
+    if (!campaignSnap.exists) {
+      return res.status(404).json({ error: 'Campaign not found' });
+    }
+    const campaign = { id: campaignSnap.id, ...(campaignSnap.data() as Record<string, unknown>) };
+    const versionId =
+      typeof req.query.versionId === 'string' ? req.query.versionId : null;
+    const report = await getTrustReportVersion(db, campaignId, campaign, versionId);
+    if (!report) {
+      return res.status(404).json({ error: 'Trust report not found' });
+    }
+    res.json(report);
+  } catch (error) {
+    console.error('GET /data/campaigns/:id/trust-report/admin:', error);
+    res.status(500).json({ error: 'Failed to fetch trust report' });
+  }
+});
+
+/** GET version history for a campaign. */
+app.get('/data/campaigns/:id/trust-report/versions', async (req: Request, res: Response) => {
+  try {
+    const campaignId = String(req.params.id || '').trim();
+    if (!campaignId) {
+      return res.status(400).json({ error: 'Campaign id is required' });
+    }
+    const campaignSnap = await db.collection('campaigns').doc(campaignId).get();
+    if (!campaignSnap.exists) {
+      return res.status(404).json({ error: 'Campaign not found' });
+    }
+    const versions = await listTrustReportVersions(db, campaignId);
+    res.json({ campaignId, versions });
+  } catch (error) {
+    console.error('GET /data/campaigns/:id/trust-report/versions:', error);
+    res.status(500).json({ error: 'Failed to list trust report versions' });
+  }
+});
+
+/**
+ * PUT create/update draft scores.
+ * Body: { initial?, final?, review?, createdBy?, publish?, refresh? }
+ * - refresh: new version without clobbering published
+ * - publish: publish this write after save
+ */
+app.put('/data/campaigns/:id/trust-report', async (req: Request, res: Response) => {
+  try {
+    const campaignId = String(req.params.id || '').trim();
+    if (!campaignId) {
+      return res.status(400).json({ error: 'Campaign id is required' });
+    }
+    const campaignSnap = await db.collection('campaigns').doc(campaignId).get();
+    if (!campaignSnap.exists) {
+      return res.status(404).json({ error: 'Campaign not found' });
+    }
+    const body = (req.body || {}) as Record<string, unknown>;
+    const result = await upsertTrustReport(db, campaignId, {
+      initial: body.initial,
+      final: body.final,
+      review: body.review,
+      createdBy: body.createdBy != null ? String(body.createdBy) : req.firebaseEmail || req.firebaseUid || null,
+      refresh: body.refresh === true,
+      publish: body.publish === true,
+    });
+    const campaign = { id: campaignSnap.id, ...(campaignSnap.data() as Record<string, unknown>) };
+    const report = await getTrustReportVersion(db, campaignId, campaign, result.versionId);
+    res.status(result.created ? 201 : 200).json({
+      message: result.created ? 'Trust report version created' : 'Trust report updated',
+      ...result,
+      report,
+    });
+  } catch (error: any) {
+    const status = typeof error?.status === 'number' ? error.status : 500;
+    if (status >= 400 && status < 500) {
+      return res.status(status).json({ error: error.message || 'Bad request' });
+    }
+    console.error('PUT /data/campaigns/:id/trust-report:', error);
+    res.status(500).json({ error: 'Failed to upsert trust report' });
+  }
+});
+
+/** POST refresh — new draft version; published scores stay intact. */
+app.post('/data/campaigns/:id/trust-report/refresh', async (req: Request, res: Response) => {
+  try {
+    const campaignId = String(req.params.id || '').trim();
+    if (!campaignId) {
+      return res.status(400).json({ error: 'Campaign id is required' });
+    }
+    const campaignSnap = await db.collection('campaigns').doc(campaignId).get();
+    if (!campaignSnap.exists) {
+      return res.status(404).json({ error: 'Campaign not found' });
+    }
+    const body = (req.body || {}) as Record<string, unknown>;
+    if (body.initial === undefined) {
+      return res.status(400).json({ error: 'initial scores are required for refresh' });
+    }
+    const result = await upsertTrustReport(db, campaignId, {
+      initial: body.initial,
+      final: body.final !== undefined ? body.final : null,
+      review: body.review ?? {
+        aiReviewed: true,
+        humanReviewed: false,
+        assignedReviewer: null,
+        decision: 'pending',
+        reviewedAt: null,
+        reviewer: null,
+      },
+      createdBy: body.createdBy != null ? String(body.createdBy) : req.firebaseEmail || req.firebaseUid || null,
+      refresh: true,
+      publish: false,
+    });
+    const campaign = { id: campaignSnap.id, ...(campaignSnap.data() as Record<string, unknown>) };
+    const report = await getTrustReportVersion(db, campaignId, campaign, result.versionId);
+    res.status(201).json({
+      message: 'Trust report refresh created as new draft version',
+      ...result,
+      report,
+    });
+  } catch (error: any) {
+    const status = typeof error?.status === 'number' ? error.status : 500;
+    if (status >= 400 && status < 500) {
+      return res.status(status).json({ error: error.message || 'Bad request' });
+    }
+    console.error('POST /data/campaigns/:id/trust-report/refresh:', error);
+    res.status(500).json({ error: 'Failed to refresh trust report' });
+  }
+});
+
+/** POST publish latest draft (or body.versionId). Archives previous published version. */
+app.post('/data/campaigns/:id/trust-report/publish', async (req: Request, res: Response) => {
+  try {
+    const campaignId = String(req.params.id || '').trim();
+    if (!campaignId) {
+      return res.status(400).json({ error: 'Campaign id is required' });
+    }
+    const campaignSnap = await db.collection('campaigns').doc(campaignId).get();
+    if (!campaignSnap.exists) {
+      return res.status(404).json({ error: 'Campaign not found' });
+    }
+    const body = (req.body || {}) as Record<string, unknown>;
+    const versionId = body.versionId != null ? String(body.versionId) : null;
+    const result = await publishTrustReport(db, campaignId, versionId);
+    const campaign = { id: campaignSnap.id, ...(campaignSnap.data() as Record<string, unknown>) };
+    const report = await getPublishedTrustReport(db, campaignId, campaign);
+    res.json({
+      message: 'Trust report published',
+      ...result,
+      report,
+    });
+  } catch (error: any) {
+    const status = typeof error?.status === 'number' ? error.status : 500;
+    if (status >= 400 && status < 500) {
+      return res.status(status).json({ error: error.message || 'Bad request' });
+    }
+    console.error('POST /data/campaigns/:id/trust-report/publish:', error);
+    res.status(500).json({ error: 'Failed to publish trust report' });
+  }
+});
 
 // GET all documents from a collection (sorted by newest first)
 // For campaigns, supports filtering by status: ?status=Approved|Rejected|Pending
