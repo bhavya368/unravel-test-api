@@ -26,7 +26,7 @@ import {
   publicCampaignSummary,
   sanitizeCampaignImpactMetricsPatch,
 } from './impactReport';
-import { runCampaignReportDrips } from './campaignReportDrips';
+import { runCampaignReportDrips, parseCampaignReportDripRequest } from './campaignReportDrips';
 import { sendContributionReceipt, AD_AMPLIFICATION_SPLIT } from './contributionReceipt';
 import {
   fetchFacebookAdInsights,
@@ -745,16 +745,35 @@ app.use(attachFirebaseUser);
  * Runs the Klaviyo-triggered report drip sequence:
  * launch + mid + recap (one event per backer with personal contribution/reach).
  * Intended for Cloud Scheduler. Does not modify site impact report calculations.
+ *
+ * Body/query:
+ * - dryRun, limit
+ * - campaignId / campaignIds — scope to specific campaigns
+ * - stage / stages — only consider launch|mid|recap
+ * - forceStage — ignore timing windows (requires campaignId); still skips if already sent
  */
 app.post('/campaign-report-drips/run', async (req: Request, res: Response) => {
   try {
-    const dryRun =
-      req.body?.dryRun === true ||
-      req.query.dryRun === 'true' ||
-      req.query.dryRun === '1';
-    const limit = Number(req.body?.limit ?? req.query.limit);
-    const result = await runCampaignReportDrips(db, { dryRun, limit, usersDb });
-    res.status(result.ok ? 200 : 207).json(result);
+    const parsed = parseCampaignReportDripRequest({
+      body: (req.body ?? {}) as Record<string, unknown>,
+      query: req.query as Record<string, unknown>,
+    });
+    if (parsed.forceStage && parsed.campaignIds.length === 0) {
+      return res.status(400).json({
+        error: 'forceStage requires campaignId or campaignIds',
+      });
+    }
+    const result = await runCampaignReportDrips(db, {
+      dryRun: parsed.dryRun,
+      limit: parsed.limit,
+      campaignIds: parsed.campaignIds,
+      stages: parsed.stages,
+      forceStage: parsed.forceStage,
+      usersDb,
+    });
+    const status =
+      'error' in result && result.error ? 400 : result.ok ? 200 : 207;
+    res.status(status).json(result);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error('POST /campaign-report-drips/run:', error);

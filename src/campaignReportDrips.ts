@@ -19,11 +19,22 @@ const DEFAULT_LIMIT = 50;
 
 export type CampaignReportStage = 'launch' | 'mid' | 'recap';
 
+const ALL_STAGES: CampaignReportStage[] = ['launch', 'mid', 'recap'];
+
 interface CampaignReportDripOptions {
   dryRun?: boolean;
   limit?: number;
   nowMs?: number;
   usersDb?: Firestore;
+  /** Only process these campaign ids (case-sensitive Firestore ids). */
+  campaignIds?: string[];
+  /** Only consider these stages when picking the next due stage. */
+  stages?: CampaignReportStage[];
+  /**
+   * Force this stage for the filtered campaign(s), ignoring timing windows.
+   * Still skips if that stage was already marked sent. Requires campaignIds.
+   */
+  forceStage?: CampaignReportStage;
 }
 
 interface RecipientProfile {
@@ -125,6 +136,8 @@ interface RunItem {
   dryRun?: boolean;
   skipped?: string;
   error?: string;
+  /** Dry-run only: first pending backer's event properties (for Klaviyo template checks). */
+  sampleEvent?: BackerStageReport;
 }
 
 function timestampToMs(value: unknown): number | null {
@@ -207,7 +220,8 @@ function getStageRecipientEmails(campaign: Record<string, unknown>, stage: Campa
 function nextDueStage(
   campaign: Record<string, unknown>,
   timing: CampaignTiming,
-  nowMs: number
+  nowMs: number,
+  allowedStages: Set<CampaignReportStage> = new Set(ALL_STAGES)
 ): CampaignReportStage | null {
   const status = String(campaign.status || '').trim();
   if (status !== 'Approved' && status !== 'Completed') return null;
@@ -215,9 +229,16 @@ function nextDueStage(
   const launchLeadMs =
     Math.max(0, Number(process.env.KLAVIYO_REPORT_LAUNCH_LEAD_HOURS ?? DEFAULT_LAUNCH_LEAD_HOURS)) * HOUR_MS;
   const launchDueMs = (timing.startMs ?? nowMs) - launchLeadMs;
-  if (!stageIsSent(campaign, 'launch') && nowMs >= launchDueMs) return 'launch';
+  if (
+    allowedStages.has('launch') &&
+    !stageIsSent(campaign, 'launch') &&
+    nowMs >= launchDueMs
+  ) {
+    return 'launch';
+  }
 
   if (
+    allowedStages.has('mid') &&
     timing.midpointMs != null &&
     !stageIsSent(campaign, 'mid') &&
     nowMs >= timing.midpointMs
@@ -226,6 +247,7 @@ function nextDueStage(
   }
 
   if (
+    allowedStages.has('recap') &&
     !stageIsSent(campaign, 'recap') &&
     (status === 'Completed' || (timing.endMs != null && nowMs >= timing.endMs))
   ) {
@@ -233,6 +255,80 @@ function nextDueStage(
   }
 
   return null;
+}
+
+function resolveStage(
+  campaign: Record<string, unknown>,
+  timing: CampaignTiming,
+  nowMs: number,
+  options: Pick<CampaignReportDripOptions, 'stages' | 'forceStage'>
+): CampaignReportStage | null {
+  const allowed = new Set(
+    (options.stages?.length ? options.stages : ALL_STAGES).filter((s) =>
+      ALL_STAGES.includes(s)
+    )
+  );
+  if (allowed.size === 0) return null;
+
+  if (options.forceStage) {
+    if (!allowed.has(options.forceStage)) return null;
+    const status = String(campaign.status || '').trim();
+    if (status !== 'Approved' && status !== 'Completed') return null;
+    if (stageIsSent(campaign, options.forceStage)) return null;
+    return options.forceStage;
+  }
+
+  return nextDueStage(campaign, timing, nowMs, allowed);
+}
+
+function normalizeCampaignIds(raw: unknown): string[] {
+  if (raw == null) return [];
+  const list = Array.isArray(raw) ? raw : String(raw).split(',');
+  return [...new Set(list.map((id) => String(id).trim()).filter(Boolean))];
+}
+
+function normalizeStages(raw: unknown): CampaignReportStage[] {
+  if (raw == null) return [];
+  const list = Array.isArray(raw) ? raw : String(raw).split(',');
+  return [
+    ...new Set(
+      list
+        .map((s) => String(s).trim().toLowerCase())
+        .filter((s): s is CampaignReportStage => ALL_STAGES.includes(s as CampaignReportStage))
+    ),
+  ];
+}
+
+export function parseCampaignReportDripRequest(input: {
+  body?: Record<string, unknown>;
+  query?: Record<string, unknown>;
+}): {
+  dryRun: boolean;
+  limit: number | undefined;
+  campaignIds: string[];
+  stages: CampaignReportStage[];
+  forceStage: CampaignReportStage | undefined;
+} {
+  const body = input.body ?? {};
+  const query = input.query ?? {};
+  const dryRun =
+    body.dryRun === true ||
+    query.dryRun === 'true' ||
+    query.dryRun === '1' ||
+    body.dryRun === 'true' ||
+    body.dryRun === '1';
+  const limitRaw = body.limit ?? query.limit;
+  const limit = limitRaw != null && limitRaw !== '' ? Number(limitRaw) : undefined;
+  const campaignIds = normalizeCampaignIds(
+    body.campaignIds ?? body.campaignId ?? query.campaignIds ?? query.campaignId
+  );
+  const stages = normalizeStages(body.stages ?? body.stage ?? query.stages ?? query.stage);
+  const forceRaw = String(body.forceStage ?? query.forceStage ?? '').trim().toLowerCase();
+  const forceStage = ALL_STAGES.includes(forceRaw as CampaignReportStage)
+    ? (forceRaw as CampaignReportStage)
+    : undefined;
+
+  return { dryRun, limit, campaignIds, stages, forceStage };
 }
 
 function asDollars(value: unknown): number {
@@ -667,13 +763,36 @@ async function markStageFailed(
 export async function runCampaignReportDrips(db: Firestore, options: CampaignReportDripOptions = {}) {
   const nowMs = options.nowMs ?? Date.now();
   const limit = Math.max(1, Math.min(200, Number(options.limit) || DEFAULT_LIMIT));
+  const campaignIdFilter = new Set((options.campaignIds ?? []).map((id) => id.trim()).filter(Boolean));
+  if (options.forceStage && campaignIdFilter.size === 0) {
+    return {
+      ok: false,
+      dryRun: Boolean(options.dryRun),
+      checkedCampaigns: 0,
+      processed: 0,
+      results: [],
+      error: 'forceStage requires campaignId or campaignIds',
+    };
+  }
+
   const statuses = ['Approved', 'Completed'];
   const campaigns: { id: string; data: Record<string, unknown> }[] = [];
 
-  for (const status of statuses) {
-    const snapshot = await db.collection('campaigns').where('status', '==', status).get();
-    for (const doc of snapshot.docs) {
-      campaigns.push({ id: doc.id, data: doc.data() as Record<string, unknown> });
+  if (campaignIdFilter.size > 0) {
+    for (const id of campaignIdFilter) {
+      const doc = await db.collection('campaigns').doc(id).get();
+      if (!doc.exists) continue;
+      const data = doc.data() as Record<string, unknown>;
+      const status = String(data.status || '').trim();
+      if (status !== 'Approved' && status !== 'Completed') continue;
+      campaigns.push({ id: doc.id, data });
+    }
+  } else {
+    for (const status of statuses) {
+      const snapshot = await db.collection('campaigns').where('status', '==', status).get();
+      for (const doc of snapshot.docs) {
+        campaigns.push({ id: doc.id, data: doc.data() as Record<string, unknown> });
+      }
     }
   }
 
@@ -688,7 +807,10 @@ export async function runCampaignReportDrips(db: Firestore, options: CampaignRep
     if (results.length >= limit) break;
     const title = String(campaign.data.title || 'Campaign');
     const timing = buildTiming(campaign.data, nowMs);
-    const stage = nextDueStage(campaign.data, timing, nowMs);
+    const stage = resolveStage(campaign.data, timing, nowMs, {
+      stages: options.stages,
+      forceStage: options.forceStage,
+    });
     if (!stage) continue;
 
     // Launch + mid + recap → each backer with personal impact fields.
@@ -699,6 +821,7 @@ export async function runCampaignReportDrips(db: Firestore, options: CampaignRep
       const basePreview = buildReport(campaign.id, campaign.data, stage, timing, nowMs, backers.length);
 
       if (options.dryRun) {
+        const sampleBacker = pending[0];
         results.push({
           campaignId: campaign.id,
           title,
@@ -707,6 +830,9 @@ export async function runCampaignReportDrips(db: Firestore, options: CampaignRep
           emails: pending.map((b) => b.email),
           recipientCount: pending.length,
           dryRun: true,
+          ...(sampleBacker
+            ? { sampleEvent: buildBackerStageReport(basePreview, sampleBacker, campaign.data) }
+            : {}),
           ...(pending.length === 0
             ? { skipped: backers.length === 0 ? 'No backers with email' : 'All backers already sent' }
             : {}),
