@@ -198,6 +198,12 @@ async function upsertBacking(input: BackingInput): Promise<void> {
 const cleanStr = (v: unknown): string | null =>
   typeof v === 'string' && v.trim() ? v.trim() : null;
 
+/** Stripe metadata values are always strings — parse a cents amount safely (0 when absent/bad). */
+const parseCents = (v: unknown): number => {
+  const n = Number(typeof v === 'string' ? v.trim() : v);
+  return Number.isFinite(n) && n >= 0 ? Math.round(n) : 0;
+};
+
 /** Primary path: full identity + discount available on the session payload. */
 async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session): Promise<void> {
   if (session.payment_status !== 'paid') return;
@@ -222,8 +228,12 @@ async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session):
   });
 }
 
-/** Backstop: fires if the session event never arrives. PI carries our metadata (set via
- * payment_intent_data.metadata in UE-154) but no client_reference_id or discount breakdown. */
+/** Backstop for the session event. In practice this usually arrives FIRST (Stripe emits
+ * payment_intent.succeeded a few seconds before checkout.session.completed), so it — not the
+ * session handler — is what normally creates the record. It must therefore carry the real
+ * money values: the PI has our `payment_intent_data.metadata` from UE-154, which includes
+ * discount_cents/gross_cents for coupon checkouts. (No client_reference_id here, so the
+ * distinct_id falls back to firebase_uid / posthog_distinct_id from metadata.) */
 async function handlePaymentIntentSucceeded(pi: Stripe.PaymentIntent): Promise<void> {
   const md = pi.metadata || {};
   const campaignId = cleanStr(md.campaign_id) || cleanStr(md.campaignId);
@@ -239,7 +249,10 @@ async function handlePaymentIntentSucceeded(pi: Stripe.PaymentIntent): Promise<v
     stripeCustomerId: typeof pi.customer === 'string' ? pi.customer : cleanStr(pi.customer?.id),
     promoCode: cleanStr(md.promo_code),
     amountTotal: pi.amount_received ?? pi.amount ?? 0,
-    amountDiscount: 0, // not available on the PaymentIntent; the session event carries the real value
+    // Our own metadata carries the coupon breakdown (UE-154). Previously hardcoded 0, which
+    // zeroed amount_discount/coupon_value on essentially every backing because this handler
+    // wins the race — see the note above.
+    amountDiscount: parseCents(md.discount_cents),
     utmSource: cleanStr(md.utm_source),
     utmCampaign: cleanStr(md.utm_campaign),
     source: 'payment_intent.succeeded',
