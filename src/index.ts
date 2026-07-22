@@ -1444,8 +1444,29 @@ interface ShareCardDoc {
   displayName: string;
   showAmount: boolean;
   metrics: Record<string, unknown>;
+  cardImageUrl?: string;
+  cardImageStoragePath?: string;
   createdAt: string;
   revoked: boolean;
+}
+
+function shareCardImageUrl(token: string, version?: string | number): string {
+  const url = `${API_PUBLIC_BASE}/public/impact/${encodeURIComponent(token)}/card.jpg`;
+  return version ? `${url}?v=${encodeURIComponent(String(version))}` : url;
+}
+
+function shareCardImageStoragePath(token: string): string {
+  return `share-cards/${token}/card.jpg`;
+}
+
+function decodeDataUrlImage(value: unknown): { buffer: Buffer; mimeType: string } | null {
+  if (typeof value !== 'string') return null;
+  const match = value.trim().match(/^data:(image\/(?:jpeg|jpg));base64,([a-z0-9+/=\s]+)$/i);
+  if (!match) return null;
+  return {
+    buffer: Buffer.from(match[2].replace(/\s/g, ''), 'base64'),
+    mimeType: 'image/jpeg',
+  };
 }
 
 /** Create a public share link for personal impact (UE-47). */
@@ -1548,6 +1569,7 @@ app.post('/users/me/share-cards', async (req: Request, res: Response) => {
       token,
       url: `${frontendBase}/impact/share/${token}`,
       ogUrl: `${API_PUBLIC_BASE}/og/impact/${token}`,
+      cardImageUrl: doc.cardImageUrl,
       scope,
       displayName,
       headlineTitle,
@@ -1556,6 +1578,65 @@ app.post('/users/me/share-cards', async (req: Request, res: Response) => {
   } catch (error) {
     console.error('POST /users/me/share-cards:', error);
     res.status(500).json({ error: 'Failed to create share card' });
+  }
+});
+
+/** Store/overwrite the public JPG for a personal impact share card. */
+app.post('/users/me/share-cards/:token/card-image', async (req: Request, res: Response) => {
+  try {
+    const uid = await requireFirebaseUid(req, res);
+    if (!uid) return;
+
+    const { token } = req.params;
+    const ref = db.collection('share_cards').doc(token);
+    const snap = await ref.get();
+    if (!snap.exists) {
+      return res.status(404).json({ error: 'Share card not found' });
+    }
+
+    const data = snap.data() as ShareCardDoc;
+    if (data.ownerUid !== uid) {
+      return res.status(403).json({ error: 'Not allowed to update this share card' });
+    }
+    if (data.revoked) {
+      return res.status(410).json({ error: 'This share link has been revoked' });
+    }
+
+    const decoded = decodeDataUrlImage(req.body?.imageBase64);
+    if (!decoded) {
+      return res.status(400).json({ error: 'imageBase64 must be a JPEG data URL' });
+    }
+    if (decoded.buffer.length > 5 * 1024 * 1024) {
+      return res.status(400).json({ error: 'Image too large (max 5MB)' });
+    }
+    if (decoded.buffer.length < 128) {
+      return res.status(400).json({ error: 'Invalid image data' });
+    }
+
+    const version = Date.now();
+    const bucketName = process.env.GCS_BUCKET || 'unravel-generated-images';
+    const storagePath = shareCardImageStoragePath(token);
+    const file = storage.bucket(bucketName).file(storagePath);
+    await file.save(decoded.buffer, {
+      resumable: false,
+      metadata: {
+        contentType: decoded.mimeType,
+        cacheControl: 'public, max-age=31536000, immutable',
+      },
+    });
+
+    const cardImageUrl = shareCardImageUrl(token, version);
+    await ref.update({
+      cardImageUrl,
+      cardImageStoragePath: `gs://${bucketName}/${storagePath}`,
+      cardImageUpdatedAt: FieldValue.serverTimestamp(),
+      cardImageVersion: version,
+    });
+
+    res.json({ cardImageUrl });
+  } catch (error) {
+    console.error('POST /users/me/share-cards/:token/card-image:', error);
+    res.status(500).json({ error: 'Failed to store share card image' });
   }
 });
 
@@ -1594,6 +1675,7 @@ app.get('/public/impact/:token', async (req: Request, res: Response) => {
     const data = snap.data() as ShareCardDoc & {
       headlineTitle?: string;
       thumbnailUrl?: string | null;
+      cardImageUrl?: string | null;
     };
     if (data.revoked) {
       return res.status(410).json({ error: 'This share link has been revoked' });
@@ -1605,12 +1687,47 @@ app.get('/public/impact/:token', async (req: Request, res: Response) => {
       displayName: data.displayName,
       headlineTitle: data.headlineTitle,
       thumbnailUrl: data.thumbnailUrl,
+      cardImageUrl: data.cardImageUrl,
       metrics: data.metrics,
       createdAt: data.createdAt,
     });
   } catch (error) {
     console.error('GET /public/impact/:token:', error);
     res.status(500).json({ error: 'Failed to load share card' });
+  }
+});
+
+/** Public stable JPG for a shareable personal impact card. */
+app.get('/public/impact/:token/card.jpg', async (req: Request, res: Response) => {
+  try {
+    const { token } = req.params;
+    const snap = await db.collection('share_cards').doc(token).get();
+    if (!snap.exists) {
+      return res.status(404).json({ error: 'Share card not found' });
+    }
+    const data = snap.data() as ShareCardDoc;
+    if (data.revoked) {
+      return res.status(410).json({ error: 'This share link has been revoked' });
+    }
+
+    const bucketName = process.env.GCS_BUCKET || 'unravel-generated-images';
+    const file = storage.bucket(bucketName).file(shareCardImageStoragePath(token));
+    const [exists] = await file.exists();
+    if (!exists) {
+      return res.status(404).json({ error: 'Share card image not found' });
+    }
+
+    res.setHeader('Content-Type', 'image/jpeg');
+    res.setHeader('Cache-Control', req.query.v ? 'public, max-age=31536000, immutable' : 'public, max-age=300');
+    file.createReadStream()
+      .on('error', (err) => {
+        console.error('Error streaming share card image:', err);
+        res.status(500).json({ error: 'Failed to load share card image' });
+      })
+      .pipe(res);
+  } catch (error) {
+    console.error('GET /public/impact/:token/card.jpg:', error);
+    res.status(500).json({ error: 'Failed to serve share card image' });
   }
 });
 
