@@ -35,8 +35,6 @@ import {
   syncCampaignFacebookInsights,
 } from './facebookInsights';
 import {
-  IMPACT_OG_HEIGHT,
-  IMPACT_OG_WIDTH,
   type ImpactShareCardPayload,
   renderImpactOgPng,
 } from './impactOgImage';
@@ -2580,10 +2578,6 @@ function impactShareCardPayloadFromDoc(
   };
 }
 
-function impactOgImageUrl(req: Request, token: string): string {
-  return `${ogRedirectBase(req)}/og/impact/${encodeURIComponent(token)}/image`;
-}
-
 function impactOgTitle(payload: ImpactShareCardPayload): string {
   const metrics = payload.metrics || {};
   const campaignTitle =
@@ -2647,12 +2641,11 @@ app.get('/og/impact/:token', async (req: Request, res: Response) => {
 
     const title = impactOgTitle(loaded.payload);
     const description = impactOgDescription(loaded.payload);
-    const image = impactOgImageUrl(req, token);
     const canonicalUrl = `${ogRedirectBase(req)}/impact/share/${token}`;
     const ogPageUrl = canonicalUrl;
     const ua = String(req.get('user-agent') || '');
     const isCrawler = isSharePreviewCrawler(ua);
-    console.log(`[og/impact] token=${token} ua="${ua}" crawler=${isCrawler} image=${image}`);
+    console.log(`[og/impact] token=${token} ua="${ua}" crawler=${isCrawler}`);
 
     const ogHtml = `<!DOCTYPE html>
 <html lang="en">
@@ -2662,19 +2655,13 @@ app.get('/og/impact/:token', async (req: Request, res: Response) => {
   <title>${escapeHtml(title)} | Unravel</title>
   <meta property="og:title" content="${escapeHtml(title)}">
   <meta property="og:description" content="${escapeHtml(description)}">
-  <meta property="og:image" content="${escapeHtml(image)}">
-  <meta property="og:image:secure_url" content="${escapeHtml(image)}">
-  <meta property="og:image:width" content="${IMPACT_OG_WIDTH}">
-  <meta property="og:image:height" content="${IMPACT_OG_HEIGHT}">
-  <meta property="og:image:type" content="image/png">
   <meta property="og:url" content="${escapeHtml(ogPageUrl)}">
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="Unravel">
   <meta property="fb:app_id" content="${escapeHtml(FB_APP_ID)}">
-  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:card" content="summary">
   <meta name="twitter:title" content="${escapeHtml(title)}">
   <meta name="twitter:description" content="${escapeHtml(description)}">
-  <meta name="twitter:image" content="${escapeHtml(image)}">
 </head>
 <body><p>${escapeHtml(title)}</p></body>
 </html>`;
