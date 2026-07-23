@@ -117,7 +117,7 @@ export async function sendContributionReceipt(input: ContributionReceiptInput): 
     ad_url: campaignUrl,
     impact_url: `${base}/account/impact/${encodeURIComponent(input.campaignId)}`,
     subscribe_url: `${base}/subscribe`,
-    trust_report_url: `${campaignUrl}/impact`, // "View online"; PDF is a follow-up
+    trust_report_url: `${campaignUrl}/report`, // UUTS Trust Score report page (view + Print/Save-PDF). Attached-PDF version is a follow-up (needs UE-174 PDF + SES).
     support_email: 'support@unravel.network',
   };
 
