@@ -3812,6 +3812,14 @@ async function recordCouponOnlyBacking(input: {
     source: 'coupon_zero_balance',
   });
 
+  // Show the SAME score the linked report page renders: prefer the published UUTS report
+  // composite, and only fall back to the legacy campaign.trust_score when no report is
+  // published (legacy is intentionally never synced to the composite). Best-effort.
+  try {
+    const published = await getPublishedTrustReport(db, input.campaignId, { id: input.campaignId });
+    if (published && typeof published.composite === 'number') campaignTrustScore = published.composite;
+  } catch { /* keep legacy campaign.trust_score */ }
+
   // Receipt + trust report email (best-effort — never block the backing on email delivery).
   if (input.donorEmail) {
     try {
@@ -4397,6 +4405,12 @@ app.post('/payments/record-checkout-session', async (req: Request, res: Response
     // Receipt + trust report email — once per session (guarded by wroteNewRecord so a webhook
     // + client double-fire doesn't double-send). Best-effort; never fails the recording.
     if (wroteNewRecord && donorEmail) {
+      // Show the SAME score the linked report page renders: prefer the published UUTS report
+      // composite, falling back to the legacy campaign.trust_score only when none is published.
+      try {
+        const published = await getPublishedTrustReport(db, campaignId.trim(), { id: campaignId.trim() });
+        if (published && typeof published.composite === 'number') campaignTrustScore = published.composite;
+      } catch { /* keep legacy campaign.trust_score */ }
       try {
         await sendContributionReceipt({
           campaignId: campaignId.trim(),
