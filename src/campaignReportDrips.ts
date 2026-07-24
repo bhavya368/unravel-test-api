@@ -64,6 +64,10 @@ interface CampaignReport {
   campaignUrl: string;
   impactUrl: string;
   thumbnailUrl: string | null;
+  /** Facebook ad creative fields (same fallbacks as AdPreviewCard on the site). */
+  ad_headline: string;
+  ad_primary_text: string | null;
+  ad_image_url: string | null;
   category: string | null;
   status: string | null;
   fundingGoalDollars: number;
@@ -356,6 +360,51 @@ function getFrontendOrigin(): string {
   return raw.split(',')[0].trim().replace(/\/$/, '');
 }
 
+function getApiPublicBase(): string {
+  const raw =
+    process.env.API_PUBLIC_URL ||
+    process.env.API_BASE_URL ||
+    'https://unravel-api-297290600394.us-central1.run.app';
+  return raw.split(',')[0].trim().replace(/\/$/, '');
+}
+
+/** Absolutize Firestore image paths for email clients (same rules as OG/thumbnail resolve). */
+function resolveCampaignImageUrl(raw: unknown): string | null {
+  const s = typeof raw === 'string' ? raw.trim() : '';
+  if (!s) return null;
+  if (s.startsWith('http://') || s.startsWith('https://') || s.startsWith('data:')) return s;
+  const apiBase = getApiPublicBase();
+  if (s.startsWith('/')) return `${apiBase}${s}`;
+  if (!s.includes('/') && !s.includes(':')) return `${apiBase}/images/${s}`;
+  return null;
+}
+
+function stripHtml(value: unknown): string {
+  return String(value ?? '')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function getCampaignAdFields(campaign: Record<string, unknown>, campaignTitle: string): {
+  ad_headline: string;
+  ad_primary_text: string | null;
+  ad_image_url: string | null;
+  thumbnailUrl: string | null;
+} {
+  const adHeadline = String(campaign.ad_headline || '').trim();
+  const adPrimary = String(campaign.ad_primary_text || '').trim();
+  const shortDescription = stripHtml(campaign.short_description ?? campaign.tagline ?? campaign.description);
+  const thumbnailUrl = resolveCampaignImageUrl(campaign.thumbnail_url);
+  const adImageUrl = resolveCampaignImageUrl(campaign.ad_image_url) ?? thumbnailUrl;
+  return {
+    ad_headline: adHeadline || campaignTitle,
+    ad_primary_text: adPrimary || shortDescription || null,
+    ad_image_url: adImageUrl,
+    thumbnailUrl,
+  };
+}
+
 function getCreatorProfileFromCampaign(campaign: Record<string, unknown>): RecipientProfile | null {
   const email = String(campaign.creator_email || '').trim().toLowerCase();
   if (!email) return null;
@@ -429,6 +478,7 @@ function buildReport(
   const budgetDollars = Math.round((getCampaignBudgetCents(campaignRow) / 100) * 100) / 100;
   const frontendOrigin = getFrontendOrigin();
   const campaignTitle = String(campaign.title || 'Campaign');
+  const adFields = getCampaignAdFields(campaign, campaignTitle);
 
   return {
     stage,
@@ -439,7 +489,10 @@ function buildReport(
     campaign_name: campaignTitle,
     campaignUrl: `${frontendOrigin}/campaign/${encodeURIComponent(campaignId)}`,
     impactUrl: `${frontendOrigin}/campaign/${encodeURIComponent(campaignId)}/impact`,
-    thumbnailUrl: typeof campaign.thumbnail_url === 'string' ? campaign.thumbnail_url : null,
+    thumbnailUrl: adFields.thumbnailUrl,
+    ad_headline: adFields.ad_headline,
+    ad_primary_text: adFields.ad_primary_text,
+    ad_image_url: adFields.ad_image_url,
     category: typeof campaign.category === 'string' ? campaign.category : null,
     status: typeof campaign.status === 'string' ? campaign.status : null,
     fundingGoalDollars,

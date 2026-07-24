@@ -39,6 +39,9 @@ FRONTEND_ORIGIN=https://your-frontend-host
 | CTA | `event.impactUrl` → `/account/impact/:campaignId` |
 | Secondary | `event.campaignUrl` |
 | Image | `event.thumbnailUrl` |
+| Ad headline | `event.ad_headline` (falls back to campaign title) |
+| Ad primary text | `event.ad_primary_text` (falls back to short description) |
+| Ad image | `event.ad_image_url` (falls back to thumbnail) |
 
 3. Dry-run returns `sampleEvent` with the same property names for a live check.
 

@@ -31,8 +31,11 @@
     event.projected_reach       personal attributed reach
     event.pooled_amount         e.g. "$1,000"
     event.total_backers
-    event.projected_collective_reach / event.reach
+    event.projected_collective_reach
     event.thumbnailUrl
+    event.ad_headline           Facebook ad headline (falls back to campaign title)
+    event.ad_primary_text       Facebook ad primary text (falls back to short description)
+    event.ad_image_url          Facebook ad image (falls back to thumbnail)
     event.impactUrl             /account/impact/:campaignId
     event.campaignUrl
 -->
@@ -52,13 +55,13 @@
     <div style="height:4px; background:#2b9dee; border-radius:999px; margin:18px 0 0; font-size:0; line-height:0;">&nbsp;</div>
   </td></tr><tr><td style="padding:22px 28px 0;">
     <div style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:26px; font-weight:800; letter-spacing:-0.5px; line-height:1.18; color:#0d161b; margin:0 0 10px;">You backed it — and it's now live, {{ first_name|default:'there' }}.</div>
-    <div style="font-family:'Noto Sans', Arial, Helvetica, sans-serif; font-size:15px; line-height:1.6; color:#4c799a;">Your contribution to <strong style="color:#0d161b">{{ event.campaign_name|default:event.campaignTitle|default:'your campaign' }}</strong> is in motion. Here's where it's headed.</div>
+    <div style="font-family:'Noto Sans', Arial, Helvetica, sans-serif; font-size:15px; line-height:1.6; color:#4c799a;">Your contribution to <strong style="color:#0d161b">{{ event.campaign_name|default:'your campaign' }}</strong> is in motion. Here's where it's headed.</div>
   </td></tr>
 
   {% if event.thumbnailUrl %}
   <tr><td style="padding:18px 28px 0;">
     <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
-      <tr><td style="border-radius:16px; overflow:hidden;"><img src="{{ event.thumbnailUrl }}" width="544" alt="{{ event.campaign_name|default:event.campaignTitle|default:'Campaign' }}" style="width:100%; height:auto; display:block; border-radius:16px;"></td></tr>
+      <tr><td style="border-radius:16px; overflow:hidden;"><img src="{{ event.thumbnailUrl }}" width="544" alt="{{ event.campaign_name|default:'Campaign' }}" style="width:100%; height:auto; display:block; border-radius:16px;"></td></tr>
     </table>
   </td></tr>
   {% endif %}
@@ -96,7 +99,7 @@
     <td class="stack" width="50%" valign="top" style="padding:0 0 0 6px;">
       <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#f6f9fb; border:1px solid #e7eef3; border-radius:13px;">
         <tr><td style="padding:15px 16px;">
-          <div style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:21px; font-weight:800; color:#0d161b;">{{ event.projected_collective_reach|default:event.reach|default:'0' }}</div>
+          <div style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:21px; font-weight:800; color:#0d161b;">{{ event.projected_collective_reach|default:'0' }}</div>
           <div style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:10px; font-weight:800; letter-spacing:0.5px; text-transform:uppercase; color:#4c799a; margin-top:4px;">Projected collective reach</div>
         </td></tr>
       </table>
@@ -105,7 +108,62 @@
     <tr><td align="center" bgcolor="#2b9dee" style="border-radius:999px;">
       <a href="{{ event.impactUrl }}" style="display:block; padding:15px 28px; font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:15px; font-weight:800; color:#ffffff; text-decoration:none; border-radius:999px;">Track your impact &rarr;</a>
     </td></tr>
-  </table><div style="text-align:center; margin-top:14px;"><a href="{{ event.campaignUrl }}" style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:13px; font-weight:800; color:#1a8cd8;">View campaign</a></div></td></tr><tr><td style="font-size:0; line-height:0; height:30px;">&nbsp;</td></tr>
+  </table><div style="text-align:center; margin-top:14px;"><a href="{{ event.campaignUrl }}" style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:13px; font-weight:800; color:#1a8cd8;">View campaign</a></div></td></tr>
+
+  <!-- Facebook-style ad preview (matches campaign AdPreviewCard) -->
+  <tr><td style="padding:24px 28px 0;">
+    <div style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:11px; font-weight:800; letter-spacing:0.8px; text-transform:uppercase; color:#4c799a; margin-bottom:6px;">Ad preview</div>
+    <div style="font-family:'Noto Sans', Arial, Helvetica, sans-serif; font-size:13px; line-height:1.5; color:#4c799a; margin-bottom:12px;">This is how the ad will appear on Facebook.</div>
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#e4e6eb; border-radius:12px;">
+      <tr><td style="padding:12px;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#ffffff; border-radius:10px; overflow:hidden; border:1px solid #e7eef3;">
+          <tr><td style="padding:12px 12px 8px;">
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+              <tr>
+                <td width="40" valign="middle" style="width:40px;">
+                  <table role="presentation" cellspacing="0" cellpadding="0" border="0"><tr>
+                    <td width="40" height="40" align="center" valign="middle" style="width:40px; height:40px; background:#1877F2; border-radius:20px; font-family:Arial, Helvetica, sans-serif; font-size:18px; font-weight:700; color:#ffffff;">U</td>
+                  </tr></table>
+                </td>
+                <td valign="middle" style="padding-left:10px;">
+                  <div style="font-family:Arial, Helvetica, sans-serif; font-size:15px; font-weight:600; color:#050505; line-height:1.2;">Unravel</div>
+                  <div style="font-family:Arial, Helvetica, sans-serif; font-size:13px; color:#65676b; line-height:1.2; margin-top:2px;">Sponsored</div>
+                </td>
+              </tr>
+            </table>
+          </td></tr>
+
+          {% if event.ad_primary_text %}
+          <tr><td style="padding:0 12px 8px; font-family:Arial, Helvetica, sans-serif; font-size:15px; line-height:1.35; color:#050505;">
+            {{ event.ad_primary_text }}
+          </td></tr>
+          {% endif %}
+
+          {% if event.ad_image_url %}
+          <tr><td>
+            <img src="{{ event.ad_image_url }}" width="520" alt="{{ event.ad_headline|default:'Campaign' }}" style="width:100%; height:auto; display:block;">
+          </td></tr>
+          {% endif %}
+
+          <tr><td style="padding:10px 12px 12px; border-top:1px solid #e4e6eb;">
+            <div style="font-family:Arial, Helvetica, sans-serif; font-size:13px; color:#65676b; margin-bottom:6px;">unravel.network</div>
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
+              <tr>
+                <td valign="middle" style="font-family:Arial, Helvetica, sans-serif; font-size:13px; font-weight:600; color:#050505; padding-right:10px;">
+                  {{ event.ad_headline|default:'Campaign' }}
+                </td>
+                <td width="110" valign="middle" align="right" style="width:110px;">
+                  <a href="{{ event.campaignUrl }}" style="display:inline-block; background:#1877F2; color:#ffffff; font-family:Arial, Helvetica, sans-serif; font-size:13px; font-weight:600; text-decoration:none; padding:8px 12px; border-radius:8px;">Learn more</a>
+                </td>
+              </tr>
+            </table>
+          </td></tr>
+        </table>
+      </td></tr>
+    </table>
+  </td></tr>
+
+  <tr><td style="font-size:0; line-height:0; height:30px;">&nbsp;</td></tr>
     </table>
     <table role="presentation" class="container" width="600" cellspacing="0" cellpadding="0" border="0" style="width:600px; max-width:600px;">
       <tr><td style="padding:18px 12px 0; text-align:center; font-family:'Noto Sans', Arial, Helvetica, sans-serif; font-size:11px; line-height:1.6; color:#94a3b8;">
