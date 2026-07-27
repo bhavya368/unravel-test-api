@@ -45,6 +45,7 @@ import {
   publishTrustReport,
   upsertTrustReport,
 } from './trustReport';
+import { isUutsPrescreenEnabled, runUutsPrescreenAndPersist } from './uutsPrescreen';
 
 declare global {
   namespace Express {
@@ -2247,6 +2248,54 @@ app.post('/data/campaigns/:id/trust-report/refresh', async (req: Request, res: R
   }
 });
 
+/**
+ * POST enqueue a new async UUTS pre-screen run for an existing campaign.
+ * Always allowed (manual Admin test path). Auto-run on submit remains gated by
+ * UUTS_PRESCREEN_ENABLED — this endpoint does not require that flag.
+ */
+app.post('/data/campaigns/:id/uuts-prescreen/refresh', async (req: Request, res: Response) => {
+  try {
+    const campaignId = String(req.params.id || '').trim();
+    if (!campaignId) {
+      return res.status(400).json({ error: 'Campaign id is required' });
+    }
+    const campaignRef = db.collection('campaigns').doc(campaignId);
+    const campaignSnap = await campaignRef.get();
+    if (!campaignSnap.exists) {
+      return res.status(404).json({ error: 'Campaign not found' });
+    }
+    const campaign = { id: campaignSnap.id, ...(campaignSnap.data() as Record<string, unknown>) };
+    const queuedAt = new Date().toISOString();
+    await campaignRef.update({
+      uuts_prescreen_status: 'queued',
+      uuts_prescreen_attempts: 0,
+      uuts_prescreen_error: null,
+      uuts_prescreen_updated_at: queuedAt,
+      updatedAt: queuedAt,
+    });
+
+    void runUutsPrescreenAndPersist({
+      db,
+      vertexAI,
+      campaignId,
+      campaign,
+      promptDocId: AI_PROMPTS_DOC_ID,
+    }).catch((err) =>
+      console.error('UUTS pre-screen refresh background task error:', err)
+    );
+
+    res.status(202).json({
+      message: 'UUTS pre-screen refresh queued',
+      campaignId,
+      uuts_prescreen_status: 'queued',
+      source: 'manual',
+    });
+  } catch (error) {
+    console.error('POST /data/campaigns/:id/uuts-prescreen/refresh:', error);
+    res.status(500).json({ error: 'Failed to queue UUTS pre-screen refresh' });
+  }
+});
+
 /** POST publish latest draft (or body.versionId). Archives previous published version. */
 app.post('/data/campaigns/:id/trust-report/publish', async (req: Request, res: Response) => {
   try {
@@ -3012,6 +3061,18 @@ app.post('/data/:collection', async (req: Request, res: Response) => {
           delete data.creator_name;
         }
       }
+
+      if (isUutsPrescreenEnabled()) {
+        data.uuts_prescreen_status = 'queued';
+        data.uuts_prescreen_attempts = 0;
+        data.uuts_prescreen_error = null;
+        data.uuts_prescreen_updated_at = new Date().toISOString();
+      } else {
+        data.uuts_prescreen_status = 'disabled';
+        data.uuts_prescreen_attempts = 0;
+        data.uuts_prescreen_error = null;
+        data.uuts_prescreen_updated_at = new Date().toISOString();
+      }
     }
 
     // Landers: own schema (snake_case + Firestore timestamps). No campaign moderation fields.
@@ -3106,6 +3167,18 @@ app.post('/data/:collection', async (req: Request, res: Response) => {
       void analyzeBiasWheelAndUpdate(docRef.id, data).catch((err) =>
         console.error('Bias wheel background task error:', err)
       );
+      // UUTS pre-screen: opt-in via UUTS_PRESCREEN_ENABLED=true (off by default for safe deploys).
+      if (isUutsPrescreenEnabled()) {
+        void runUutsPrescreenAndPersist({
+          db,
+          vertexAI,
+          campaignId: docRef.id,
+          campaign: data,
+          promptDocId: AI_PROMPTS_DOC_ID,
+        }).catch((err) =>
+          console.error('UUTS pre-screen background task error:', err)
+        );
+      }
     }
     
     res.status(201).json({ id: docRef.id, message: 'Document created' });
