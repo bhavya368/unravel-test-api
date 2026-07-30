@@ -33,6 +33,23 @@ export type ReviewDecision =
   | 'rejected'
   | null;
 
+/**
+ * One atomic claim. `evidenceWeight` / `consensusFactor` / `regionalBonus` / `score` carry the
+ * Layer 1 per-claim formula so the layer score can be recomputed from the rows shown in the UI.
+ */
+export interface FactCheckClaim {
+  id: string;
+  text: string;
+  source: string | null;
+  tier: string;
+  verdict: string;
+  tierBase?: number | null;
+  evidenceWeight?: number | null;
+  consensusFactor?: number | null;
+  regionalBonus?: number | null;
+  score?: number | null;
+}
+
 export interface FactCheckLayer {
   status: LayerStatus;
   score: number | null;
@@ -42,8 +59,10 @@ export interface FactCheckLayer {
     contextIntegrity: number;
     uncertaintyDisclosure: number;
   } | null;
-  claims: Array<{ id: string; text: string; source: string | null; tier: string; verdict: string }>;
+  claims: FactCheckClaim[];
   penalties: Array<{ type: string; points: number }>;
+  /** Mean of scored claims before penalties (Layer 1 Σ/n × 100). */
+  claimsMean?: number | null;
 }
 
 export interface CommsIntegrityLayer {
@@ -73,6 +92,12 @@ export interface SharedRealityLayer {
 /** One complete scoring snapshot (AI initial or human final). */
 export interface ScoreSnapshot {
   composite: number | null;
+  /** Layer-weighted composite before Confidence Factor / Uncertainty Visibility. */
+  compositeBase?: number | null;
+  /** Confidence Factor (0.70–1.00). 0.70 = automated pre-screen with no human validation. */
+  confidenceFactor?: number | null;
+  /** Uncertainty Visibility modifier (0.95–1.05). */
+  uncertaintyVisibility?: number | null;
   factCheck: FactCheckLayer;
   commsIntegrity: CommsIntegrityLayer;
   sharedReality: SharedRealityLayer;
@@ -139,6 +164,7 @@ const EMPTY_FACT_CHECK: FactCheckLayer = {
   subscores: null,
   claims: [],
   penalties: [],
+  claimsMean: null,
 };
 
 const EMPTY_COMMS: CommsIntegrityLayer = {
@@ -161,6 +187,9 @@ const EMPTY_SHARED: SharedRealityLayer = {
 export function emptySnapshot(): ScoreSnapshot {
   return {
     composite: null,
+    compositeBase: null,
+    confidenceFactor: null,
+    uncertaintyVisibility: null,
     factCheck: { ...EMPTY_FACT_CHECK, claims: [], penalties: [] },
     commsIntegrity: { ...EMPTY_COMMS, dims: [] },
     sharedReality: { ...EMPTY_SHARED, subs: [] },
@@ -205,11 +234,32 @@ export function computeComposite(
   );
 }
 
+/**
+ * UUTS Mathematical Framework: final = base × Confidence Factor × Uncertainty Visibility.
+ * CF reflects review rigor (0.70 automated pre-screen … 1.00 three agreeing reviewers).
+ */
+export function applyConfidenceModifiers(
+  compositeBase: number | null | undefined,
+  confidenceFactor: number,
+  uncertaintyVisibility: number
+): number | null {
+  const base = Number(compositeBase);
+  if (!Number.isFinite(base)) return null;
+  const adjusted = base * confidenceFactor * uncertaintyVisibility;
+  return Math.max(0, Math.min(100, Math.round(adjusted)));
+}
+
 function clampScore100(n: unknown): number | null {
   if (n == null || n === '') return null;
   const v = Number(n);
   if (!Number.isFinite(v)) return null;
   return Math.max(0, Math.min(100, Math.round(v)));
+}
+
+function finiteOrNull(n: unknown): number | null {
+  if (n == null || n === '') return null;
+  const v = Number(n);
+  return Number.isFinite(v) ? v : null;
 }
 
 function asLayerStatus(raw: unknown): LayerStatus {
@@ -240,6 +290,11 @@ function sanitizeFactCheck(raw: unknown): FactCheckLayer {
           source: row.source != null ? String(row.source) : null,
           tier: String(row.tier ?? ''),
           verdict: String(row.verdict ?? ''),
+          tierBase: finiteOrNull(row.tierBase),
+          evidenceWeight: finiteOrNull(row.evidenceWeight),
+          consensusFactor: finiteOrNull(row.consensusFactor),
+          regionalBonus: finiteOrNull(row.regionalBonus),
+          score: finiteOrNull(row.score),
         };
       })
     : [];
@@ -249,7 +304,7 @@ function sanitizeFactCheck(raw: unknown): FactCheckLayer {
         return { type: String(row.type ?? ''), points: Number(row.points) || 0 };
       })
     : [];
-  return { status, score, subscores, claims, penalties };
+  return { status, score, subscores, claims, penalties, claimsMean: finiteOrNull(o.claimsMean) };
 }
 
 function sanitizeComms(raw: unknown): CommsIntegrityLayer {
@@ -319,6 +374,9 @@ export function sanitizeSnapshot(raw: unknown): ScoreSnapshot {
   const composite = o.composite != null ? clampScore100(o.composite) : computed;
   return {
     composite: composite ?? computed,
+    compositeBase: o.compositeBase != null ? clampScore100(o.compositeBase) : computed,
+    confidenceFactor: finiteOrNull(o.confidenceFactor),
+    uncertaintyVisibility: finiteOrNull(o.uncertaintyVisibility),
     factCheck,
     commsIntegrity,
     sharedReality,
