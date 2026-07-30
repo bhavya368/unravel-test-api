@@ -964,6 +964,7 @@ app.post('/users/profile', async (req: Request, res: Response) => {
       lastName,
       email,
       username,
+      avatarUrl,
       policiesVersion,
       marketingEmailConsent,
       marketingSmsConsent,
@@ -1027,6 +1028,18 @@ app.post('/users/profile', async (req: Request, res: Response) => {
       payload.usernameLower = resolved.usernameLower;
     }
 
+    // Optional profile photo URL (uploaded via /upload-campaign-image). Empty string clears.
+    if (Object.prototype.hasOwnProperty.call(req.body as object, 'avatarUrl')) {
+      const raw = avatarUrl == null ? '' : String(avatarUrl).trim().slice(0, 500);
+      if (!raw) {
+        payload.avatarUrl = FieldValue.delete();
+      } else if (!/^https?:\/\//i.test(raw)) {
+        return res.status(400).json({ error: 'avatarUrl must be an http(s) URL' });
+      } else {
+        payload.avatarUrl = raw;
+      }
+    }
+
     // Current-state consent fields on the user doc (fast read, overwritten on each
     // update). Only written when the client sends policiesVersion — otherwise we
     // leave prior values intact (caller may be updating name/email only).
@@ -1038,8 +1051,13 @@ app.post('/users/profile', async (req: Request, res: Response) => {
     }
 
     if (!snap.exists) {
+      const createPayload = { ...payload };
+      // FieldValue.delete() is only valid on update; omit cleared avatar on create.
+      if (createPayload.avatarUrl && typeof createPayload.avatarUrl === 'object') {
+        delete createPayload.avatarUrl;
+      }
       await ref.set({
-        ...payload,
+        ...createPayload,
         createdAt: now,
       });
     } else {
@@ -1062,7 +1080,14 @@ app.post('/users/profile', async (req: Request, res: Response) => {
       });
     }
 
-    res.json({ ok: true, uid, ...payload });
+    const responsePayload = { ...payload };
+    if (
+      responsePayload.avatarUrl &&
+      typeof responsePayload.avatarUrl === 'object'
+    ) {
+      delete responsePayload.avatarUrl;
+    }
+    res.json({ ok: true, uid, ...responsePayload });
   } catch (error) {
     console.error('POST /users/profile:', error);
     res.status(500).json({ error: 'Failed to save profile' });
@@ -1880,6 +1905,7 @@ function creatorFieldsFromUserProfile(userData: Record<string, unknown> | null |
   creator?: string;
   creator_name?: string;
   creator_email?: string;
+  creator_avatar_url?: string;
 } {
   if (!userData) return {};
   const username = String(userData.username ?? '').trim();
@@ -1887,6 +1913,7 @@ function creatorFieldsFromUserProfile(userData: Record<string, unknown> | null |
   const lastName = String(userData.lastName ?? '').trim();
   const fullName = `${firstName} ${lastName}`.trim();
   const email = String(userData.email ?? '').trim().toLowerCase();
+  const avatarUrl = String(userData.avatarUrl ?? '').trim();
   const display = username || fullName;
   const out: Record<string, string> = {};
   if (username) out.creator_username = username;
@@ -1897,6 +1924,7 @@ function creatorFieldsFromUserProfile(userData: Record<string, unknown> | null |
     out.creator_name = display;
   }
   if (email) out.creator_email = email;
+  if (avatarUrl && /^https?:\/\//i.test(avatarUrl)) out.creator_avatar_url = avatarUrl;
   return out;
 }
 
@@ -1912,7 +1940,8 @@ function campaignHasCreatorDisplay(data: Record<string, unknown>): boolean {
 
 /**
  * Fill missing creator display fields from users/{created_by}.
- * Prefer username when present. Response-only (does not write Firestore).
+ * Prefer username when present. Always attach live avatar when available.
+ * Response-only (does not write Firestore).
  */
 async function enrichCampaignCreators(
   campaigns: Record<string, unknown>[]
@@ -1921,12 +1950,8 @@ async function enrichCampaignCreators(
   for (const c of campaigns) {
     if (c.admin_created) continue;
     const uid = String(c.created_by ?? c.created_by_uid ?? '').trim();
-    if (!uid) continue;
-    // Always try to attach username when missing, even if a name snapshot exists.
-    const hasUsername = Boolean(String(c.creator_username ?? '').trim());
-    if (!hasUsername || !campaignHasCreatorDisplay(c)) {
-      uidsNeeded.add(uid);
-    }
+    // Always load the user profile so avatar (and username) stay live.
+    if (uid) uidsNeeded.add(uid);
   }
 
   const byUid = new Map<string, Record<string, unknown>>();
@@ -1966,6 +1991,13 @@ async function enrichCampaignCreators(
       if (!data.creator_email && fields.creator_email) {
         data.creator_email = fields.creator_email;
       }
+      if (fields.creator_avatar_url) {
+        data.creator_avatar_url = fields.creator_avatar_url;
+      } else {
+        delete data.creator_avatar_url;
+      }
+    } else {
+      delete data.creator_avatar_url;
     }
 
     // Prefer stored username over a name-only snapshot when both exist.
