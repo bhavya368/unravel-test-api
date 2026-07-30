@@ -119,7 +119,7 @@ interface BackerStageReport extends CampaignReport {
   total_spend?: string;
 }
 
-interface CampaignBacker {
+export interface CampaignBacker {
   email: string;
   firstName?: string;
   lastName?: string;
@@ -144,7 +144,7 @@ interface RunItem {
   sampleEvent?: BackerStageReport;
 }
 
-function timestampToMs(value: unknown): number | null {
+export function timestampToMs(value: unknown): number | null {
   if (value == null) return null;
   if (typeof value === 'object') {
     if ('_seconds' in value) {
@@ -164,7 +164,7 @@ function timestampToMs(value: unknown): number | null {
   return Number.isNaN(t) ? null : t;
 }
 
-function getCampaignStartMs(campaign: Record<string, unknown>): number | null {
+export function getCampaignStartMs(campaign: Record<string, unknown>): number | null {
   return (
     timestampToMs(campaign.campaign_starts_at) ??
     timestampToMs(campaign.createdAt) ??
@@ -182,7 +182,7 @@ function getCampaignDurationMs(campaign: Record<string, unknown>): number | null
   return (hasDays ? days * DAY_MS : 0) + (hasHours ? hours * HOUR_MS : 0);
 }
 
-function getCampaignEndMs(campaign: Record<string, unknown>): number | null {
+export function getCampaignEndMs(campaign: Record<string, unknown>): number | null {
   const durationMs = getCampaignDurationMs(campaign);
   if (durationMs == null) return timestampToMs(campaign.campaign_ends_at);
   const startMs = getCampaignStartMs(campaign);
@@ -614,7 +614,7 @@ function buildBackerStageReport(
  * Load unique backers for a campaign from stripe_checkout_records (paid + coupon-only).
  * Aggregates multiple contributions per email.
  */
-async function loadCampaignBackers(
+export async function loadCampaignBackers(
   db: Firestore,
   campaignId: string,
   usersDb?: Firestore

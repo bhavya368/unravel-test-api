@@ -27,6 +27,7 @@ import {
   sanitizeCampaignImpactMetricsPatch,
 } from './impactReport';
 import { runCampaignReportDrips, parseCampaignReportDripRequest } from './campaignReportDrips';
+import { runCampaignUrgentWindow, parseUrgentWindowRequest } from './campaignUrgentWindow';
 import { sendContributionReceipt, AD_AMPLIFICATION_SPLIT } from './contributionReceipt';
 import {
   fetchFacebookAdInsights,
@@ -304,7 +305,7 @@ function sanitizeSlideshowBackButtonUrl(raw: unknown): string {
 }
 
 /** Donation Checkout: customer chooses amount on Stripe (min $5, default suggestion $5). */
-const DONATION_CHECKOUT_MIN_CENTS = 500;
+const DONATION_CHECKOUT_MIN_CENTS = 300; // UE-183: $3 low entry point (was $5)
 const DONATION_CHECKOUT_PRESET_CENTS = 500;
 /** Stripe's minimum chargeable amount (USD). A coupon that leaves a smaller (non-zero) net
  * can't be charged, so we reject it cleanly rather than let Stripe 500. */
@@ -790,6 +791,27 @@ app.post('/campaign-report-drips/run', async (req: Request, res: Response) => {
     const message = error instanceof Error ? error.message : String(error);
     console.error('POST /campaign-report-drips/run:', error);
     res.status(500).json({ error: message || 'Failed to run campaign report drips' });
+  }
+});
+
+/**
+ * UE-184 urgent-window email job (Cloud Scheduler → this endpoint, same pattern as the drips job).
+ * When a campaign enters its final 48h, emails backers of OTHER same-category campaigns to help
+ * close the gap. Fires once per campaign.
+ * Body/query: dryRun, limit, windowHours (default 48), freqCapHours (default 72), campaignId(s).
+ */
+app.post('/campaign-urgent-window/run', async (req: Request, res: Response) => {
+  try {
+    const parsed = parseUrgentWindowRequest({
+      body: (req.body ?? {}) as Record<string, unknown>,
+      query: req.query as Record<string, unknown>,
+    });
+    const result = await runCampaignUrgentWindow(db, { ...parsed, usersDb });
+    res.status(result.ok ? 200 : 207).json(result);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error('POST /campaign-urgent-window/run:', error);
+    res.status(500).json({ error: message || 'Failed to run campaign urgent-window emails' });
   }
 });
 
@@ -4348,6 +4370,12 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
         custom_text: {
           submit: {
             message: 'Fund this campaign — complete your secure payment below.',
+          },
+          // Note shown below the Pay button (Stripe's only custom-text slot; the left-side
+          // order summary is Stripe-controlled and can't take custom lines).
+          after_submit: {
+            message:
+              'Upon confirmation, a link to the copy of your trust score report will be available on your email receipt. Thanks for supporting The Unravel Network!',
           },
         },
         // Generate a finalized invoice (downloadable PDF + hosted page) for every paid session.
