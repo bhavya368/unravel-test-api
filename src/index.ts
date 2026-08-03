@@ -47,6 +47,13 @@ import {
   upsertTrustReport,
 } from './trustReport';
 import { isUutsPrescreenEnabled, runUutsPrescreenAndPersist } from './uutsPrescreen';
+import {
+  extractVertexUsage,
+  forceFlushLangfuse,
+  initLangfuse,
+  metaStr,
+  traceGeminiCall,
+} from './langfuseInstrumentation';
 
 declare global {
   namespace Express {
@@ -60,6 +67,7 @@ declare global {
 
 // Load environment variables
 dotenv.config();
+initLangfuse();
 
 // Initialize Firebase Admin (uses default credentials on Cloud Run)
 initializeApp({
@@ -462,22 +470,44 @@ Tagline: ${tagline || 'N/A'}
       campaignContent + '\nEvaluate the campaign for:'
     );
     
-    const model = vertexAI.getGenerativeModel({
-      model: process.env.GEMINI_MODEL_AI_MODERATION || 'gemini-2.5-flash-lite',
+    const modelName = process.env.GEMINI_MODEL_AI_MODERATION || 'gemini-2.5-flash-lite';
+    const model = vertexAI.getGenerativeModel({ model: modelName });
+
+    const recommendation = await traceGeminiCall({
+      name: 'moderate-campaign',
+      model: modelName,
+      tags: ['ai-moderation'],
+      metadata: {
+        title: metaStr(title, 120),
+        contentChars: String(totalContentLength),
+      },
+      input: {
+        title: title || null,
+        tagline: tagline || null,
+        descriptionChars: description?.length || 0,
+        // Full prompt for debugging; trim very long campaigns in UI via Langfuse
+        prompt: prompt.length > 8000 ? `${prompt.slice(0, 8000)}…` : prompt,
+      },
+      run: async () => {
+        const result = await model.generateContent({
+          contents: [{
+            role: 'user',
+            parts: [{ text: prompt }],
+          }],
+        });
+        const text =
+          result.response.candidates?.[0]?.content?.parts?.[0]?.text ||
+          'AI moderation analysis unavailable';
+        const trimmed = text.trim();
+        return {
+          result: trimmed,
+          output: trimmed,
+          usageDetails: extractVertexUsage(result),
+        };
+      },
     });
 
-    const result = await model.generateContent({
-      contents: [{
-        role: 'user',
-        parts: [{ text: prompt }]
-      }],
-    });
-    
-    const response = result.response;
-    const recommendation = response.candidates?.[0]?.content?.parts?.[0]?.text || 
-                          'AI moderation analysis unavailable';
-    
-    return recommendation.trim();
+    return recommendation;
   } catch (error: any) {
     console.error('AI moderation error:', error);
     
@@ -513,7 +543,8 @@ const VALID_DIRECTIONS = ['none', 'left-leaning', 'centrist', 'right-leaning', '
 async function analyzeBiasWheel(
   title: string,
   shortDescription: string,
-  longDescription: string
+  longDescription: string,
+  campaignId?: string
 ): Promise<BiasWheel> {
   try {
     const content = [title, shortDescription, longDescription].filter(Boolean).join('\n\n');
@@ -569,37 +600,68 @@ ${content}
 `;
     const prompt = campaignContent + promptTemplate;
 
-    const model = vertexAI.getGenerativeModel({
-      model: process.env.GEMINI_MODEL_BIAS_WHEEL || 'gemini-2.5-flash-lite',
+    const modelName = process.env.GEMINI_MODEL_BIAS_WHEEL || 'gemini-2.5-flash-lite';
+    const model = vertexAI.getGenerativeModel({ model: modelName });
+
+    return await traceGeminiCall({
+      name: 'score-bias-wheel',
+      model: modelName,
+      tags: ['bias-wheel'],
+      metadata: {
+        contentChars: String(content.trim().length),
+        title: metaStr(title, 120),
+        ...(campaignId ? { campaignId: metaStr(campaignId) } : {}),
+      },
+      input: {
+        title: title || null,
+        shortDescriptionChars: shortDescription?.length || 0,
+        longDescriptionChars: longDescription?.length || 0,
+        prompt: prompt.length > 8000 ? `${prompt.slice(0, 8000)}…` : prompt,
+      },
+      run: async () => {
+        const result = await model.generateContent({
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        });
+
+        const text = result.response?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
+        const jsonMatch = text.match(/\{[\s\S]*\}/);
+        if (!jsonMatch) {
+          console.warn('Bias wheel: no JSON in AI response, text:', text?.substring(0, 200));
+          return {
+            result: DEFAULT_BIAS_WHEEL,
+            output: { parseError: 'no-json', raw: text.slice(0, 500) },
+            usageDetails: extractVertexUsage(result),
+          };
+        }
+
+        let parsed: Record<string, unknown>;
+        try {
+          parsed = JSON.parse(jsonMatch[0]) as Record<string, unknown>;
+        } catch (parseErr) {
+          console.warn('Bias wheel: JSON parse failed:', parseErr, 'raw:', jsonMatch[0]);
+          return {
+            result: DEFAULT_BIAS_WHEEL,
+            output: { parseError: 'invalid-json', raw: jsonMatch[0].slice(0, 500) },
+            usageDetails: extractVertexUsage(result),
+          };
+        }
+        const evidence = Math.min(5, Math.max(1, Number(parsed.evidence) || 1));
+        const facts = Math.min(5, Math.max(1, Number(parsed.facts) || 1));
+        const perspective = Math.min(5, Math.max(1, Number(parsed.perspective) || 1));
+        const tone = Math.min(5, Math.max(1, Number(parsed.tone) || 1));
+        const direction =
+          typeof parsed.direction === 'string' && VALID_DIRECTIONS.includes(parsed.direction.toLowerCase())
+            ? parsed.direction.toLowerCase()
+            : 'none';
+
+        const biasWheel: BiasWheel = { evidence, facts, perspective, tone, direction };
+        return {
+          result: biasWheel,
+          output: biasWheel,
+          usageDetails: extractVertexUsage(result),
+        };
+      },
     });
-
-    const result = await model.generateContent({
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    });
-
-    const text = result.response?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
-      console.warn('Bias wheel: no JSON in AI response, text:', text?.substring(0, 200));
-      return DEFAULT_BIAS_WHEEL;
-    }
-
-    let parsed: Record<string, unknown>;
-    try {
-      parsed = JSON.parse(jsonMatch[0]) as Record<string, unknown>;
-    } catch (parseErr) {
-      console.warn('Bias wheel: JSON parse failed:', parseErr, 'raw:', jsonMatch[0]);
-      return DEFAULT_BIAS_WHEEL;
-    }
-    const evidence = Math.min(5, Math.max(1, Number(parsed.evidence) || 1));
-    const facts = Math.min(5, Math.max(1, Number(parsed.facts) || 1));
-    const perspective = Math.min(5, Math.max(1, Number(parsed.perspective) || 1));
-    const tone = Math.min(5, Math.max(1, Number(parsed.tone) || 1));
-    const direction = typeof parsed.direction === 'string' && VALID_DIRECTIONS.includes(parsed.direction.toLowerCase())
-      ? parsed.direction.toLowerCase()
-      : 'none';
-
-    return { evidence, facts, perspective, tone, direction };
   } catch (error) {
     console.error('Bias wheel analysis error:', error);
     return DEFAULT_BIAS_WHEEL;
@@ -611,8 +673,8 @@ async function analyzeBiasWheelAndUpdate(campaignId: string, data: Record<string
     const title = (data.title as string) || '';
     const shortDescription = (data.short_description as string) || '';
     const longDescription = (data.long_description as string) || '';
-    console.log('Bias wheel input:', { titleLen: title.length, shortLen: shortDescription.length, longLen: longDescription.length });
-    const biasWheel = await analyzeBiasWheel(title, shortDescription, longDescription);
+    console.log('Bias wheel input:', { titleLen: title.length, shortLen: shortDescription.length, longLen: longDescription.length, campaignId });
+    const biasWheel = await analyzeBiasWheel(title, shortDescription, longDescription, campaignId);
     await db.collection('campaigns').doc(campaignId).update({
       bias_wheel: biasWheel,
       updatedAt: new Date().toISOString(),
@@ -3667,58 +3729,87 @@ type GeneratedImage = { imageBase64: string; imageUrl: string; storagePath: stri
 
 // Generate a single image (one API call). Returns null on any failure (API error, no image, safety block).
 async function generateSingleImage(description: string): Promise<GeneratedImage | null> {
+  const modelName = process.env.GEMINI_MODEL_IMAGE_GENERATION || 'gemini-2.0-flash-exp';
   try {
-    const imagenModel = vertexAI.getGenerativeModel({
-      model: process.env.GEMINI_MODEL_IMAGE_GENERATION || 'gemini-2.0-flash-exp',
-      generationConfig: {
-        responseModalities: ['TEXT', 'IMAGE'],
-      } as any,
-    });
+    return await traceGeminiCall({
+      name: 'generate-campaign-image',
+      model: modelName,
+      tags: ['image-generation'],
+      metadata: {
+        descriptionChars: String(description?.length || 0),
+      },
+      input: {
+        description: description.length > 2000 ? `${description.slice(0, 2000)}…` : description,
+      },
+      run: async () => {
+        const imagenModel = vertexAI.getGenerativeModel({
+          model: modelName,
+          generationConfig: {
+            responseModalities: ['TEXT', 'IMAGE'],
+          } as any,
+        });
 
-    const result = await imagenModel.generateContent({
-      contents: [{
-        role: 'user',
-        parts: [{ text: `Generate an image of: ${description}. Only respond with the image.` }]
-      }],
-    });
+        const result = await imagenModel.generateContent({
+          contents: [{
+            role: 'user',
+            parts: [{ text: `Generate an image of: ${description}. Only respond with the image.` }],
+          }],
+        });
 
-    const response = result.response;
-    let imageData: string | null = null;
-    let mimeType = 'image/png';
+        const response = result.response;
+        let imageData: string | null = null;
+        let mimeType = 'image/png';
 
-    const candidates = response.candidates || [];
-    for (const candidate of candidates) {
-      const parts = candidate.content?.parts || [];
-      for (const part of parts) {
-        const inlineData = (part as { inlineData?: { data: string; mimeType?: string } }).inlineData;
-        if (inlineData?.data) {
-          imageData = inlineData.data;
-          mimeType = inlineData.mimeType || 'image/png';
-          break;
+        const candidates = response.candidates || [];
+        for (const candidate of candidates) {
+          const parts = candidate.content?.parts || [];
+          for (const part of parts) {
+            const inlineData = (part as { inlineData?: { data: string; mimeType?: string } }).inlineData;
+            if (inlineData?.data) {
+              imageData = inlineData.data;
+              mimeType = inlineData.mimeType || 'image/png';
+              break;
+            }
+          }
+          if (imageData) break;
         }
-      }
-      if (imageData) break;
-    }
 
-    if (!imageData) {
-      console.warn('Image generation returned no image data (possible safety filter or empty response)');
-      return null;
-    }
+        if (!imageData) {
+          console.warn('Image generation returned no image data (possible safety filter or empty response)');
+          return {
+            result: null,
+            output: { imageGenerated: false, reason: 'no-image-data' },
+            usageDetails: extractVertexUsage(result),
+          };
+        }
 
-    const bucketName = process.env.GCS_BUCKET || 'unravel-generated-images';
-    const bucket = storage.bucket(bucketName);
-    const fileName = `generated-${Date.now()}-${Math.random().toString(36).substring(7)}.png`;
-    const file = bucket.file(fileName);
-    await file.save(Buffer.from(imageData, 'base64'), {
-      metadata: { contentType: mimeType },
+        const bucketName = process.env.GCS_BUCKET || 'unravel-generated-images';
+        const bucket = storage.bucket(bucketName);
+        const fileName = `generated-${Date.now()}-${Math.random().toString(36).substring(7)}.png`;
+        const file = bucket.file(fileName);
+        await file.save(Buffer.from(imageData, 'base64'), {
+          metadata: { contentType: mimeType },
+        });
+
+        const generated: GeneratedImage = {
+          imageBase64: `data:${mimeType};base64,${imageData}`,
+          imageUrl: '',
+          storagePath: `gs://${bucketName}/${fileName}`,
+          fileName,
+        };
+        return {
+          result: generated,
+          // Never log raw base64 into Langfuse
+          output: {
+            imageGenerated: true,
+            mimeType,
+            fileName,
+            storagePath: generated.storagePath,
+          },
+          usageDetails: extractVertexUsage(result),
+        };
+      },
     });
-
-    return {
-      imageBase64: `data:${mimeType};base64,${imageData}`,
-      imageUrl: '',
-      storagePath: `gs://${bucketName}/${fileName}`,
-      fileName,
-    };
   } catch (error: unknown) {
     const err = error as { message?: string; code?: number };
     console.error('Error generating single image:', err?.message ?? error, err?.code);
@@ -5320,7 +5411,21 @@ app.post('/facebook/sync-insights', async (req: Request, res: Response) => {
 });
 
 // Start server
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
 });
+
+async function shutdown(signal: string) {
+  console.log(`${signal} received — flushing Langfuse and closing server`);
+  try {
+    await forceFlushLangfuse();
+  } catch (err) {
+    console.warn('[Langfuse] flush on shutdown failed:', err);
+  }
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 10_000).unref();
+}
+
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));
 

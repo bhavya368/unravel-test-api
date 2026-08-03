@@ -10,6 +10,12 @@ import {
   upsertTrustReport,
 } from './trustReport';
 
+import {
+  extractVertexUsage,
+  metaStr,
+  traceGeminiCall,
+} from './langfuseInstrumentation';
+
 export const UUTS_PRESCREEN_PROMPT_FIELD = 'uuts_prescreen';
 
 const DEFAULT_PROMPT_DOC_ID = 'ucZnWEWd4t1f32H9f9Tj';
@@ -921,26 +927,56 @@ async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
 async function generatePrescreen(
   vertexAI: VertexAI,
   prompt: string,
-  category: string
+  category: string,
+  campaignId: string
 ): Promise<ScoreSnapshot> {
+  const modelName = process.env.GEMINI_MODEL_UUTS_PRESCREEN || DEFAULT_MODEL;
   const model = vertexAI.getGenerativeModel({
-    model: process.env.GEMINI_MODEL_UUTS_PRESCREEN || DEFAULT_MODEL,
+    model: modelName,
     // Sampling makes the same campaign score differently on every run, so scores are
     // not reproducible and reviewers cannot compare a re-run against a stored version.
     generationConfig: { temperature: 0 },
   });
-  const result = await withTimeout(
-    model.generateContent({
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    }),
-    TIMEOUT_MS
-  );
-  const responseText =
-    result.response?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
-  if (!responseText) {
-    throw new Error('UUTS pre-screen returned an empty response');
-  }
-  return mapUutsPrescreenOutput(extractJson(responseText), category);
+
+  return traceGeminiCall({
+    name: 'prescreen-uuts',
+    model: modelName,
+    tags: ['uuts-prescreen'],
+    metadata: {
+      campaignId: metaStr(campaignId),
+      category: metaStr(category, 80),
+    },
+    input: {
+      campaignId,
+      category,
+      prompt: prompt.length > 8000 ? `${prompt.slice(0, 8000)}…` : prompt,
+    },
+    run: async () => {
+      const result = await withTimeout(
+        model.generateContent({
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        }),
+        TIMEOUT_MS
+      );
+      const responseText =
+        result.response?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
+      if (!responseText) {
+        throw new Error('UUTS pre-screen returned an empty response');
+      }
+      const snapshot = mapUutsPrescreenOutput(extractJson(responseText), category);
+      return {
+        result: snapshot,
+        output: {
+          composite: snapshot.composite,
+          compositeBase: snapshot.compositeBase ?? null,
+          confidenceFactor: snapshot.confidenceFactor ?? null,
+          // Keep full model text for review; truncate extreme outliers
+          raw: responseText.length > 6000 ? `${responseText.slice(0, 6000)}…` : responseText,
+        },
+        usageDetails: extractVertexUsage(result),
+      };
+    },
+  });
 }
 
 export async function runUutsPrescreenAndPersist({
@@ -975,7 +1011,7 @@ export async function runUutsPrescreenAndPersist({
         uuts_prescreen_updated_at: nowIso(),
       });
       try {
-        snapshot = await generatePrescreen(vertexAI, prompt, category);
+        snapshot = await generatePrescreen(vertexAI, prompt, category, campaignId);
         break;
       } catch (error) {
         lastError = error;
