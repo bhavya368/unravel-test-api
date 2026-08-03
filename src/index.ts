@@ -168,6 +168,22 @@ async function upsertBacking(input: BackingInput): Promise<void> {
     }
   }
 
+  // UE-158 review: stamp the backer's username onto the PostHog person so the
+  // dashboard's backer list shows it next to the email. Usernames live only in
+  // the Firestore user profile (UE-75) — guests have none, so theirs stays unset.
+  let username: string | null = null;
+  if (input.firebaseUid) {
+    try {
+      const userDoc = await usersDb.collection('users').doc(input.firebaseUid).get();
+      if (userDoc.exists) {
+        username =
+          String((userDoc.data() as Record<string, unknown>)?.username || '').trim() || null;
+      }
+    } catch {
+      /* lookup failure — the person simply stays email-only */
+    }
+  }
+
   const ph = getPostHog();
   if (ph && input.distinctId) {
     ph.capture({
@@ -183,6 +199,9 @@ async function upsertBacking(input: BackingInput): Promise<void> {
         is_first_backing: isFirstBacking,
         utm_source: input.utmSource,
         utm_campaign: input.utmCampaign,
+        // $set rides the same event, so the person — and this event's person
+        // snapshot — carry the username the moment the backing is ingested.
+        ...(username ? { $set: { username } } : {}),
       },
     });
     try {
@@ -2454,6 +2473,165 @@ app.get('/data/:collection/:id', async (req: Request, res: Response) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// UE-186 — Social proof: backer count + recent backer activity
+// ---------------------------------------------------------------------------
+
+/**
+ * Display thresholds, editable WITHOUT a deploy via Firestore: settings/engagement
+ * (unravel DB, same singleton-doc pattern as passkey / ai_prompts). A missing doc
+ * or field falls back to these defaults.
+ */
+const SOCIAL_PROOF_DEFAULTS = {
+  social_proof_min_backers: 5,
+  social_proof_activity_max_hours: 72,
+};
+
+async function getEngagementSettings(): Promise<typeof SOCIAL_PROOF_DEFAULTS> {
+  try {
+    const doc = await db.collection('settings').doc('engagement').get();
+    if (!doc.exists) return { ...SOCIAL_PROOF_DEFAULTS };
+    const data = doc.data() as Record<string, unknown>;
+    const minBackers = Number(data.social_proof_min_backers);
+    const maxHours = Number(data.social_proof_activity_max_hours);
+    return {
+      social_proof_min_backers:
+        Number.isFinite(minBackers) && minBackers >= 0
+          ? minBackers
+          : SOCIAL_PROOF_DEFAULTS.social_proof_min_backers,
+      social_proof_activity_max_hours:
+        Number.isFinite(maxHours) && maxHours > 0
+          ? maxHours
+          : SOCIAL_PROOF_DEFAULTS.social_proof_activity_max_hours,
+    };
+  } catch {
+    return { ...SOCIAL_PROOF_DEFAULTS };
+  }
+}
+
+// GET anonymized social proof for a campaign (public; UE-186).
+// Privacy is enforced HERE, server-side: below the min-backer threshold nothing
+// leaves the API; emails and last names never leave it at all; first names only
+// with an explicit opt-in (show_name on the backing record, captured at checkout);
+// timestamps are coarsened to whole hours (no exact times).
+app.get('/data/campaigns/:id/backers', async (req: Request, res: Response) => {
+  try {
+    const campaignId = String(req.params.id || '').trim();
+    if (!campaignId) return res.status(400).json({ error: 'Campaign id is required' });
+
+    const settings = await getEngagementSettings();
+    const snapshot = await db
+      .collection('stripe_checkout_records')
+      .where('campaignId', '==', campaignId)
+      .get();
+
+    // One entry per distinct backer (uid, else email, else the record itself for
+    // fully anonymous guests) — a repeat backer counts once, keeping their most
+    // recent backing. Real records only; there is no simulated activity, ever.
+    type BackerAgg = {
+      donorUid?: string;
+      donorName?: string;
+      showName: boolean;
+      lastAt: number;
+    };
+    const byBacker = new Map<string, BackerAgg>();
+    for (const doc of snapshot.docs) {
+      const data = doc.data() as Record<string, unknown>;
+      const at = Date.parse(String(data.recordedAt || ''));
+      if (!Number.isFinite(at)) continue;
+      const donorUid = String(data.donor_uid || '').trim() || undefined;
+      const email = String(data.donor_email || '').trim().toLowerCase();
+      const key = donorUid || (email ? `e:${email}` : `r:${doc.id}`);
+      const donorName = String(data.donor_name || '').trim() || undefined;
+      const prev = byBacker.get(key);
+      if (!prev || at > prev.lastAt) {
+        byBacker.set(key, {
+          donorUid: donorUid || prev?.donorUid,
+          donorName: donorName || prev?.donorName,
+          // The opt-in follows the most recent backing, so a backer can change
+          // their mind on a later contribution.
+          showName: data.show_name === true,
+          lastAt: at,
+        });
+      }
+    }
+
+    const backerCount = byBacker.size;
+    if (backerCount < settings.social_proof_min_backers) {
+      // Below threshold: hide everything and send nothing else — young campaigns
+      // must not look dead ("1 backer, 5 days ago").
+      return res.json({ visible: false });
+    }
+
+    const now = Date.now();
+    const recent = [...byBacker.values()].sort((a, b) => b.lastAt - a.lastAt).slice(0, 5);
+
+    // Resolve first names ONLY for opted-in backers. Stripe-path records carry no
+    // donor_name, so fall back to the user profile for logged-in donors.
+    const recentBackers: { firstName: string | null; hoursAgo: number }[] = [];
+    for (const b of recent) {
+      let firstName: string | null = null;
+      if (b.showName) {
+        firstName = (b.donorName || '').split(/\s+/)[0] || null;
+        if (!firstName && b.donorUid) {
+          try {
+            const userDoc = await usersDb.collection('users').doc(b.donorUid).get();
+            if (userDoc.exists) {
+              firstName =
+                String((userDoc.data() as Record<string, unknown>)?.firstName || '').trim() || null;
+            }
+          } catch {
+            /* lookup failure → stays anonymous */
+          }
+        }
+      }
+      recentBackers.push({
+        firstName, // null renders as "Someone" on the client
+        hoursAgo: Math.max(0, Math.floor((now - b.lastAt) / 3_600_000)),
+      });
+    }
+
+    const lastAt = recent[0]?.lastAt ?? 0;
+    const showActivity =
+      lastAt > 0 && now - lastAt <= settings.social_proof_activity_max_hours * 3_600_000;
+
+    res.json({ visible: true, backerCount, showActivity, recentBackers });
+  } catch (error) {
+    console.error('Error fetching campaign backers:', error);
+    res.status(500).json({ error: 'Failed to fetch campaign backers' });
+  }
+});
+
+/**
+ * UE-185 (Tim, Aug 3): capture WHY a backer funded, right after they contribute.
+ * Stored against the campaign in `campaign_backer_feedback` so the team can read it.
+ * Optional + length-capped; identity is best-effort (uid/email from the auth token,
+ * session_id from the Stripe backing). Plain text only.
+ */
+const BACKER_FEEDBACK_MAX_CHARS = 500;
+app.post('/data/campaigns/:id/backer-feedback', async (req: Request, res: Response) => {
+  try {
+    const campaignId = String(req.params.id || '').trim();
+    if (!campaignId) return res.status(400).json({ error: 'Campaign id is required' });
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const feedback = String(body.feedback ?? '').trim().slice(0, BACKER_FEEDBACK_MAX_CHARS);
+    if (!feedback) return res.status(400).json({ error: 'Feedback text is required' });
+    const sessionId = String(body.sessionId ?? '').trim() || undefined;
+    await db.collection('campaign_backer_feedback').add({
+      campaignId,
+      feedback,
+      ...(req.firebaseUid ? { donor_uid: req.firebaseUid } : {}),
+      ...(req.firebaseEmail ? { donor_email: req.firebaseEmail } : {}),
+      ...(sessionId ? { session_id: sessionId } : {}),
+      createdAt: new Date().toISOString(),
+    });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error saving backer feedback:', error);
+    res.status(500).json({ error: 'Failed to save backer feedback' });
+  }
+});
+
 // GET campaign Open Graph HTML for share previews (no API key; used by Facebook/crawlers and redirects users to frontend)
 function normalizeFrontendBaseForOg(raw: unknown): string {
   const value = typeof raw === 'string' ? raw.trim().replace(/\/$/, '') : '';
@@ -2545,6 +2723,11 @@ app.get('/og/campaign/:id', async (req: Request, res: Response) => {
     // Use the canonical frontend URL for FB preview display.
     // Otherwise the OG endpoint URL leaks as the visible "source" domain.
     const ogPageUrl = canonicalUrl;
+    // UE-185: carry the share link's query (utm_source / utm_medium / …) through to
+    // the frontend so attribution survives the click-through. og:url stays clean so
+    // crawlers collapse every share of a campaign onto one preview object.
+    const qsIndex = req.originalUrl.indexOf('?');
+    const forwardedQuery = qsIndex >= 0 ? req.originalUrl.slice(qsIndex) : '';
     const ua = String(req.get('user-agent') || '');
     const isCrawler = isSharePreviewCrawler(ua);
     // Diagnostic log so we can confirm which crawler (if any) is hitting /og/campaign/:id in prod.
@@ -2578,7 +2761,7 @@ app.get('/og/campaign/:id', async (req: Request, res: Response) => {
       return res.send(ogHtml);
     }
 
-    return res.redirect(302, canonicalUrl);
+    return res.redirect(302, `${canonicalUrl}${forwardedQuery}`);
   } catch (error) {
     console.error('OG campaign error:', error);
     res.status(500).send('Error loading campaign');
@@ -2632,6 +2815,9 @@ app.get('/og/lander/:id', async (req: Request, res: Response) => {
 
     const canonicalUrl = `${ogRedirectBase(req)}/lander/${id}`;
     const ogPageUrl = canonicalUrl;
+    // UE-185: forward share-link UTMs through the human redirect (see /og/campaign).
+    const qsIndex = req.originalUrl.indexOf('?');
+    const forwardedQuery = qsIndex >= 0 ? req.originalUrl.slice(qsIndex) : '';
     const ua = String(req.get('user-agent') || '');
     const isCrawler = isSharePreviewCrawler(ua);
     console.log(`[og/lander] id=${id} ua="${ua}" crawler=${isCrawler} campaignId=${campaignId || 'none'} image=${image}`);
@@ -2663,7 +2849,7 @@ app.get('/og/lander/:id', async (req: Request, res: Response) => {
       return res.send(ogHtml);
     }
 
-    return res.redirect(302, canonicalUrl);
+    return res.redirect(302, `${canonicalUrl}${forwardedQuery}`);
   } catch (error) {
     console.error('OG lander error:', error);
     res.status(500).send('Error loading lander');
@@ -3964,6 +4150,7 @@ async function recordCouponOnlyBacking(input: {
   donorUid?: string;
   donorEmail?: string;
   donorName?: string;
+  showName?: boolean;
   posthogDistinctId?: string;
   utmSource?: string;
   utmCampaign?: string;
@@ -3998,6 +4185,7 @@ async function recordCouponOnlyBacking(input: {
       ...(input.donorUid ? { donor_uid: input.donorUid } : {}),
       ...(input.donorEmail ? { donor_email: input.donorEmail } : {}),
       ...(input.donorName ? { donor_name: input.donorName } : {}),
+      ...(input.showName ? { show_name: true } : {}), // UE-186 social-proof opt-in
     });
   });
 
@@ -4260,6 +4448,7 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
       couponCode?: string;
       email?: string;
       name?: string;
+      showName?: boolean;
     };
     const { amount: amountCents, campaignId, currency = 'usd' } = body;
     const cur = (currency || 'usd').toLowerCase();
@@ -4291,6 +4480,9 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
       // Full name for the receipt + trust-score email. Guests supply it on the lander form.
       const donorName =
         typeof body.name === 'string' && body.name.trim() ? body.name.trim() : undefined;
+      // UE-186 social proof: explicit opt-in to show the first name as a recent
+      // backer. Default is anonymous ("Someone") — only an explicit true opts in.
+      const showName = body.showName === true;
 
       // Acquisition + identity context (UE-154), stamped on the session so a redemption is
       // fully recoverable from the webhook.
@@ -4334,6 +4526,7 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
           donorUid,
           donorEmail,
           donorName,
+          showName,
           posthogDistinctId: posthogDistinctId || undefined,
           utmSource: utmSource || undefined,
           utmCampaign: utmCampaign || undefined,
@@ -4364,6 +4557,7 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
         checkoutMetadata.firebase_uid = donorUid; // canonical key per the Eng Brief
       }
       if (promoCode) checkoutMetadata.promo_code = promoCode;
+      if (showName) checkoutMetadata.show_name = 'true'; // UE-186 social-proof opt-in
       if (posthogDistinctId) checkoutMetadata.posthog_distinct_id = posthogDistinctId;
       if (utmSource) checkoutMetadata.utm_source = utmSource;
       if (utmCampaign) checkoutMetadata.utm_campaign = utmCampaign;
@@ -4390,7 +4584,9 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
       const sessionCommon = {
         mode: 'payment' as const,
         ...(canonicalRef ? { client_reference_id: canonicalRef } : {}),
-        success_url: `${base}/campaign/${encodeURIComponent(cidTrim)}?donation=success&session_id={CHECKOUT_SESSION_ID}`,
+        // UE-185: land on the full-screen thank-you interstitial (it records the
+        // session, shows verified impact, and offers the share module).
+        success_url: `${base}/campaign/${encodeURIComponent(cidTrim)}/thanks?session_id={CHECKOUT_SESSION_ID}`,
         cancel_url: `${base}${cancelRel}`,
         submit_type: 'pay' as const,
         // A stamped Customer and customer_email are mutually exclusive in Checkout.
@@ -4521,7 +4717,9 @@ app.post('/payments/record-checkout-session', async (req: Request, res: Response
       expand: ['invoice'],
     });
     if (session.payment_status !== 'paid') {
-      return res.status(400).json({ error: 'This checkout session is not paid yet.' });
+      // UE-185: `pending` lets the thank-you page render its optimistic
+      // "Confirming your contribution…" state and retry, instead of failing.
+      return res.status(400).json({ error: 'This checkout session is not paid yet.', pending: true });
     }
     const campaignId = session.metadata?.campaignId;
     if (!campaignId || typeof campaignId !== 'string') {
@@ -4563,6 +4761,8 @@ app.post('/payments/record-checkout-session', async (req: Request, res: Response
     // especially for guests (who have no uid).
     const donorEmail =
       (session.customer_details?.email || session.customer_email || '').trim().toLowerCase() || undefined;
+    // UE-186 social-proof opt-in, carried through the Checkout Session metadata.
+    const showName = session.metadata?.show_name === 'true';
     const recordedAt = new Date().toISOString();
 
     const recordRef = db.collection('stripe_checkout_records').doc(sid);
@@ -4602,6 +4802,7 @@ app.post('/payments/record-checkout-session', async (req: Request, res: Response
         ...(couponCode ? { coupon_code: couponCode } : {}),
         ...(donorUid ? { donor_uid: donorUid } : {}),
         ...(donorEmail ? { donor_email: donorEmail } : {}),
+        ...(showName ? { show_name: true } : {}), // UE-186 social-proof opt-in
       });
       t.update(campaignRef, {
         funding_current: newFunding,
@@ -4676,6 +4877,12 @@ app.post('/payments/record-checkout-session', async (req: Request, res: Response
     res.json({
       ok: true,
       funding_current,
+      // UE-185: server-verified figures for the thank-you interstitial — the
+      // impact statement renders from these, never from client-side state.
+      campaignId: campaignId.trim(),
+      amount_gross_cents: amountGrossCents,
+      amount_charged_cents: amountChargedCents,
+      amount_discount_cents: amountDiscountCents,
       receipt: {
         invoicePdf,
         hostedInvoiceUrl,
