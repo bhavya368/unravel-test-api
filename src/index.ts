@@ -115,6 +115,9 @@ interface BackingInput {
   amountDiscount: number; // cents
   utmSource: string | null;
   utmCampaign: string | null;
+  utmMedium: string | null;
+  utmTerm: string | null;
+  utmContent: string | null;
   source: string; // which event produced this
 }
 
@@ -146,6 +149,9 @@ async function upsertBacking(input: BackingInput): Promise<void> {
       amount_discount: input.amountDiscount,
       utm_source: input.utmSource,
       utm_campaign: input.utmCampaign,
+      utm_medium: input.utmMedium,
+      utm_term: input.utmTerm,
+      utm_content: input.utmContent,
       source: input.source,
       created_at: new Date().toISOString(),
     });
@@ -199,6 +205,9 @@ async function upsertBacking(input: BackingInput): Promise<void> {
         is_first_backing: isFirstBacking,
         utm_source: input.utmSource,
         utm_campaign: input.utmCampaign,
+        utm_medium: input.utmMedium,
+        utm_term: input.utmTerm,
+        utm_content: input.utmContent,
         // $set rides the same event, so the person — and this event's person
         // snapshot — carry the username the moment the backing is ingested.
         ...(username ? { $set: { username } } : {}),
@@ -243,6 +252,9 @@ async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session):
     amountDiscount: session.total_details?.amount_discount ?? 0,
     utmSource: cleanStr(md.utm_source),
     utmCampaign: cleanStr(md.utm_campaign),
+    utmMedium: cleanStr(md.utm_medium),
+    utmTerm: cleanStr(md.utm_term),
+    utmContent: cleanStr(md.utm_content),
     source: 'checkout.session.completed',
   });
 }
@@ -274,6 +286,9 @@ async function handlePaymentIntentSucceeded(pi: Stripe.PaymentIntent): Promise<v
     amountDiscount: parseCents(md.discount_cents),
     utmSource: cleanStr(md.utm_source),
     utmCampaign: cleanStr(md.utm_campaign),
+    utmMedium: cleanStr(md.utm_medium),
+    utmTerm: cleanStr(md.utm_term),
+    utmContent: cleanStr(md.utm_content),
     source: 'payment_intent.succeeded',
   });
 }
@@ -4154,6 +4169,9 @@ async function recordCouponOnlyBacking(input: {
   posthogDistinctId?: string;
   utmSource?: string;
   utmCampaign?: string;
+  utmMedium?: string;
+  utmTerm?: string;
+  utmContent?: string;
   isGuest: boolean;
 }): Promise<{ funding_current: number }> {
   const redemptionId = 'cpn_' + randomUUID();
@@ -4228,6 +4246,9 @@ async function recordCouponOnlyBacking(input: {
     amountDiscount: input.discountCents,
     utmSource: input.utmSource ?? null,
     utmCampaign: input.utmCampaign ?? null,
+    utmMedium: input.utmMedium ?? null,
+    utmTerm: input.utmTerm ?? null,
+    utmContent: input.utmContent ?? null,
     source: 'coupon_zero_balance',
   });
 
@@ -4384,25 +4405,76 @@ app.post('/coupons', async (req: Request, res: Response) => {
   }
 });
 
-// PATCH - Update a coupon (admin) — e.g. activate/deactivate, adjust expiry/cap.
+// PATCH - Update a coupon (admin). Any subset of the editable fields may be sent; the code
+// itself is the doc id and is never renamed, and times_redeemed/created_at are never touched.
 app.patch('/coupons/:code', async (req: Request, res: Response) => {
   try {
     const code = String(req.params.code || '').trim().toUpperCase();
     const ref = db.collection('coupons').doc(code);
-    if (!(await ref.get()).exists) {
+    const snap = await ref.get();
+    if (!snap.exists) {
       return res.status(404).json({ error: 'Coupon not found' });
     }
-    const b = req.body as { active?: boolean; expiresAt?: string | null; maxRedemptions?: number | null };
+    const existing = snap.data() as Record<string, unknown>;
+    const b = req.body as {
+      active?: boolean;
+      type?: string;
+      value?: number;
+      campaignScope?: unknown; // 'all' | string | string[]
+      expiresAt?: string | null;
+      maxRedemptions?: number | null;
+      oncePerUser?: boolean;
+      fundingSource?: string | null;
+    };
     const patch: Record<string, unknown> = {};
+
     if (typeof b.active === 'boolean') patch.active = b.active;
+    if (typeof b.oncePerUser === 'boolean') patch.once_per_user = b.oncePerUser;
+
+    // type + value validate together: the value's ceiling depends on the (possibly new) type.
+    const effectiveType = b.type !== undefined ? b.type : (existing.type as string);
+    if (b.type !== undefined) {
+      if (b.type !== 'amount_off' && b.type !== 'percent_off') {
+        return res.status(400).json({ error: "type must be 'amount_off' or 'percent_off'" });
+      }
+      patch.type = b.type;
+    }
+    if (b.value !== undefined) {
+      const value = Number(b.value);
+      if (!Number.isInteger(value) || value <= 0) {
+        return res.status(400).json({ error: 'value must be a positive integer (cents for amount_off, percent for percent_off)' });
+      }
+      if (effectiveType === 'percent_off' && value > 100) {
+        return res.status(400).json({ error: 'percent_off value must be between 1 and 100' });
+      }
+      patch.value = value;
+    }
+
+    if (b.campaignScope !== undefined) {
+      const scope = b.campaignScope;
+      if (Array.isArray(scope) && scope.length && scope.every((s) => typeof s === 'string')) {
+        patch.campaign_scope = scope as string[];
+      } else if (typeof scope === 'string' && scope.trim() && scope.trim() !== 'all') {
+        patch.campaign_scope = [scope.trim()];
+      } else {
+        patch.campaign_scope = 'all';
+      }
+    }
+
     if (b.expiresAt === null || typeof b.expiresAt === 'string') {
       patch.expires_at = b.expiresAt && b.expiresAt.trim() ? b.expiresAt.trim() : null;
     }
     if (b.maxRedemptions === null || (typeof b.maxRedemptions === 'number' && Number.isInteger(b.maxRedemptions))) {
-      patch.max_redemptions = b.maxRedemptions ?? null;
+      patch.max_redemptions =
+        typeof b.maxRedemptions === 'number' && b.maxRedemptions > 0 ? b.maxRedemptions : null;
     }
+    if (b.fundingSource !== undefined) {
+      patch.funding_source =
+        typeof b.fundingSource === 'string' && b.fundingSource.trim() ? b.fundingSource.trim() : null;
+    }
+
     if (Object.keys(patch).length === 0) {
-      return res.status(400).json({ error: 'No updatable fields provided (active, expiresAt, maxRedemptions)' });
+      return res.status(400).json({ error: 'No updatable fields provided' });
     }
     patch.updatedAt = new Date().toISOString();
     await ref.update(patch);
@@ -4490,6 +4562,9 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
       const utmIn = body.utm && typeof body.utm === 'object' ? body.utm : {};
       const utmSource = sanitizeMetaValue(utmIn.utm_source);
       const utmCampaign = sanitizeMetaValue(utmIn.utm_campaign);
+      const utmMedium = sanitizeMetaValue(utmIn.utm_medium);
+      const utmTerm = sanitizeMetaValue(utmIn.utm_term);
+      const utmContent = sanitizeMetaValue(utmIn.utm_content);
       const isGuest = !donorUid;
       // Canonical distinct id everywhere: Firebase UID for logged-in users, else the guest's
       // PostHog distinct id. campaignId is preserved in metadata (below).
@@ -4530,6 +4605,9 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
           posthogDistinctId: posthogDistinctId || undefined,
           utmSource: utmSource || undefined,
           utmCampaign: utmCampaign || undefined,
+          utmMedium: utmMedium || undefined,
+          utmTerm: utmTerm || undefined,
+          utmContent: utmContent || undefined,
           isGuest,
         });
         return res.json({ ok: true, zeroBalance: true, funding_current });
@@ -4561,6 +4639,9 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
       if (posthogDistinctId) checkoutMetadata.posthog_distinct_id = posthogDistinctId;
       if (utmSource) checkoutMetadata.utm_source = utmSource;
       if (utmCampaign) checkoutMetadata.utm_campaign = utmCampaign;
+      if (utmMedium) checkoutMetadata.utm_medium = utmMedium;
+      if (utmTerm) checkoutMetadata.utm_term = utmTerm;
+      if (utmContent) checkoutMetadata.utm_content = utmContent;
       if (coupon) {
         // We charge the net, but the fund must still credit the gross — carry both so the
         // recorder uses gross_cents (Stripe's amount_subtotal would only equal the net here).
