@@ -1,5 +1,6 @@
-import type { Firestore } from 'firebase-admin/firestore';
+import type { Firestore, QueryDocumentSnapshot } from 'firebase-admin/firestore';
 import type { VertexAI } from '@google-cloud/vertexai';
+import Anthropic from '@anthropic-ai/sdk';
 import {
   applyConfidenceModifiers,
   computeComposite,
@@ -19,7 +20,8 @@ import {
 export const UUTS_PRESCREEN_PROMPT_FIELD = 'uuts_prescreen';
 
 const DEFAULT_PROMPT_DOC_ID = 'ucZnWEWd4t1f32H9f9Tj';
-const DEFAULT_MODEL = 'gemini-2.5-flash-lite';
+const DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash-lite';
+const DEFAULT_ANTHROPIC_MODEL = 'claude-opus-4-6';
 // A reasoning model scoring the full three-layer rubric routinely runs past a minute.
 // Worst case across all attempts is roughly TIMEOUT_MS * MAX_ATTEMPTS plus backoff; the
 // admin preview's poll window must stay above that or it reports a false timeout.
@@ -27,10 +29,99 @@ const TIMEOUT_MS = 120_000;
 const MAX_RETRIES = 2;
 const MAX_ATTEMPTS = MAX_RETRIES + 1;
 
+export type UutsProvider = 'gemini' | 'anthropic';
+
+export interface UutsModelOption {
+  id: string;
+  provider: UutsProvider;
+  label: string;
+}
+
+function envFlagEnabled(name: string): boolean {
+  const raw = (process.env[name] || '').trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
+}
+
 /** Opt-in kill switch. Off unless UUTS_PRESCREEN_ENABLED=true (deploy without connecting). */
 export function isUutsPrescreenEnabled(): boolean {
-  const raw = (process.env.UUTS_PRESCREEN_ENABLED || '').trim().toLowerCase();
-  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
+  return envFlagEnabled('UUTS_PRESCREEN_ENABLED');
+}
+
+/**
+ * When false (default), POST .../trust-report/publish is blocked so admin republish
+ * cannot affect the live public trust-report pipeline yet.
+ */
+export function isUutsPublishLiveEnabled(): boolean {
+  return envFlagEnabled('UUTS_PUBLISH_LIVE_ENABLED');
+}
+
+/** Opt-in scheduled UUTS batch runner. Off unless UUTS_SCHEDULER_ENABLED=true. */
+export function isUutsSchedulerEnabled(): boolean {
+  return envFlagEnabled('UUTS_SCHEDULER_ENABLED');
+}
+
+export function defaultGeminiModel(): string {
+  return (process.env.GEMINI_MODEL_UUTS_PRESCREEN || DEFAULT_GEMINI_MODEL).trim() || DEFAULT_GEMINI_MODEL;
+}
+
+export function defaultAnthropicModel(): string {
+  return (
+    (process.env.ANTHROPIC_MODEL_UUTS_PRESCREEN || DEFAULT_ANTHROPIC_MODEL).trim() ||
+    DEFAULT_ANTHROPIC_MODEL
+  );
+}
+
+/** Models available for Admin model picker / request allowlist. */
+export function listUutsModels(): UutsModelOption[] {
+  const geminiLiteId = DEFAULT_GEMINI_MODEL;
+  const geminiDefaultId = defaultGeminiModel();
+  const models: UutsModelOption[] = [
+    {
+      id: geminiLiteId,
+      provider: 'gemini',
+      label: 'Gemini 2.5 Flash Lite',
+    },
+  ];
+  // If GEMINI_MODEL_UUTS_PRESCREEN points at a different Gemini id, offer it too.
+  if (geminiDefaultId && geminiDefaultId !== geminiLiteId) {
+    models.push({
+      id: geminiDefaultId,
+      provider: 'gemini',
+      label: `Gemini (${geminiDefaultId})`,
+    });
+  }
+  models.push({
+    id: defaultAnthropicModel(),
+    provider: 'anthropic',
+    label: 'Claude Opus',
+  });
+  return models;
+}
+
+export function resolveUutsModel(requested?: string | null): UutsModelOption {
+  const models = listUutsModels();
+  const want = (requested || '').trim();
+  if (want) {
+    const match = models.find((m) => m.id === want);
+    if (!match) {
+      throw Object.assign(
+        new Error(`Unsupported UUTS model "${want}". Allowed: ${models.map((m) => m.id).join(', ')}`),
+        { status: 400 }
+      );
+    }
+    return match;
+  }
+  return models[0];
+}
+
+export function getUutsConfig() {
+  return {
+    prescreenEnabled: isUutsPrescreenEnabled(),
+    publishLiveEnabled: isUutsPublishLiveEnabled(),
+    schedulerEnabled: isUutsSchedulerEnabled(),
+    models: listUutsModels(),
+    defaultModel: defaultGeminiModel(),
+  };
 }
 
 type JsonObject = Record<string, unknown>;
@@ -484,6 +575,8 @@ export interface RunUutsPrescreenParams {
   campaignId: string;
   campaign: JsonObject;
   promptDocId?: string;
+  /** Optional allowlisted model id (Gemini or Claude Opus). */
+  model?: string | null;
 }
 
 function nowIso(): string {
@@ -924,13 +1017,13 @@ async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   }
 }
 
-async function generatePrescreen(
+async function generatePrescreenGemini(
   vertexAI: VertexAI,
+  modelName: string,
   prompt: string,
   category: string,
   campaignId: string
 ): Promise<ScoreSnapshot> {
-  const modelName = process.env.GEMINI_MODEL_UUTS_PRESCREEN || DEFAULT_MODEL;
   const model = vertexAI.getGenerativeModel({
     model: modelName,
     // Sampling makes the same campaign score differently on every run, so scores are
@@ -941,10 +1034,11 @@ async function generatePrescreen(
   return traceGeminiCall({
     name: 'prescreen-uuts',
     model: modelName,
-    tags: ['uuts-prescreen'],
+    tags: ['uuts-prescreen', 'gemini'],
     metadata: {
       campaignId: metaStr(campaignId),
       category: metaStr(category, 80),
+      provider: 'gemini',
     },
     input: {
       campaignId,
@@ -970,7 +1064,6 @@ async function generatePrescreen(
           composite: snapshot.composite,
           compositeBase: snapshot.compositeBase ?? null,
           confidenceFactor: snapshot.confidenceFactor ?? null,
-          // Keep full model text for review; truncate extreme outliers
           raw: responseText.length > 6000 ? `${responseText.slice(0, 6000)}…` : responseText,
         },
         usageDetails: extractVertexUsage(result),
@@ -979,14 +1072,94 @@ async function generatePrescreen(
   });
 }
 
+async function generatePrescreenAnthropic(
+  modelName: string,
+  prompt: string,
+  category: string,
+  campaignId: string
+): Promise<ScoreSnapshot> {
+  const apiKey = (process.env.ANTHROPIC_API_KEY || '').trim();
+  if (!apiKey) {
+    throw Object.assign(new Error('ANTHROPIC_API_KEY is required for Claude UUTS models'), {
+      status: 500,
+    });
+  }
+  const client = new Anthropic({ apiKey });
+
+  return traceGeminiCall({
+    name: 'prescreen-uuts',
+    model: modelName,
+    tags: ['uuts-prescreen', 'anthropic'],
+    metadata: {
+      campaignId: metaStr(campaignId),
+      category: metaStr(category, 80),
+      provider: 'anthropic',
+    },
+    input: {
+      campaignId,
+      category,
+      prompt: prompt.length > 8000 ? `${prompt.slice(0, 8000)}…` : prompt,
+    },
+    run: async () => {
+      const result = await withTimeout(
+        client.messages.create({
+          model: modelName,
+          max_tokens: 8192,
+          temperature: 0,
+          messages: [{ role: 'user', content: prompt }],
+        }),
+        TIMEOUT_MS
+      );
+      const textBlock = result.content.find((block) => block.type === 'text');
+      const responseText = textBlock && textBlock.type === 'text' ? textBlock.text.trim() : '';
+      if (!responseText) {
+        throw new Error('UUTS pre-screen (Claude) returned an empty response');
+      }
+      const snapshot = mapUutsPrescreenOutput(extractJson(responseText), category);
+      return {
+        result: snapshot,
+        output: {
+          composite: snapshot.composite,
+          compositeBase: snapshot.compositeBase ?? null,
+          confidenceFactor: snapshot.confidenceFactor ?? null,
+          raw: responseText.length > 6000 ? `${responseText.slice(0, 6000)}…` : responseText,
+        },
+        usageDetails: {
+          input: result.usage?.input_tokens,
+          output: result.usage?.output_tokens,
+          total:
+            result.usage?.input_tokens != null && result.usage?.output_tokens != null
+              ? result.usage.input_tokens + result.usage.output_tokens
+              : undefined,
+        },
+      };
+    },
+  });
+}
+
+async function generatePrescreen(
+  vertexAI: VertexAI,
+  modelOption: UutsModelOption,
+  prompt: string,
+  category: string,
+  campaignId: string
+): Promise<ScoreSnapshot> {
+  if (modelOption.provider === 'anthropic') {
+    return generatePrescreenAnthropic(modelOption.id, prompt, category, campaignId);
+  }
+  return generatePrescreenGemini(vertexAI, modelOption.id, prompt, category, campaignId);
+}
+
 export async function runUutsPrescreenAndPersist({
   db,
   vertexAI,
   campaignId,
   campaign,
   promptDocId = DEFAULT_PROMPT_DOC_ID,
+  model: requestedModel,
 }: RunUutsPrescreenParams): Promise<void> {
   const campaignRef = db.collection('campaigns').doc(campaignId);
+  const modelOption = resolveUutsModel(requestedModel);
   const promptTemplate = await loadPrompt(db, promptDocId);
   const prompt = buildPrompt(promptTemplate, campaign);
   const category = text(campaign.category);
@@ -996,6 +1169,8 @@ export async function runUutsPrescreenAndPersist({
     uuts_prescreen_status: 'in_progress',
     uuts_prescreen_attempts: attempts,
     uuts_prescreen_error: null,
+    uuts_prescreen_model: modelOption.id,
+    uuts_prescreen_provider: modelOption.provider,
     uuts_prescreen_started_at: nowIso(),
     uuts_prescreen_updated_at: nowIso(),
   });
@@ -1011,7 +1186,7 @@ export async function runUutsPrescreenAndPersist({
         uuts_prescreen_updated_at: nowIso(),
       });
       try {
-        snapshot = await generatePrescreen(vertexAI, prompt, category, campaignId);
+        snapshot = await generatePrescreen(vertexAI, modelOption, prompt, category, campaignId);
         break;
       } catch (error) {
         lastError = error;
@@ -1038,6 +1213,8 @@ export async function runUutsPrescreenAndPersist({
         reviewer: 'UUTS Pre-screening skill',
       },
       createdBy: 'uuts-prescreen',
+      model: modelOption.id,
+      provider: modelOption.provider,
       refresh: true,
       publish: false,
     });
@@ -1051,6 +1228,8 @@ export async function runUutsPrescreenAndPersist({
       uuts_prescreen_confidence_factor: snapshot.confidenceFactor ?? null,
       uuts_prescreen_version_id: result.versionId,
       uuts_prescreen_version_number: result.version,
+      uuts_prescreen_model: modelOption.id,
+      uuts_prescreen_provider: modelOption.provider,
       uuts_prescreen_completed_at: nowIso(),
       uuts_prescreen_updated_at: nowIso(),
       updatedAt: nowIso(),
@@ -1066,4 +1245,110 @@ export async function runUutsPrescreenAndPersist({
     });
     throw error;
   }
+}
+
+export interface RunUutsSchedulerOptions {
+  db: Firestore;
+  vertexAI: VertexAI;
+  dryRun?: boolean;
+  limit?: number;
+  campaignIds?: string[];
+  model?: string | null;
+  promptDocId?: string;
+}
+
+/**
+ * Batch UUTS re-score for Cloud Scheduler. Creates draft versions only (never publishes).
+ * Gated by isUutsSchedulerEnabled() at the HTTP layer.
+ */
+export async function runUutsPrescreenScheduler(
+  options: RunUutsSchedulerOptions
+): Promise<{
+  ok: boolean;
+  dryRun: boolean;
+  schedulerEnabled: true;
+  model: string;
+  provider: UutsProvider;
+  considered: number;
+  queued: number;
+  skipped: number;
+  results: Array<{ campaignId: string; action: 'queued' | 'would_queue' | 'skipped'; reason?: string }>;
+}> {
+  const { db, vertexAI, dryRun = false, limit = 20, campaignIds, model, promptDocId } = options;
+  const modelOption = resolveUutsModel(model);
+  const results: Array<{
+    campaignId: string;
+    action: 'queued' | 'would_queue' | 'skipped';
+    reason?: string;
+  }> = [];
+
+  let docs: QueryDocumentSnapshot[] = [];
+  if (campaignIds && campaignIds.length > 0) {
+    const snaps = await Promise.all(
+      campaignIds.slice(0, Math.max(1, limit)).map((id) => db.collection('campaigns').doc(id).get())
+    );
+    docs = snaps.filter((s) => s.exists) as QueryDocumentSnapshot[];
+  } else {
+    const snap = await db.collection('campaigns').limit(Math.max(1, Math.min(limit, 100))).get();
+    docs = snap.docs;
+  }
+
+  let queued = 0;
+  let skipped = 0;
+
+  for (const doc of docs) {
+    const campaignId = doc.id;
+    const data = doc.data() || {};
+    const status = String(data.status || '');
+    // Skip campaigns already mid-run to avoid duplicate draft versions.
+    if (data.uuts_prescreen_status === 'in_progress' || data.uuts_prescreen_status === 'queued') {
+      skipped += 1;
+      results.push({ campaignId, action: 'skipped', reason: `status=${data.uuts_prescreen_status}` });
+      continue;
+    }
+    if (status && !['Approved', 'Pending', 'Completed', 'Draft'].includes(status)) {
+      skipped += 1;
+      results.push({ campaignId, action: 'skipped', reason: `campaign status=${status}` });
+      continue;
+    }
+
+    if (dryRun) {
+      results.push({ campaignId, action: 'would_queue' });
+      queued += 1;
+      continue;
+    }
+
+    const queuedAt = nowIso();
+    await doc.ref.update({
+      uuts_prescreen_status: 'queued',
+      uuts_prescreen_attempts: 0,
+      uuts_prescreen_error: null,
+      uuts_prescreen_updated_at: queuedAt,
+      updatedAt: queuedAt,
+    });
+
+    void runUutsPrescreenAndPersist({
+      db,
+      vertexAI,
+      campaignId,
+      campaign: { id: campaignId, ...data },
+      promptDocId,
+      model: modelOption.id,
+    }).catch((err) => console.error(`UUTS scheduler background error for ${campaignId}:`, err));
+
+    queued += 1;
+    results.push({ campaignId, action: 'queued' });
+  }
+
+  return {
+    ok: true,
+    dryRun,
+    schedulerEnabled: true,
+    model: modelOption.id,
+    provider: modelOption.provider,
+    considered: docs.length,
+    queued,
+    skipped,
+    results,
+  };
 }
