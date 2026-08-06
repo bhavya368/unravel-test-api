@@ -119,6 +119,10 @@ export interface TrustReportVersionDoc {
   updatedAt: unknown;
   publishedAt: unknown | null;
   createdBy: string | null;
+  /** Model id that produced `initial` (e.g. gemini-2.5-flash-lite, claude-opus-…). */
+  model: string | null;
+  /** Provider that produced `initial` (gemini | anthropic). */
+  provider: string | null;
   initial: ScoreSnapshot;
   final: ScoreSnapshot | null;
   review: ReviewState;
@@ -155,6 +159,8 @@ export interface TrustReportPayload {
     number: number;
     status: VersionStatus;
     publishedAt: string | null;
+    model: string | null;
+    provider: string | null;
   };
 }
 
@@ -484,6 +490,8 @@ export function buildTrustReportPayload(
       number: version.version,
       status: version.status,
       publishedAt: timestampToIso(version.publishedAt),
+      model: version.model,
+      provider: version.provider,
     },
   };
 }
@@ -505,6 +513,8 @@ function parseVersionDoc(data: DocumentData | undefined): TrustReportVersionDoc 
     updatedAt: data.updatedAt ?? null,
     publishedAt: data.publishedAt ?? null,
     createdBy: data.createdBy != null ? String(data.createdBy) : null,
+    model: data.model != null ? String(data.model) : null,
+    provider: data.provider != null ? String(data.provider) : null,
     initial: sanitizeSnapshot(data.initial),
     final: data.final == null ? null : sanitizeSnapshot(data.final),
     review: sanitizeReview(data.review),
@@ -558,6 +568,10 @@ export interface UpsertTrustReportInput {
   review?: unknown;
   /** Who wrote this (optional display / audit). */
   createdBy?: string | null;
+  /** Model id used for AI scoring (optional; stored on new versions). */
+  model?: string | null;
+  /** Provider used for AI scoring (optional; stored on new versions). */
+  provider?: string | null;
   /**
    * If true, archive published (if any) is NOT done here — create a new draft version
    * from `initial` (refresh). Previous published stays published.
@@ -643,6 +657,8 @@ export async function upsertTrustReport(
         updatedAt: FieldValue.serverTimestamp(),
         publishedAt: input.publish ? FieldValue.serverTimestamp() : null,
         createdBy: input.createdBy ?? null,
+        model: input.model ?? null,
+        provider: input.provider ?? null,
         initial: baseInitial,
         final: baseFinal,
         review: baseReview,
@@ -696,6 +712,8 @@ export async function upsertTrustReport(
         updatedAt: FieldValue.serverTimestamp(),
         publishedAt: null,
         createdBy: input.createdBy ?? existing.createdBy,
+        model: input.model !== undefined ? input.model : existing.model,
+        provider: input.provider !== undefined ? input.provider : existing.provider,
         initial: mergedInitial,
         final: mergedFinal,
         review: mergedReview,
@@ -722,6 +740,8 @@ export async function upsertTrustReport(
       update.review = { ...existing.review, ...reviewPatch };
     }
     if (input.createdBy !== undefined) update.createdBy = input.createdBy;
+    if (input.model !== undefined) update.model = input.model;
+    if (input.provider !== undefined) update.provider = input.provider;
 
     if (input.publish) {
       update.status = 'published';
@@ -818,6 +838,9 @@ export async function listTrustReportVersions(
     status: VersionStatus;
     createdAt: string | null;
     publishedAt: string | null;
+    createdBy: string | null;
+    model: string | null;
+    provider: string | null;
     review: ReviewState;
     compositeInitial: number | null;
     compositeFinal: number | null;
@@ -832,6 +855,9 @@ export async function listTrustReportVersions(
       status: v?.status ?? 'draft',
       createdAt: timestampToIso(v?.createdAt),
       publishedAt: timestampToIso(v?.publishedAt),
+      createdBy: v?.createdBy ?? null,
+      model: v?.model ?? null,
+      provider: v?.provider ?? null,
       review: v?.review ?? emptyReview(),
       compositeInitial: v?.initial?.composite ?? null,
       compositeFinal: v?.final?.composite ?? null,

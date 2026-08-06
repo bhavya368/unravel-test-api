@@ -46,7 +46,15 @@ import {
   publishTrustReport,
   upsertTrustReport,
 } from './trustReport';
-import { isUutsPrescreenEnabled, runUutsPrescreenAndPersist } from './uutsPrescreen';
+import {
+  getUutsConfig,
+  isUutsPrescreenEnabled,
+  isUutsPublishLiveEnabled,
+  isUutsSchedulerEnabled,
+  resolveUutsModel,
+  runUutsPrescreenAndPersist,
+  runUutsPrescreenScheduler,
+} from './uutsPrescreen';
 import {
   extractVertexUsage,
   forceFlushLangfuse,
@@ -2311,6 +2319,13 @@ app.put('/data/campaigns/:id/trust-report', async (req: Request, res: Response) 
       return res.status(404).json({ error: 'Campaign not found' });
     }
     const body = (req.body || {}) as Record<string, unknown>;
+    if (body.publish === true && !isUutsPublishLiveEnabled()) {
+      return res.status(403).json({
+        error: 'UUTS live publish is disabled',
+        publishLiveEnabled: false,
+        hint: 'Set UUTS_PUBLISH_LIVE_ENABLED=true to connect publish to the live pipeline',
+      });
+    }
     const result = await upsertTrustReport(db, campaignId, {
       initial: body.initial,
       final: body.final,
@@ -2387,12 +2402,21 @@ app.post('/data/campaigns/:id/trust-report/refresh', async (req: Request, res: R
  * POST enqueue a new async UUTS pre-screen run for an existing campaign.
  * Always allowed (manual Admin test path). Auto-run on submit remains gated by
  * UUTS_PRESCREEN_ENABLED — this endpoint does not require that flag.
+ * Body (optional): { model?: string } — allowlisted Gemini or Claude Opus id.
  */
 app.post('/data/campaigns/:id/uuts-prescreen/refresh', async (req: Request, res: Response) => {
   try {
     const campaignId = String(req.params.id || '').trim();
     if (!campaignId) {
       return res.status(400).json({ error: 'Campaign id is required' });
+    }
+    const body = (req.body || {}) as Record<string, unknown>;
+    let modelOption;
+    try {
+      modelOption = resolveUutsModel(body.model != null ? String(body.model) : null);
+    } catch (err: any) {
+      const status = typeof err?.status === 'number' ? err.status : 400;
+      return res.status(status).json({ error: err.message || 'Invalid model' });
     }
     const campaignRef = db.collection('campaigns').doc(campaignId);
     const campaignSnap = await campaignRef.get();
@@ -2405,6 +2429,8 @@ app.post('/data/campaigns/:id/uuts-prescreen/refresh', async (req: Request, res:
       uuts_prescreen_status: 'queued',
       uuts_prescreen_attempts: 0,
       uuts_prescreen_error: null,
+      uuts_prescreen_model: modelOption.id,
+      uuts_prescreen_provider: modelOption.provider,
       uuts_prescreen_updated_at: queuedAt,
       updatedAt: queuedAt,
     });
@@ -2415,6 +2441,7 @@ app.post('/data/campaigns/:id/uuts-prescreen/refresh', async (req: Request, res:
       campaignId,
       campaign,
       promptDocId: AI_PROMPTS_DOC_ID,
+      model: modelOption.id,
     }).catch((err) =>
       console.error('UUTS pre-screen refresh background task error:', err)
     );
@@ -2423,6 +2450,8 @@ app.post('/data/campaigns/:id/uuts-prescreen/refresh', async (req: Request, res:
       message: 'UUTS pre-screen refresh queued',
       campaignId,
       uuts_prescreen_status: 'queued',
+      model: modelOption.id,
+      provider: modelOption.provider,
       source: 'manual',
     });
   } catch (error) {
@@ -2431,9 +2460,87 @@ app.post('/data/campaigns/:id/uuts-prescreen/refresh', async (req: Request, res:
   }
 });
 
-/** POST publish latest draft (or body.versionId). Archives previous published version. */
+/**
+ * GET UUTS admin config: available models + feature flags (publish live, scheduler).
+ */
+app.get('/uuts-prescreen/config', async (_req: Request, res: Response) => {
+  try {
+    res.json(getUutsConfig());
+  } catch (error) {
+    console.error('GET /uuts-prescreen/config:', error);
+    res.status(500).json({ error: 'Failed to load UUTS config' });
+  }
+});
+
+/**
+ * POST batch UUTS re-score (Cloud Scheduler). Creates draft versions only.
+ * Gated by UUTS_SCHEDULER_ENABLED (default off).
+ * Body/query: dryRun, limit, campaignId(s), model.
+ */
+app.post('/uuts-prescreen/run', async (req: Request, res: Response) => {
+  try {
+    if (!isUutsSchedulerEnabled()) {
+      return res.status(503).json({
+        error: 'UUTS scheduler is disabled',
+        schedulerEnabled: false,
+        hint: 'Set UUTS_SCHEDULER_ENABLED=true to enable',
+      });
+    }
+    const body = (req.body || {}) as Record<string, unknown>;
+    const query = req.query as Record<string, unknown>;
+    const dryRun =
+      body.dryRun === true ||
+      query.dryRun === 'true' ||
+      query.dryRun === '1';
+    const limitRaw = body.limit ?? query.limit;
+    const limit = Math.max(1, Math.min(Number(limitRaw) || 20, 100));
+    const campaignIdsRaw = body.campaignIds ?? body.campaignId ?? query.campaignIds ?? query.campaignId;
+    const campaignIds = Array.isArray(campaignIdsRaw)
+      ? campaignIdsRaw.map((id) => String(id).trim()).filter(Boolean)
+      : typeof campaignIdsRaw === 'string' && campaignIdsRaw.trim()
+        ? campaignIdsRaw.split(',').map((s) => s.trim()).filter(Boolean)
+        : [];
+    const model =
+      body.model != null
+        ? String(body.model)
+        : typeof query.model === 'string'
+          ? query.model
+          : null;
+
+    const result = await runUutsPrescreenScheduler({
+      db,
+      vertexAI,
+      dryRun,
+      limit,
+      campaignIds,
+      model,
+      promptDocId: AI_PROMPTS_DOC_ID,
+    });
+    res.json(result);
+  } catch (error: any) {
+    const status = typeof error?.status === 'number' ? error.status : 500;
+    if (status >= 400 && status < 500) {
+      return res.status(status).json({ error: error.message || 'Bad request' });
+    }
+    console.error('POST /uuts-prescreen/run:', error);
+    res.status(500).json({ error: 'Failed to run UUTS scheduler' });
+  }
+});
+
+/**
+ * POST publish latest draft (or body.versionId). Archives previous published version.
+ * Gated by UUTS_PUBLISH_LIVE_ENABLED (default off) so republish does not hit the live
+ * public trust-report pipeline until explicitly enabled.
+ */
 app.post('/data/campaigns/:id/trust-report/publish', async (req: Request, res: Response) => {
   try {
+    if (!isUutsPublishLiveEnabled()) {
+      return res.status(403).json({
+        error: 'UUTS live publish is disabled',
+        publishLiveEnabled: false,
+        hint: 'Set UUTS_PUBLISH_LIVE_ENABLED=true to connect republish to the live pipeline',
+      });
+    }
     const campaignId = String(req.params.id || '').trim();
     if (!campaignId) {
       return res.status(400).json({ error: 'Campaign id is required' });
