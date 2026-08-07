@@ -3,12 +3,14 @@
  * Load env before reading keys (CommonJS import order can beat dotenv in index.ts).
  */
 import dotenv from 'dotenv';
+import { trace as otelTrace } from '@opentelemetry/api';
 import { NodeSDK } from '@opentelemetry/sdk-node';
 import { LangfuseSpanProcessor } from '@langfuse/otel';
 import {
   propagateAttributes,
   startActiveObservation,
 } from '@langfuse/tracing';
+import { LangfuseClient } from '@langfuse/client';
 
 dotenv.config();
 
@@ -37,6 +39,7 @@ type TraceGeminiCallOptions<T> = {
 let enabled = false;
 let langfuseSpanProcessor: LangfuseSpanProcessor | null = null;
 let sdk: NodeSDK | null = null;
+let langfuseClient: LangfuseClient | null = null;
 
 function hasLangfuseCredentials(): boolean {
   const publicKey = (process.env.LANGFUSE_PUBLIC_KEY || '').trim();
@@ -81,11 +84,34 @@ export function isLangfuseEnabled(): boolean {
   return enabled;
 }
 
-/** Flush buffered spans (shutdown / end of one-shot scripts). */
+/** Shared API client for scores, prompts, datasets (null when tracing disabled). */
+export function getLangfuseClient(): LangfuseClient | null {
+  if (!enabled) return null;
+  if (langfuseClient) return langfuseClient;
+  const publicKey = (process.env.LANGFUSE_PUBLIC_KEY || '').trim();
+  const secretKey = (process.env.LANGFUSE_SECRET_KEY || '').trim();
+  if (!publicKey || !secretKey) return null;
+  const baseUrl = (process.env.LANGFUSE_BASE_URL || 'https://cloud.langfuse.com').trim();
+  langfuseClient = new LangfuseClient({ publicKey, secretKey, baseUrl });
+  return langfuseClient;
+}
+
+/** Flush buffered spans + score queue (shutdown / end of one-shot scripts). */
 export async function forceFlushLangfuse(): Promise<void> {
   if (langfuseSpanProcessor) {
     await langfuseSpanProcessor.forceFlush();
   }
+  if (langfuseClient) {
+    await langfuseClient.flush();
+  }
+}
+
+/** Active OTEL trace id (32-char hex) when inside a Langfuse generation, else null. */
+export function getActiveLangfuseTraceId(): string | null {
+  const span = otelTrace.getActiveSpan();
+  if (!span) return null;
+  const { traceId } = span.spanContext();
+  return traceId || null;
 }
 
 export function extractVertexUsage(result: {

@@ -13,9 +13,17 @@ import {
 
 import {
   extractVertexUsage,
+  getActiveLangfuseTraceId,
   metaStr,
   traceGeminiCall,
 } from './langfuseInstrumentation';
+import {
+  evaluateUutsSchemaHealth,
+  loadUutsPromptTemplate,
+  scoreActiveUutsFailure,
+  scoreActiveUutsRun,
+  type UutsPromptSource,
+} from './uutsLangfuseEval';
 
 export const UUTS_PRESCREEN_PROMPT_FIELD = 'uuts_prescreen';
 
@@ -658,7 +666,7 @@ function slideshowDescriptions(raw: unknown): string[] {
     .slice(0, 30);
 }
 
-function buildCampaignContent(campaign: JsonObject): string {
+export function buildCampaignContent(campaign: JsonObject): string {
   const parts = [
     `Title: ${text(campaign.title, 'N/A')}`,
     `Category: ${text(campaign.category, 'N/A')}`,
@@ -694,7 +702,7 @@ function buildPrompt(promptTemplate: string, campaign: JsonObject): string {
   return `${template}\n\nCampaign to evaluate:\n---\n${campaignContent}\n---`;
 }
 
-async function loadPrompt(db: Firestore, promptDocId: string): Promise<string> {
+async function loadPromptFromFirestore(db: Firestore, promptDocId: string): Promise<string> {
   try {
     const snap = await db.collection('ai_prompts').doc(promptDocId).get();
     const prompt = snap.exists ? snap.data()?.[UUTS_PRESCREEN_PROMPT_FIELD] : null;
@@ -704,6 +712,13 @@ async function loadPrompt(db: Firestore, promptDocId: string): Promise<string> {
     console.warn('UUTS pre-screen prompt load failed; using fallback prompt:', error);
   }
   return FALLBACK_PROMPT;
+}
+
+async function loadPrompt(db: Firestore, promptDocId: string): Promise<UutsPromptSource> {
+  return loadUutsPromptTemplate({
+    fallback: FALLBACK_PROMPT,
+    firestoreLoader: () => loadPromptFromFirestore(db, promptDocId),
+  });
 }
 
 function extractJson(textValue: string): JsonObject {
@@ -1017,18 +1032,22 @@ async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   }
 }
 
+export type PrescreenGenerationResult = {
+  snapshot: ScoreSnapshot;
+  langfuseTraceId: string | null;
+};
+
 async function generatePrescreenGemini(
   vertexAI: VertexAI,
   modelName: string,
   prompt: string,
   category: string,
-  campaignId: string
-): Promise<ScoreSnapshot> {
+  campaignId: string,
+  promptMeta?: Pick<UutsPromptSource, 'promptName' | 'promptVersion' | 'source'>
+): Promise<PrescreenGenerationResult> {
   const model = vertexAI.getGenerativeModel({
     model: modelName,
-    // Sampling makes the same campaign score differently on every run, so scores are
-    // not reproducible and reviewers cannot compare a re-run against a stored version.
-    generationConfig: { temperature: 0 },
+    generationConfig: { temperature: 1.0 },
   });
 
   return traceGeminiCall({
@@ -1039,6 +1058,9 @@ async function generatePrescreenGemini(
       campaignId: metaStr(campaignId),
       category: metaStr(category, 80),
       provider: 'gemini',
+      promptSource: metaStr(promptMeta?.source || 'unknown', 40),
+      promptName: metaStr(promptMeta?.promptName || '', 80),
+      promptVersion: metaStr(promptMeta?.promptVersion ?? '', 20),
     },
     input: {
       campaignId,
@@ -1055,15 +1077,32 @@ async function generatePrescreenGemini(
       const responseText =
         result.response?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
       if (!responseText) {
+        scoreActiveUutsFailure('UUTS pre-screen returned an empty response');
         throw new Error('UUTS pre-screen returned an empty response');
       }
-      const snapshot = mapUutsPrescreenOutput(extractJson(responseText), category);
+      let snapshot: ScoreSnapshot;
+      try {
+        snapshot = mapUutsPrescreenOutput(extractJson(responseText), category);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        scoreActiveUutsFailure(msg);
+        throw err;
+      }
+      const health = evaluateUutsSchemaHealth(snapshot);
+      scoreActiveUutsRun(snapshot, health, {
+        promptName: promptMeta?.promptName,
+        promptVersion: promptMeta?.promptVersion,
+      });
       return {
-        result: snapshot,
+        result: { snapshot, langfuseTraceId: getActiveLangfuseTraceId() },
         output: {
           composite: snapshot.composite,
           compositeBase: snapshot.compositeBase ?? null,
           confidenceFactor: snapshot.confidenceFactor ?? null,
+          factCheck: snapshot.factCheck?.score ?? null,
+          commsIntegrity: snapshot.commsIntegrity?.score ?? null,
+          sharedReality: snapshot.sharedReality?.score ?? null,
+          schemaValid: health.schemaValid,
           raw: responseText.length > 6000 ? `${responseText.slice(0, 6000)}…` : responseText,
         },
         usageDetails: extractVertexUsage(result),
@@ -1076,8 +1115,9 @@ async function generatePrescreenAnthropic(
   modelName: string,
   prompt: string,
   category: string,
-  campaignId: string
-): Promise<ScoreSnapshot> {
+  campaignId: string,
+  promptMeta?: Pick<UutsPromptSource, 'promptName' | 'promptVersion' | 'source'>
+): Promise<PrescreenGenerationResult> {
   const apiKey = (process.env.ANTHROPIC_API_KEY || '').trim();
   if (!apiKey) {
     throw Object.assign(new Error('ANTHROPIC_API_KEY is required for Claude UUTS models'), {
@@ -1094,6 +1134,9 @@ async function generatePrescreenAnthropic(
       campaignId: metaStr(campaignId),
       category: metaStr(category, 80),
       provider: 'anthropic',
+      promptSource: metaStr(promptMeta?.source || 'unknown', 40),
+      promptName: metaStr(promptMeta?.promptName || '', 80),
+      promptVersion: metaStr(promptMeta?.promptVersion ?? '', 20),
     },
     input: {
       campaignId,
@@ -1105,7 +1148,7 @@ async function generatePrescreenAnthropic(
         client.messages.create({
           model: modelName,
           max_tokens: 8192,
-          temperature: 0,
+          temperature: 1.0,
           messages: [{ role: 'user', content: prompt }],
         }),
         TIMEOUT_MS
@@ -1113,15 +1156,32 @@ async function generatePrescreenAnthropic(
       const textBlock = result.content.find((block) => block.type === 'text');
       const responseText = textBlock && textBlock.type === 'text' ? textBlock.text.trim() : '';
       if (!responseText) {
+        scoreActiveUutsFailure('UUTS pre-screen (Claude) returned an empty response');
         throw new Error('UUTS pre-screen (Claude) returned an empty response');
       }
-      const snapshot = mapUutsPrescreenOutput(extractJson(responseText), category);
+      let snapshot: ScoreSnapshot;
+      try {
+        snapshot = mapUutsPrescreenOutput(extractJson(responseText), category);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        scoreActiveUutsFailure(msg);
+        throw err;
+      }
+      const health = evaluateUutsSchemaHealth(snapshot);
+      scoreActiveUutsRun(snapshot, health, {
+        promptName: promptMeta?.promptName,
+        promptVersion: promptMeta?.promptVersion,
+      });
       return {
-        result: snapshot,
+        result: { snapshot, langfuseTraceId: getActiveLangfuseTraceId() },
         output: {
           composite: snapshot.composite,
           compositeBase: snapshot.compositeBase ?? null,
           confidenceFactor: snapshot.confidenceFactor ?? null,
+          factCheck: snapshot.factCheck?.score ?? null,
+          commsIntegrity: snapshot.commsIntegrity?.score ?? null,
+          sharedReality: snapshot.sharedReality?.score ?? null,
+          schemaValid: health.schemaValid,
           raw: responseText.length > 6000 ? `${responseText.slice(0, 6000)}…` : responseText,
         },
         usageDetails: {
@@ -1142,12 +1202,13 @@ async function generatePrescreen(
   modelOption: UutsModelOption,
   prompt: string,
   category: string,
-  campaignId: string
-): Promise<ScoreSnapshot> {
+  campaignId: string,
+  promptMeta?: Pick<UutsPromptSource, 'promptName' | 'promptVersion' | 'source'>
+): Promise<PrescreenGenerationResult> {
   if (modelOption.provider === 'anthropic') {
-    return generatePrescreenAnthropic(modelOption.id, prompt, category, campaignId);
+    return generatePrescreenAnthropic(modelOption.id, prompt, category, campaignId, promptMeta);
   }
-  return generatePrescreenGemini(vertexAI, modelOption.id, prompt, category, campaignId);
+  return generatePrescreenGemini(vertexAI, modelOption.id, prompt, category, campaignId, promptMeta);
 }
 
 export async function runUutsPrescreenAndPersist({
@@ -1160,8 +1221,8 @@ export async function runUutsPrescreenAndPersist({
 }: RunUutsPrescreenParams): Promise<void> {
   const campaignRef = db.collection('campaigns').doc(campaignId);
   const modelOption = resolveUutsModel(requestedModel);
-  const promptTemplate = await loadPrompt(db, promptDocId);
-  const prompt = buildPrompt(promptTemplate, campaign);
+  const promptSource = await loadPrompt(db, promptDocId);
+  const prompt = buildPrompt(promptSource.template, campaign);
   const category = text(campaign.category);
   let attempts = 0;
 
@@ -1171,12 +1232,14 @@ export async function runUutsPrescreenAndPersist({
     uuts_prescreen_error: null,
     uuts_prescreen_model: modelOption.id,
     uuts_prescreen_provider: modelOption.provider,
+    uuts_prescreen_prompt_source: promptSource.source,
+    uuts_prescreen_prompt_version: promptSource.promptVersion ?? null,
     uuts_prescreen_started_at: nowIso(),
     uuts_prescreen_updated_at: nowIso(),
   });
 
   try {
-    let snapshot: ScoreSnapshot | null = null;
+    let generation: PrescreenGenerationResult | null = null;
     let lastError: unknown = null;
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
@@ -1186,7 +1249,14 @@ export async function runUutsPrescreenAndPersist({
         uuts_prescreen_updated_at: nowIso(),
       });
       try {
-        snapshot = await generatePrescreen(vertexAI, modelOption, prompt, category, campaignId);
+        generation = await generatePrescreen(
+          vertexAI,
+          modelOption,
+          prompt,
+          category,
+          campaignId,
+          promptSource
+        );
         break;
       } catch (error) {
         lastError = error;
@@ -1197,9 +1267,11 @@ export async function runUutsPrescreenAndPersist({
       }
     }
 
-    if (!snapshot) {
+    if (!generation) {
       throw lastError || new Error('UUTS pre-screen failed');
     }
+
+    const { snapshot, langfuseTraceId } = generation;
 
     const result = await upsertTrustReport(db, campaignId, {
       initial: snapshot,
@@ -1230,6 +1302,9 @@ export async function runUutsPrescreenAndPersist({
       uuts_prescreen_version_number: result.version,
       uuts_prescreen_model: modelOption.id,
       uuts_prescreen_provider: modelOption.provider,
+      uuts_prescreen_prompt_source: promptSource.source,
+      uuts_prescreen_prompt_version: promptSource.promptVersion ?? null,
+      uuts_prescreen_langfuse_trace_id: langfuseTraceId,
       uuts_prescreen_completed_at: nowIso(),
       uuts_prescreen_updated_at: nowIso(),
       updatedAt: nowIso(),

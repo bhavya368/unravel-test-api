@@ -2567,8 +2567,31 @@ app.post('/data/campaigns/:id/trust-report/publish', async (req: Request, res: R
     const body = (req.body || {}) as Record<string, unknown>;
     const versionId = body.versionId != null ? String(body.versionId) : null;
     const result = await publishTrustReport(db, campaignId, versionId);
-    const campaign = { id: campaignSnap.id, ...(campaignSnap.data() as Record<string, unknown>) };
+    const campaign: Record<string, unknown> = {
+      id: campaignSnap.id,
+      ...(campaignSnap.data() as Record<string, unknown>),
+    };
     const report = await getPublishedTrustReport(db, campaignId, campaign);
+
+    // Queue for human annotation when AI initial vs human final diverge materially.
+    try {
+      const initialComposite = report?.initial?.composite ?? null;
+      const finalComposite = report?.final?.composite ?? null;
+      const { compositeDelta, enqueueUutsDisagreement } = await import('./uutsLangfuseEval');
+      const delta = compositeDelta(initialComposite, finalComposite);
+      const traceRaw = campaign.uuts_prescreen_langfuse_trace_id;
+      const traceId = typeof traceRaw === 'string' ? traceRaw : null;
+      if (delta != null && traceId) {
+        await enqueueUutsDisagreement({
+          traceId,
+          delta,
+          reason: `publish AI vs human Δ=${delta} campaign=${campaignId}`,
+        });
+      }
+    } catch (enqueueErr) {
+      console.warn('UUTS annotation enqueue after publish failed:', enqueueErr);
+    }
+
     res.json({
       message: 'Trust report published',
       ...result,
