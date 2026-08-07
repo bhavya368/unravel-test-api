@@ -62,6 +62,16 @@ import {
   metaStr,
   traceGeminiCall,
 } from './langfuseInstrumentation';
+import {
+  dismissPoll,
+  getMyPollResponses,
+  isPollQuestionId,
+  loadPollConfig,
+  mergePollConfig,
+  resolveRespondent,
+  summarizePollAggregates,
+  upsertPollAnswer,
+} from './campaignPolls';
 
 declare global {
   namespace Express {
@@ -798,6 +808,17 @@ app.get('/config/analytics', (_req: Request, res: Response) => {
     posthogKey: key,
     posthogHost: host,
   });
+});
+
+/** Public poll UI config (Story triggers + funding popup rate). */
+app.get('/config/polls', async (_req: Request, res: Response) => {
+  try {
+    const cfg = mergePollConfig(await loadPollConfig(db));
+    res.json(cfg);
+  } catch (error) {
+    console.error('Error loading poll config:', error);
+    res.status(500).json({ error: 'Failed to load poll config' });
+  }
 });
 
 // API Key validation - required for all routes below (except /images/ for img src, /og/ for share previews)
@@ -2836,6 +2857,129 @@ app.post('/data/campaigns/:id/backer-feedback', async (req: Request, res: Respon
   } catch (error) {
     console.error('Error saving backer feedback:', error);
     res.status(500).json({ error: 'Failed to save backer feedback' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Campaign one-tap polls — perception-shift / content-quality signals
+// ---------------------------------------------------------------------------
+
+/** Upsert one answer per respondent per campaign per question. */
+app.post('/data/campaigns/:id/polls', async (req: Request, res: Response) => {
+  try {
+    const campaignId = String(req.params.id || '').trim();
+    if (!campaignId) return res.status(400).json({ error: 'Campaign id is required' });
+    if (!req.firebaseUid) {
+      return res.status(401).json({ error: 'Sign in required to submit feedback' });
+    }
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const questionId = body.questionId ?? body.question_id;
+    if (!isPollQuestionId(questionId)) {
+      return res.status(400).json({ error: 'Invalid or missing questionId' });
+    }
+    const answer = body.answer;
+    const placement = typeof body.placement === 'string' ? body.placement : undefined;
+    const resolved = resolveRespondent(req.firebaseUid, body.fingerprint ?? body.posthogDistinctId);
+    if (resolved.error || !resolved.respondent || resolved.respondent.type !== 'user') {
+      return res.status(401).json({ error: 'Sign in required to submit feedback' });
+    }
+
+    const result = await upsertPollAnswer(db, {
+      campaignId,
+      questionId,
+      answer: String(answer ?? ''),
+      respondent: resolved.respondent,
+      placement,
+    });
+    if (!result.ok) return res.status(result.status).json({ error: result.error });
+    res.json({
+      ok: true,
+      questionId,
+      answer: result.answer,
+      changed: result.changed,
+      aggregates: result.aggregates,
+    });
+  } catch (error) {
+    console.error('Error saving poll answer:', error);
+    res.status(500).json({ error: 'Failed to save poll answer' });
+  }
+});
+
+/** Dismiss a poll without answering (still counts toward one-shot UI). */
+app.post('/data/campaigns/:id/polls/dismiss', async (req: Request, res: Response) => {
+  try {
+    const campaignId = String(req.params.id || '').trim();
+    if (!campaignId) return res.status(400).json({ error: 'Campaign id is required' });
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const questionId = body.questionId ?? body.question_id;
+    if (!isPollQuestionId(questionId)) {
+      return res.status(400).json({ error: 'Invalid or missing questionId' });
+    }
+    const placement = typeof body.placement === 'string' ? body.placement : undefined;
+    const resolved = resolveRespondent(req.firebaseUid, body.fingerprint ?? body.posthogDistinctId);
+    if (resolved.error || !resolved.respondent) {
+      return res.status(400).json({ error: resolved.error || 'Respondent identity required' });
+    }
+
+    const result = await dismissPoll(db, {
+      campaignId,
+      questionId,
+      respondent: resolved.respondent,
+      placement,
+    });
+    if (!result.ok) return res.status(result.status).json({ error: result.error });
+    res.json({ ok: true, alreadyAnswered: result.alreadyAnswered });
+  } catch (error) {
+    console.error('Error dismissing poll:', error);
+    res.status(500).json({ error: 'Failed to dismiss poll' });
+  }
+});
+
+/** Caller’s answers/dismissals for this campaign. */
+app.get('/data/campaigns/:id/polls/me', async (req: Request, res: Response) => {
+  try {
+    const campaignId = String(req.params.id || '').trim();
+    if (!campaignId) return res.status(400).json({ error: 'Campaign id is required' });
+
+    const fingerprint = req.query.fingerprint ?? req.query.posthogDistinctId;
+    const resolved = resolveRespondent(req.firebaseUid, fingerprint);
+    if (resolved.error || !resolved.respondent) {
+      return res.status(400).json({ error: resolved.error || 'Respondent identity required' });
+    }
+
+    const responses = await getMyPollResponses(db, campaignId, resolved.respondent);
+    const config = mergePollConfig(await loadPollConfig(db));
+    res.json({ responses, config });
+  } catch (error) {
+    console.error('Error fetching poll responses:', error);
+    res.status(500).json({ error: 'Failed to fetch poll responses' });
+  }
+});
+
+/** Public aggregates per question for a campaign. */
+app.get('/data/campaigns/:id/polls/summary', async (req: Request, res: Response) => {
+  try {
+    const campaignId = String(req.params.id || '').trim();
+    if (!campaignId) return res.status(400).json({ error: 'Campaign id is required' });
+
+    const snap = await db.collection('campaigns').doc(campaignId).get();
+    if (!snap.exists) return res.status(404).json({ error: 'Campaign not found' });
+    const data = snap.data() as Record<string, unknown>;
+    const aggregates = summarizePollAggregates(data.poll_aggregates);
+    res.json({
+      campaignId,
+      aggregates,
+      perception_shift_actual: data.perception_shift_actual ?? null,
+      thumbs_up: data.thumbs_up ?? null,
+      thumbs_down: data.thumbs_down ?? null,
+      net_rating: data.net_rating ?? null,
+      config: mergePollConfig(await loadPollConfig(db)),
+    });
+  } catch (error) {
+    console.error('Error fetching poll summary:', error);
+    res.status(500).json({ error: 'Failed to fetch poll summary' });
   }
 });
 
