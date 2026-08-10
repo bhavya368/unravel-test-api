@@ -34,8 +34,37 @@ const DEFAULT_ANTHROPIC_MODEL = 'claude-opus-4-6';
 // Worst case across all attempts is roughly TIMEOUT_MS * MAX_ATTEMPTS plus backoff; the
 // admin preview's poll window must stay above that or it reports a false timeout.
 const TIMEOUT_MS = 120_000;
+/** External research (web search / grounding) needs headroom beyond the base score call. */
+const RESEARCH_TIMEOUT_MS = 300_000;
 const MAX_RETRIES = 2;
 const MAX_ATTEMPTS = MAX_RETRIES + 1;
+/** Cap Anthropic web_search uses per run to bound cost while still covering claim checks. */
+const ANTHROPIC_WEB_SEARCH_MAX_USES = 5;
+const ANTHROPIC_MAX_TOKENS = 8192;
+const ANTHROPIC_RESEARCH_MAX_TOKENS = 16384;
+
+const EXTERNAL_RESEARCH_ADDENDUM = `
+================================================================
+EXTERNAL RESEARCH MODE (enabled for this run)
+================================================================
+You have live web search / grounding. Use it to verify factual claims even when the
+submission does not cite a source. Prefer primary and authoritative sources.
+
+Rules:
+- Search for evidence on each material factual claim before scoring it (a few focused searches are enough).
+- If research shows the claim is wrong, mark Unsupported (and apply critical-error penalties when appropriate).
+- If research finds no reliable corroboration or contradiction, mark Unverifiable — that is NOT the same as false.
+- Do NOT invent sources. Only cite URLs/titles returned by search or present in the submission.
+- Score Comms Integrity and Shared Reality independently of Fact-Check. A low fact-check score must not automatically lower those layers.
+- After researching, your FINAL message must be the COMPLETE JSON object matching the schema above — no prose, no markdown fences, no truncated output.
+`.trim();
+
+const NO_RESEARCH_CLARIFICATION = `
+Scoring clarification (no external research on this run):
+- Only use the campaign text and any sources included in the submission.
+- If a claim has no citation in the submission, mark it Unverifiable — do not treat a missing citation as "false".
+- Score Comms Integrity and Shared Reality independently of Fact-Check.
+`.trim();
 
 export type UutsProvider = 'gemini' | 'anthropic';
 
@@ -129,7 +158,20 @@ export function getUutsConfig() {
     schedulerEnabled: isUutsSchedulerEnabled(),
     models: listUutsModels(),
     defaultModel: defaultGeminiModel(),
+    /** Admin can opt into web search / grounding per run for A/B tests. Default off. */
+    externalResearchSupported: true,
+    externalResearchDefault: false,
   };
+}
+
+/** Coerce request/body flags into a boolean (default false). */
+export function parseExternalResearchFlag(value: unknown): boolean {
+  if (value === true || value === 1) return true;
+  if (typeof value === 'string') {
+    const raw = value.trim().toLowerCase();
+    return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
+  }
+  return false;
 }
 
 type JsonObject = Record<string, unknown>;
@@ -585,6 +627,11 @@ export interface RunUutsPrescreenParams {
   promptDocId?: string;
   /** Optional allowlisted model id (Gemini or Claude Opus). */
   model?: string | null;
+  /**
+   * When true, enable provider web search / Google Search grounding so the model can
+   * research claims beyond sources cited in the submission. Default false (cited-only).
+   */
+  externalResearch?: boolean;
 }
 
 function nowIso(): string {
@@ -690,16 +737,23 @@ export function buildCampaignContent(campaign: JsonObject): string {
   return parts.join('\n\n');
 }
 
-function buildPrompt(promptTemplate: string, campaign: JsonObject): string {
+function buildPrompt(
+  promptTemplate: string,
+  campaign: JsonObject,
+  options?: { externalResearch?: boolean }
+): string {
   const campaignContent = buildCampaignContent(campaign);
   const template = promptTemplate.trim() || FALLBACK_PROMPT;
+  let prompt: string;
   if (template.includes('{{campaign_content}}')) {
-    return template.split('{{campaign_content}}').join(campaignContent);
+    prompt = template.split('{{campaign_content}}').join(campaignContent);
+  } else if (template.includes('{campaign_content}')) {
+    prompt = template.split('{campaign_content}').join(campaignContent);
+  } else {
+    prompt = `${template}\n\nCampaign to evaluate:\n---\n${campaignContent}\n---`;
   }
-  if (template.includes('{campaign_content}')) {
-    return template.split('{campaign_content}').join(campaignContent);
-  }
-  return `${template}\n\nCampaign to evaluate:\n---\n${campaignContent}\n---`;
+  const addendum = options?.externalResearch ? EXTERNAL_RESEARCH_ADDENDUM : NO_RESEARCH_CLARIFICATION;
+  return `${prompt}\n\n${addendum}`;
 }
 
 async function loadPromptFromFirestore(db: Firestore, promptDocId: string): Promise<string> {
@@ -1037,23 +1091,41 @@ export type PrescreenGenerationResult = {
   langfuseTraceId: string | null;
 };
 
+type PrescreenCallOptions = {
+  externalResearch?: boolean;
+};
+
 async function generatePrescreenGemini(
   vertexAI: VertexAI,
   modelName: string,
   prompt: string,
   category: string,
   campaignId: string,
-  promptMeta?: Pick<UutsPromptSource, 'promptName' | 'promptVersion' | 'source'>
+  promptMeta?: Pick<UutsPromptSource, 'promptName' | 'promptVersion' | 'source'>,
+  callOptions?: PrescreenCallOptions
 ): Promise<PrescreenGenerationResult> {
+  const externalResearch = callOptions?.externalResearch === true;
+  const timeoutMs = externalResearch ? RESEARCH_TIMEOUT_MS : TIMEOUT_MS;
   const model = vertexAI.getGenerativeModel({
     model: modelName,
     generationConfig: { temperature: 1.0 },
+    ...(externalResearch
+      ? {
+          // Newer Gemini models require `googleSearch` (not legacy `googleSearchRetrieval`).
+          // SDK typings still lag the API, so cast through unknown.
+          tools: [{ googleSearch: {} } as unknown as import('@google-cloud/vertexai').Tool],
+        }
+      : {}),
   });
 
   return traceGeminiCall({
     name: 'prescreen-uuts',
     model: modelName,
-    tags: ['uuts-prescreen', 'gemini'],
+    tags: [
+      'uuts-prescreen',
+      'gemini',
+      externalResearch ? 'external-research' : 'cited-only',
+    ],
     metadata: {
       campaignId: metaStr(campaignId),
       category: metaStr(category, 80),
@@ -1061,10 +1133,12 @@ async function generatePrescreenGemini(
       promptSource: metaStr(promptMeta?.source || 'unknown', 40),
       promptName: metaStr(promptMeta?.promptName || '', 80),
       promptVersion: metaStr(promptMeta?.promptVersion ?? '', 20),
+      externalResearch: externalResearch ? 'true' : 'false',
     },
     input: {
       campaignId,
       category,
+      externalResearch,
       prompt: prompt.length > 8000 ? `${prompt.slice(0, 8000)}…` : prompt,
     },
     run: async () => {
@@ -1072,7 +1146,7 @@ async function generatePrescreenGemini(
         model.generateContent({
           contents: [{ role: 'user', parts: [{ text: prompt }] }],
         }),
-        TIMEOUT_MS
+        timeoutMs
       );
       const responseText =
         result.response?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
@@ -1103,6 +1177,7 @@ async function generatePrescreenGemini(
           commsIntegrity: snapshot.commsIntegrity?.score ?? null,
           sharedReality: snapshot.sharedReality?.score ?? null,
           schemaValid: health.schemaValid,
+          externalResearch,
           raw: responseText.length > 6000 ? `${responseText.slice(0, 6000)}…` : responseText,
         },
         usageDetails: extractVertexUsage(result),
@@ -1116,8 +1191,11 @@ async function generatePrescreenAnthropic(
   prompt: string,
   category: string,
   campaignId: string,
-  promptMeta?: Pick<UutsPromptSource, 'promptName' | 'promptVersion' | 'source'>
+  promptMeta?: Pick<UutsPromptSource, 'promptName' | 'promptVersion' | 'source'>,
+  callOptions?: PrescreenCallOptions
 ): Promise<PrescreenGenerationResult> {
+  const externalResearch = callOptions?.externalResearch === true;
+  const timeoutMs = externalResearch ? RESEARCH_TIMEOUT_MS : TIMEOUT_MS;
   const apiKey = (process.env.ANTHROPIC_API_KEY || '').trim();
   if (!apiKey) {
     throw Object.assign(new Error('ANTHROPIC_API_KEY is required for Claude UUTS models'), {
@@ -1129,7 +1207,11 @@ async function generatePrescreenAnthropic(
   return traceGeminiCall({
     name: 'prescreen-uuts',
     model: modelName,
-    tags: ['uuts-prescreen', 'anthropic'],
+    tags: [
+      'uuts-prescreen',
+      'anthropic',
+      externalResearch ? 'external-research' : 'cited-only',
+    ],
     metadata: {
       campaignId: metaStr(campaignId),
       category: metaStr(category, 80),
@@ -1137,24 +1219,41 @@ async function generatePrescreenAnthropic(
       promptSource: metaStr(promptMeta?.source || 'unknown', 40),
       promptName: metaStr(promptMeta?.promptName || '', 80),
       promptVersion: metaStr(promptMeta?.promptVersion ?? '', 20),
+      externalResearch: externalResearch ? 'true' : 'false',
     },
     input: {
       campaignId,
       category,
+      externalResearch,
       prompt: prompt.length > 8000 ? `${prompt.slice(0, 8000)}…` : prompt,
     },
     run: async () => {
       const result = await withTimeout(
         client.messages.create({
           model: modelName,
-          max_tokens: 8192,
+          max_tokens: externalResearch ? ANTHROPIC_RESEARCH_MAX_TOKENS : ANTHROPIC_MAX_TOKENS,
           temperature: 1.0,
           messages: [{ role: 'user', content: prompt }],
+          ...(externalResearch
+            ? {
+                // Server-side web search — Anthropic runs searches within this request.
+                tools: [
+                  {
+                    type: 'web_search_20250305' as const,
+                    name: 'web_search' as const,
+                    max_uses: ANTHROPIC_WEB_SEARCH_MAX_USES,
+                  },
+                ],
+              }
+            : {}),
         }),
-        TIMEOUT_MS
+        timeoutMs
       );
-      const textBlock = result.content.find((block) => block.type === 'text');
-      const responseText = textBlock && textBlock.type === 'text' ? textBlock.text.trim() : '';
+      const responseText = result.content
+        .filter((block) => block.type === 'text')
+        .map((block) => (block.type === 'text' ? block.text : ''))
+        .join('\n')
+        .trim();
       if (!responseText) {
         scoreActiveUutsFailure('UUTS pre-screen (Claude) returned an empty response');
         throw new Error('UUTS pre-screen (Claude) returned an empty response');
@@ -1172,6 +1271,14 @@ async function generatePrescreenAnthropic(
         promptName: promptMeta?.promptName,
         promptVersion: promptMeta?.promptVersion,
       });
+      const webSearchRequests =
+        result.usage &&
+        'server_tool_use' in result.usage &&
+        result.usage.server_tool_use &&
+        typeof (result.usage.server_tool_use as { web_search_requests?: number }).web_search_requests ===
+          'number'
+          ? (result.usage.server_tool_use as { web_search_requests: number }).web_search_requests
+          : undefined;
       return {
         result: { snapshot, langfuseTraceId: getActiveLangfuseTraceId() },
         output: {
@@ -1182,6 +1289,8 @@ async function generatePrescreenAnthropic(
           commsIntegrity: snapshot.commsIntegrity?.score ?? null,
           sharedReality: snapshot.sharedReality?.score ?? null,
           schemaValid: health.schemaValid,
+          externalResearch,
+          webSearchRequests: webSearchRequests ?? null,
           raw: responseText.length > 6000 ? `${responseText.slice(0, 6000)}…` : responseText,
         },
         usageDetails: {
@@ -1203,12 +1312,28 @@ async function generatePrescreen(
   prompt: string,
   category: string,
   campaignId: string,
-  promptMeta?: Pick<UutsPromptSource, 'promptName' | 'promptVersion' | 'source'>
+  promptMeta?: Pick<UutsPromptSource, 'promptName' | 'promptVersion' | 'source'>,
+  callOptions?: PrescreenCallOptions
 ): Promise<PrescreenGenerationResult> {
   if (modelOption.provider === 'anthropic') {
-    return generatePrescreenAnthropic(modelOption.id, prompt, category, campaignId, promptMeta);
+    return generatePrescreenAnthropic(
+      modelOption.id,
+      prompt,
+      category,
+      campaignId,
+      promptMeta,
+      callOptions
+    );
   }
-  return generatePrescreenGemini(vertexAI, modelOption.id, prompt, category, campaignId, promptMeta);
+  return generatePrescreenGemini(
+    vertexAI,
+    modelOption.id,
+    prompt,
+    category,
+    campaignId,
+    promptMeta,
+    callOptions
+  );
 }
 
 export async function runUutsPrescreenAndPersist({
@@ -1218,11 +1343,13 @@ export async function runUutsPrescreenAndPersist({
   campaign,
   promptDocId = DEFAULT_PROMPT_DOC_ID,
   model: requestedModel,
+  externalResearch: externalResearchRaw,
 }: RunUutsPrescreenParams): Promise<void> {
   const campaignRef = db.collection('campaigns').doc(campaignId);
   const modelOption = resolveUutsModel(requestedModel);
+  const externalResearch = externalResearchRaw === true;
   const promptSource = await loadPrompt(db, promptDocId);
-  const prompt = buildPrompt(promptSource.template, campaign);
+  const prompt = buildPrompt(promptSource.template, campaign, { externalResearch });
   const category = text(campaign.category);
   let attempts = 0;
 
@@ -1232,6 +1359,7 @@ export async function runUutsPrescreenAndPersist({
     uuts_prescreen_error: null,
     uuts_prescreen_model: modelOption.id,
     uuts_prescreen_provider: modelOption.provider,
+    uuts_prescreen_external_research: externalResearch,
     uuts_prescreen_prompt_source: promptSource.source,
     uuts_prescreen_prompt_version: promptSource.promptVersion ?? null,
     uuts_prescreen_started_at: nowIso(),
@@ -1255,7 +1383,8 @@ export async function runUutsPrescreenAndPersist({
           prompt,
           category,
           campaignId,
-          promptSource
+          promptSource,
+          { externalResearch }
         );
         break;
       } catch (error) {
@@ -1284,7 +1413,7 @@ export async function runUutsPrescreenAndPersist({
         reviewedAt: nowIso(),
         reviewer: 'UUTS Pre-screening skill',
       },
-      createdBy: 'uuts-prescreen',
+      createdBy: externalResearch ? 'uuts-prescreen-research' : 'uuts-prescreen',
       model: modelOption.id,
       provider: modelOption.provider,
       refresh: true,
@@ -1302,6 +1431,7 @@ export async function runUutsPrescreenAndPersist({
       uuts_prescreen_version_number: result.version,
       uuts_prescreen_model: modelOption.id,
       uuts_prescreen_provider: modelOption.provider,
+      uuts_prescreen_external_research: externalResearch,
       uuts_prescreen_prompt_source: promptSource.source,
       uuts_prescreen_prompt_version: promptSource.promptVersion ?? null,
       uuts_prescreen_langfuse_trace_id: langfuseTraceId,
@@ -1314,6 +1444,7 @@ export async function runUutsPrescreenAndPersist({
       uuts_prescreen_status: 'manual_required',
       uuts_prescreen_attempts: attempts,
       uuts_prescreen_error: errorMessage(error).slice(0, 1000),
+      uuts_prescreen_external_research: externalResearch,
       uuts_prescreen_failed_at: nowIso(),
       uuts_prescreen_updated_at: nowIso(),
       updatedAt: nowIso(),
@@ -1330,6 +1461,7 @@ export interface RunUutsSchedulerOptions {
   campaignIds?: string[];
   model?: string | null;
   promptDocId?: string;
+  externalResearch?: boolean;
 }
 
 /**
@@ -1344,13 +1476,24 @@ export async function runUutsPrescreenScheduler(
   schedulerEnabled: true;
   model: string;
   provider: UutsProvider;
+  externalResearch: boolean;
   considered: number;
   queued: number;
   skipped: number;
   results: Array<{ campaignId: string; action: 'queued' | 'would_queue' | 'skipped'; reason?: string }>;
 }> {
-  const { db, vertexAI, dryRun = false, limit = 20, campaignIds, model, promptDocId } = options;
+  const {
+    db,
+    vertexAI,
+    dryRun = false,
+    limit = 20,
+    campaignIds,
+    model,
+    promptDocId,
+    externalResearch: externalResearchRaw,
+  } = options;
   const modelOption = resolveUutsModel(model);
+  const externalResearch = externalResearchRaw === true;
   const results: Array<{
     campaignId: string;
     action: 'queued' | 'would_queue' | 'skipped';
@@ -1398,6 +1541,7 @@ export async function runUutsPrescreenScheduler(
       uuts_prescreen_status: 'queued',
       uuts_prescreen_attempts: 0,
       uuts_prescreen_error: null,
+      uuts_prescreen_external_research: externalResearch,
       uuts_prescreen_updated_at: queuedAt,
       updatedAt: queuedAt,
     });
@@ -1409,6 +1553,7 @@ export async function runUutsPrescreenScheduler(
       campaign: { id: campaignId, ...data },
       promptDocId,
       model: modelOption.id,
+      externalResearch,
     }).catch((err) => console.error(`UUTS scheduler background error for ${campaignId}:`, err));
 
     queued += 1;
@@ -1421,6 +1566,7 @@ export async function runUutsPrescreenScheduler(
     schedulerEnabled: true,
     model: modelOption.id,
     provider: modelOption.provider,
+    externalResearch,
     considered: docs.length,
     queued,
     skipped,
