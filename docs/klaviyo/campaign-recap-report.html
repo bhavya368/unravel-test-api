@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en" xmlns="http://www.w3.org/1999/xhtml" xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:v="urn:schemas-microsoft-com:vml">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta content="IE=edge" http-equiv="X-UA-Compatible"/>
+<title>Your campaign delivered on its promise</title>
+<!--[if mso]><noscript><xml><o:OfficeDocumentSettings><o:PixelsPerInch>96</o:PixelsPerInch></o:OfficeDocumentSettings></xml></noscript><![endif]-->
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;700;800&family=Noto+Sans:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  body,table,td,a{ -webkit-text-size-adjust:100%; -ms-text-size-adjust:100%; }
+  table,td{ mso-table-lspace:0pt; mso-table-rspace:0pt; }
+  img{ -ms-interpolation-mode:bicubic; border:0; outline:none; text-decoration:none; display:block; }
+  body{ margin:0; padding:0; width:100%!important; background:#f6f7f8; }
+  a{ text-decoration:none; }
+  @media only screen and (max-width:620px){
+    .container{ width:100%!important; }
+    .stack{ display:block!important; width:100%!important; }
+  }
+</style>
+</head>
+<body style="margin:0; padding:0; background:#f6f7f8;">
+<!--
+  Metric: Unravel Campaign Recap Report
+  Fired once per backer from unravel-api campaignReportDrips (recap stage).
+
+  Event properties:
+    first_name (profile)
+    event.campaign_name / event.campaignTitle
+    event.contribution_amount
+    event.final_reach / event.projected_reach
+    event.actions_sparked
+    event.perception_shift / event.perceptionShift
+    event.total_backers
+    event.final_collective_reach / event.reach
+    event.total_spend / event.pooled_amount
+    event.thumbnailUrl
+    event.impactUrl
+    event.campaignUrl
+-->
+<div style="display:none; max-height:0; overflow:hidden; mso-hide:all; font-size:1px; line-height:1px; color:#f6f7f8;">Your {{ event.contribution_amount|default:'$0' }} reached ~{{ event.final_reach|default:event.projected_reach|default:'0' }} people.</div>
+<table border="0" cellpadding="0" cellspacing="0" role="presentation" style="background:#f6f7f8;" width="100%">
+  <tr>
+    <td align="center" style="padding:32px 12px;">
+      <table border="0" cellpadding="0" cellspacing="0" class="container" role="presentation" style="width:600px; max-width:600px; background:#ffffff; border:1px solid #e7eef3; border-radius:20px; overflow:hidden;" width="600">
+        <tr>
+          <td style="padding:28px 28px 0;">
+            <table border="0" cellpadding="0" cellspacing="0" role="presentation" width="100%">
+              <tr>
+                <td align="left" style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:11px; font-weight:800; letter-spacing:1px; text-transform:uppercase; color:#1a8cd8;">
+                  <span style="background:#e8f5fd; border-radius:20px; padding:7px 13px; display:inline-block;">03 — Recap</span>
+                </td>
+                <td align="right" style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:13px; font-weight:800; color:#0d161b;">Unravel</td>
+              </tr>
+            </table>
+            <div style="height:4px; background:#2b9dee; border-radius:999px; margin:18px 0 0; font-size:0; line-height:0;">&nbsp;</div>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:22px 28px 0;">
+            <div style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:26px; font-weight:800; letter-spacing:-0.5px; line-height:1.18; color:#0d161b; margin:0 0 10px;">Your {{ event.contribution_amount|default:'$0' }} reached ~{{ event.final_reach|default:event.projected_reach|default:'0' }} people, {{ first_name|default:'there' }}.</div>
+            <div style="font-family:'Noto Sans', Arial, Helvetica, sans-serif; font-size:15px; line-height:1.6; color:#4c799a;">The campaign closed. Here's exactly what your share did — alongside the {{ event.total_backers|default:'0' }} of you who made <strong style="color:#0d161b">{{ event.campaign_name|default:event.campaignTitle|default:'this campaign' }}</strong> travel.</div>
+          </td>
+        </tr>
+
+        {% if event.thumbnailUrl %}
+        <tr>
+          <td style="padding:18px 28px 0;">
+            <table border="0" cellpadding="0" cellspacing="0" role="presentation" width="100%">
+              <tr>
+                <td style="border-radius:16px; overflow:hidden;">
+                  <img alt="{{ event.campaign_name|default:event.campaignTitle|default:'Campaign' }}" src="{{ event.thumbnailUrl }}" style="width:100%; height:auto; display:block; border-radius:16px;" width="544"/>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+        {% endif %}
+
+        <tr>
+          <td style="padding:18px 28px 0;">
+            <table border="0" cellpadding="0" cellspacing="0" role="presentation" style="background:#f0f9ff; border:1px solid #cdebfb; border-radius:18px;" width="100%">
+              <tr>
+                <td style="padding:22px;">
+                  <div style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:11px; font-weight:800; letter-spacing:0.8px; text-transform:uppercase; color:#1a8cd8;">Your final impact</div>
+                  <div style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:14px; font-weight:700; color:#0d161b; margin-top:3px; margin-bottom:16px;">{{ first_name|default:'there' }} · {{ event.contribution_amount|default:'$0' }} contributed</div>
+                  <table border="0" cellpadding="0" cellspacing="0" role="presentation" width="100%">
+                    <tr>
+                      <td style="width:92px;" valign="middle" width="92">
+                        <table border="0" cellpadding="0" cellspacing="0" role="presentation">
+                          <tr>
+                            <td align="center" height="84" style="width:84px; height:84px; background:#2b9dee; border-radius:42px; font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:15px; font-weight:800; color:#ffffff;" valign="middle" width="84">{{ event.contribution_amount|default:'$0' }}</td>
+                          </tr>
+                        </table>
+                      </td>
+                      <td style="padding-left:18px;" valign="middle">
+                        <div style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:32px; font-weight:800; letter-spacing:-1px; line-height:1; color:#0d161b;">~{{ event.final_reach|default:event.projected_reach|default:'0' }}</div>
+                        <div style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:11px; font-weight:800; letter-spacing:0.6px; text-transform:uppercase; color:#1a8cd8; margin-top:6px;">People your share reached</div>
+                      </td>
+                    </tr>
+                  </table>
+                  <div style="font-family:'Noto Sans', Arial, Helvetica, sans-serif; font-size:13px; line-height:1.55; color:#4c799a; margin-top:14px;">You're 1 of {{ event.total_backers|default:'0' }} backers who made this campaign travel.</div>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+
+        <tr>
+          <td style="padding:16px 28px 0;">
+            <table border="0" cellpadding="0" cellspacing="0" role="presentation" width="100%">
+              <tr>
+                <td class="stack" style="padding:0 6px 0 0;" valign="top" width="33%">
+                  <table border="0" cellpadding="0" cellspacing="0" role="presentation" style="background:#f6f9fb; border:1px solid #e7eef3; border-radius:13px;" width="100%">
+                    <tr>
+                      <td style="padding:14px 12px;">
+                        <div style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:19px; font-weight:800; color:#0d161b;">~{{ event.actions_sparked|default:event.actions_so_far|default:event.actions|default:'0' }}</div>
+                        <div style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:9px; font-weight:800; letter-spacing:0.5px; text-transform:uppercase; color:#4c799a; margin-top:4px;">Actions you sparked</div>
+                      </td>
+                    </tr>
+                  </table>
+                </td>
+                <td class="stack" style="padding:0 6px;" valign="top" width="33%">
+                  <table border="0" cellpadding="0" cellspacing="0" role="presentation" style="background:#f6f9fb; border:1px solid #e7eef3; border-radius:13px;" width="100%">
+                    <tr>
+                      <td style="padding:14px 12px;">
+                        <div style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:19px; font-weight:800; color:#0f9e6e;">+{{ event.perception_shift|default:event.perceptionShift|default:'0' }}%</div>
+                        <div style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:9px; font-weight:800; letter-spacing:0.5px; text-transform:uppercase; color:#4c799a; margin-top:4px;">Perception you moved</div>
+                      </td>
+                    </tr>
+                  </table>
+                </td>
+                <td class="stack" style="padding:0 0 0 6px;" valign="top" width="33%">
+                  <table border="0" cellpadding="0" cellspacing="0" role="presentation" style="background:#f6f9fb; border:1px solid #e7eef3; border-radius:13px;" width="100%">
+                    <tr>
+                      <td style="padding:14px 12px;">
+                        <div style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:19px; font-weight:800; color:#0d161b;">1/{{ event.total_backers|default:'0' }}</div>
+                        <div style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:9px; font-weight:800; letter-spacing:0.5px; text-transform:uppercase; color:#4c799a; margin-top:4px;">Backers</div>
+                      </td>
+                    </tr>
+                  </table>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+
+        <tr>
+          <td style="padding:16px 28px 0;">
+            <div style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:12px; font-weight:800; letter-spacing:0.7px; text-transform:uppercase; color:#1a8cd8;">Together, the {{ event.total_backers|default:'0' }} of you</div>
+          </td>
+        </tr>
+
+        <tr>
+          <td style="padding:16px 28px 0;">
+            <table border="0" cellpadding="0" cellspacing="0" role="presentation" width="100%">
+              <tr>
+                <td class="stack" style="padding:0 6px 0 0;" valign="top" width="33%">
+                  <table border="0" cellpadding="0" cellspacing="0" role="presentation" style="background:#f6f9fb; border:1px solid #e7eef3; border-radius:13px;" width="100%">
+                    <tr>
+                      <td style="padding:14px 12px;">
+                        <div style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:19px; font-weight:800; color:#0d161b;">{{ event.final_collective_reach|default:event.reach|default:'0' }}</div>
+                        <div style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:9px; font-weight:800; letter-spacing:0.5px; text-transform:uppercase; color:#4c799a; margin-top:4px;">Total reach</div>
+                      </td>
+                    </tr>
+                  </table>
+                </td>
+                <td class="stack" style="padding:0 6px;" valign="top" width="33%">
+                  <table border="0" cellpadding="0" cellspacing="0" role="presentation" style="background:#f6f9fb; border:1px solid #e7eef3; border-radius:13px;" width="100%">
+                    <tr>
+                      <td style="padding:14px 12px;">
+                        <div style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:19px; font-weight:800; color:#0d161b;">{{ event.total_spend|default:event.pooled_amount|default:'$0' }}</div>
+                        <div style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:9px; font-weight:800; letter-spacing:0.5px; text-transform:uppercase; color:#4c799a; margin-top:4px;">Pooled spend</div>
+                      </td>
+                    </tr>
+                  </table>
+                </td>
+                <td class="stack" style="padding:0 0 0 6px;" valign="top" width="33%">
+                  <table border="0" cellpadding="0" cellspacing="0" role="presentation" style="background:#f6f9fb; border:1px solid #e7eef3; border-radius:13px;" width="100%">
+                    <tr>
+                      <td style="padding:14px 12px;">
+                        <div style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:19px; font-weight:800; color:#0f9e6e;">+{{ event.perception_shift|default:event.perceptionShift|default:'0' }}%</div>
+                        <div style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:9px; font-weight:800; letter-spacing:0.5px; text-transform:uppercase; color:#4c799a; margin-top:4px;">Perception shift</div>
+                      </td>
+                    </tr>
+                  </table>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+
+        <tr>
+          <td style="padding:20px 28px 0;">
+            <table border="0" cellpadding="0" cellspacing="0" role="presentation" style="margin:0 auto;" width="100%">
+              <tr>
+                <td align="center" bgcolor="#2b9dee" style="border-radius:999px;">
+                  <a href="{{ event.impactUrl }}" style="display:block; padding:15px 28px; font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:15px; font-weight:800; color:#ffffff; text-decoration:none; border-radius:999px;">Open your recap &rarr;</a>
+                </td>
+              </tr>
+            </table>
+            <div style="text-align:center; margin-top:14px;">
+              <a href="{{ event.campaignUrl }}" style="font-family:'Plus Jakarta Sans', Arial, Helvetica, sans-serif; font-size:13px; font-weight:800; color:#1a8cd8;">Share your impact</a>
+            </div>
+          </td>
+        </tr>
+        <tr>
+          <td style="font-size:0; line-height:0; height:30px;">&nbsp;</td>
+        </tr>
+      </table>
+      <table border="0" cellpadding="0" cellspacing="0" class="container" role="presentation" style="width:600px; max-width:600px;" width="600">
+        <tr>
+          <td style="padding:18px 12px 0; text-align:center; font-family:'Noto Sans', Arial, Helvetica, sans-serif; font-size:11px; line-height:1.6; color:#94a3b8;">
+            Unravel · Reverberate, Inc. — Recap report<br/>
+            You're receiving this because you backed a campaign on Unravel.
+            <a href="{% unsubscribe %}" style="color:#94a3b8; text-decoration:underline;">Unsubscribe</a>
+          </td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+</table>
+</body>
+</html>
