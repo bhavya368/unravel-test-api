@@ -2440,8 +2440,8 @@ app.post('/data/campaigns/:id/trust-report/refresh', async (req: Request, res: R
  * Always allowed (manual Admin test path). Auto-run on submit remains gated by
  * UUTS_PRESCREEN_ENABLED — this endpoint does not require that flag.
  * Body (optional): { model?: string, externalResearch?: boolean }
- *   - externalResearch: when true, Gemini uses Google Search grounding and Claude
- *     uses Anthropic web_search so claims can be checked beyond cited sources.
+ *   - externalResearch: when true, fetch Sources-box URLs only and score Fact-Check
+ *     against that pack (no open-web search; description-only citations are ignored).
  */
 app.post('/data/campaigns/:id/uuts-prescreen/refresh', async (req: Request, res: Response) => {
   try {

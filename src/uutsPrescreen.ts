@@ -38,31 +38,74 @@ const TIMEOUT_MS = 120_000;
 const RESEARCH_TIMEOUT_MS = 300_000;
 const MAX_RETRIES = 2;
 const MAX_ATTEMPTS = MAX_RETRIES + 1;
-/** Cap Anthropic web_search uses per run to bound cost while still covering claim checks. */
-const ANTHROPIC_WEB_SEARCH_MAX_USES = 5;
 const ANTHROPIC_MAX_TOKENS = 8192;
 const ANTHROPIC_RESEARCH_MAX_TOKENS = 16384;
 
+/** Fair external research: fetch Sources-box URLs only (no open-web roaming). */
+const MAX_SOURCE_FETCHES = 15;
+/** Slow agency/journal pages often exceed 8s under parallel load. */
+const SOURCE_FETCH_TIMEOUT_MS = 20_000;
+const SOURCE_FETCH_CONCURRENCY = 3;
+const MAX_CHARS_PER_SOURCE = 12_000;
+const MAX_EVIDENCE_CHARS_TOTAL = 60_000;
+/** Cap download size so huge HTML pages don't blow the timeout budget. */
+const MAX_SOURCE_DOWNLOAD_BYTES = 1_500_000;
+
+const SOURCE_FETCH_HEADERS_BROWSER: Record<string, string> = {
+  Accept:
+    'text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf;q=0.8,text/plain;q=0.8,*/*;q=0.5',
+  'Accept-Language': 'en-US,en;q=0.9',
+  // Browser-like UA: some agencies block custom bot UAs.
+  'User-Agent':
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+};
+
+const SOURCE_FETCH_HEADERS_BOT: Record<string, string> = {
+  Accept:
+    'text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf;q=0.8,text/plain;q=0.8,*/*;q=0.5',
+  'Accept-Language': 'en-US,en;q=0.9',
+  // Honest bot UA: some publishers (e.g. BMC) serve full HTML to bots but cookie-walls to browsers.
+  'User-Agent': 'UnravelUUTSPrescreen/1.0 (+https://unravel.network; source-verification)',
+};
+
+/** Retry with the other UA when the first response is blocked or nearly empty. */
+const SHORT_SOURCE_TEXT_CHARS = 400;
+
 const EXTERNAL_RESEARCH_ADDENDUM = `
 ================================================================
-EXTERNAL RESEARCH MODE (enabled for this run)
+EXTERNAL RESEARCH MODE — SOURCES BOX ONLY (fair)
 ================================================================
-You have live web search / grounding. Use it to verify factual claims even when the
-submission does not cite a source. Prefer primary and authoritative sources.
+We fetched pages linked in the campaign Sources box and included their text below
+(or noted fetch failures). That evidence pack is the ONLY allowed source set for Fact-Check.
 
-Rules:
-- Search for evidence on each material factual claim before scoring it (a few focused searches are enough).
-- If research shows the claim is wrong, mark Unsupported (and apply critical-error penalties when appropriate).
-- If research finds no reliable corroboration or contradiction, mark Unverifiable — that is NOT the same as false.
-- Do NOT invent sources. Only cite URLs/titles returned by search or present in the submission.
-- Score Comms Integrity and Shared Reality independently of Fact-Check. A low fact-check score must not automatically lower those layers.
-- After researching, your FINAL message must be the COMPLETE JSON object matching the schema above — no prose, no markdown fences, no truncated output.
+Hard rules for sources:
+- The Sources box (numbered list + fetched pack below) is the exclusive evidence list.
+- Do NOT web-search, invent, or add sources mentioned only in the campaign description,
+  slideshow, or body text unless that same source also appears in the Sources box.
+- Do NOT treat inline URLs/citations in the description as Sources-box entries.
+- Do NOT use open-web knowledge to "fill in" missing Sources-box evidence.
+
+Fair scoring stance — evidence-based, not harsh:
+- Still analyze the full campaign description, slideshow, and framing for all three layers.
+- For Fact-Check support, rely only on Sources-box entries and the fetched pack.
+- Give credit when a claim is substantially true and reasonably supported by a Sources-box item,
+  even if wording is imperfect.
+- Prefer Partially supported over Unsupported when the core fact holds but details need nuance.
+- Prefer Unverifiable over false/Unsupported when evidence is missing or inconclusive —
+  a missing Sources-box citation or failed fetch is NOT the same as "false".
+- Apply penalties only for clear, material issues. Do not stack minor deductions.
+- Honest advocacy can score well on Comms / Shared Reality; do not punish taking a side.
+- Score Comms Integrity and Shared Reality independently of Fact-Check.
+- Return ONLY the COMPLETE JSON object matching the schema — no prose, no markdown fences.
 `.trim();
 
 const NO_RESEARCH_CLARIFICATION = `
 Scoring clarification (no external research on this run):
-- Only use the campaign text and any sources included in the submission.
-- If a claim has no citation in the submission, mark it Unverifiable — do not treat a missing citation as "false".
+- Analyze the full campaign description and framing.
+- For Fact-Check, only use Sources listed in the Sources box (as listed — pages were not fetched).
+- Do NOT treat URLs/citations that appear only in the description as Sources-box entries.
+- If a claim has no Sources-box citation, mark it Unverifiable — do not treat a missing citation as "false".
+- Give credit when claims are substantially supported by Sources-box entries; prefer Partially supported over Unsupported when the core fact holds.
 - Score Comms Integrity and Shared Reality independently of Fact-Check.
 `.trim();
 
@@ -300,8 +343,8 @@ export const PRESCREEN_UNCERTAINTY_VISIBILITY = 1.0;
 
 const FALLBACK_PROMPT = `You are the UUTS Pre-screening skill for Unravel.
 
-Score the campaign in ONE pass across three layers. Be strict, evidence-based, and consistent.
-Do NOT invent sources. If a claim has no citation, treat it as unverifiable/weak.
+Score the campaign in ONE pass across three layers. Be fair, evidence-based, and consistent — not harsh.
+Do NOT invent sources. If a claim has no citation, treat it as Unverifiable (not as false).
 Return ONLY valid JSON (no markdown, no commentary).
 
 ================================================================
@@ -706,6 +749,326 @@ function sourceList(raw: unknown): string[] {
   return [];
 }
 
+function addSourceUrl(candidate: string, found: string[]): void {
+  const cleaned = candidate.trim().replace(/[.,;:]+$/g, '');
+  if (!cleaned) return;
+  try {
+    const u = new URL(/^https?:\/\//i.test(cleaned) ? cleaned : `https://${cleaned}`);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return;
+    const host = u.hostname.toLowerCase();
+    if (
+      host === 'localhost' ||
+      host === '127.0.0.1' ||
+      host === '::1' ||
+      host.endsWith('.local') ||
+      host.startsWith('10.') ||
+      host.startsWith('192.168.') ||
+      /^172\.(1[6-9]|2\d|3[0-1])\./.test(host)
+    ) {
+      return;
+    }
+    if (!found.includes(u.toString())) found.push(u.toString());
+  } catch {
+    // ignore invalid URLs
+  }
+}
+
+/** Pull URLs from Sources-box entries only (never from description text). */
+export function extractSourceUrls(campaign: JsonObject): string[] {
+  const raw = campaign.campaign_sources ?? campaign.sources;
+  const found: string[] = [];
+  const pushUrl = (value: unknown) => {
+    const s = text(value);
+    if (!s) return;
+    const matches =
+      s.match(/https?:\/\/[^\s<>"'`)\]]+/gi) ||
+      s.match(/\b(?:[a-z0-9-]+\.)+[a-z]{2,}(?:\/[^\s<>"'`)\]]*)?/gi) ||
+      [];
+    for (const match of matches) addSourceUrl(match, found);
+  };
+
+  if (Array.isArray(raw)) {
+    for (const item of raw) {
+      if (typeof item === 'string') pushUrl(item);
+      else {
+        const row = asObject(item);
+        pushUrl(row.url);
+        pushUrl(row.detail);
+        pushUrl(row.name);
+        pushUrl([row.name, row.detail, row.url].filter(Boolean).join(' '));
+      }
+    }
+  } else if (typeof raw === 'string') {
+    pushUrl(raw);
+  }
+
+  return found.slice(0, MAX_SOURCE_FETCHES);
+}
+
+function stripHtmlToText(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+export type FetchedSourceEvidence = {
+  url: string;
+  ok: boolean;
+  status?: number;
+  title?: string;
+  text?: string;
+  error?: string;
+  chars?: number;
+};
+
+async function mapPool<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(concurrency, Math.max(items.length, 1)) }, async () => {
+    while (true) {
+      const index = next;
+      next += 1;
+      if (index >= items.length) return;
+      results[index] = await fn(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+function isRetryableFetchFailure(row: FetchedSourceEvidence): boolean {
+  if (row.ok) return false;
+  const err = (row.error || '').toLowerCase();
+  if (err.includes('abort') || err.includes('timeout') || err.includes('network') || err.includes('fetch failed')) {
+    return true;
+  }
+  return row.status === 408 || row.status === 425 || row.status === 429 || row.status === 500 || row.status === 502 || row.status === 503 || row.status === 504;
+}
+
+async function readResponseBytes(res: Response, maxBytes: number): Promise<Buffer> {
+  if (!res.body) {
+    const ab = await res.arrayBuffer();
+    return Buffer.from(ab).subarray(0, maxBytes);
+  }
+  const reader = res.body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  while (total < maxBytes) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value?.length) continue;
+    const buf = Buffer.from(value);
+    const room = maxBytes - total;
+    chunks.push(buf.length > room ? buf.subarray(0, room) : buf);
+    total += Math.min(buf.length, room);
+    if (buf.length > room) {
+      try {
+        await reader.cancel();
+      } catch {
+        // ignore cancel errors
+      }
+      break;
+    }
+  }
+  return Buffer.concat(chunks, total);
+}
+
+async function extractPdfText(buf: Buffer): Promise<string> {
+  // pdf-parse is CJS; keep require so ts-node/dev doesn't need esModuleInterop tweaks.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const pdfParse = require('pdf-parse') as (data: Buffer) => Promise<{ text?: string }>;
+  const parsed = await pdfParse(buf);
+  return text(parsed?.text);
+}
+
+async function fetchOneSourceUrlOnce(
+  url: string,
+  headers: Record<string, string>
+): Promise<FetchedSourceEvidence> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SOURCE_FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      method: 'GET',
+      redirect: 'follow',
+      signal: controller.signal,
+      headers,
+    });
+    if (!res.ok) {
+      return { url, ok: false, status: res.status, error: `HTTP ${res.status}` };
+    }
+
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+    const buf = await readResponseBytes(res, MAX_SOURCE_DOWNLOAD_BYTES);
+    const looksPdf =
+      contentType.includes('application/pdf') ||
+      url.toLowerCase().includes('.pdf') ||
+      buf.subarray(0, 5).toString('utf8') === '%PDF-';
+
+    if (looksPdf) {
+      try {
+        const pdfText = (await extractPdfText(buf)).replace(/\s+/g, ' ').trim().slice(0, MAX_CHARS_PER_SOURCE);
+        if (!pdfText) {
+          return { url, ok: false, status: res.status, error: 'Empty PDF text after extract' };
+        }
+        return {
+          url,
+          ok: true,
+          status: res.status,
+          title: 'PDF document',
+          text: pdfText,
+          chars: pdfText.length,
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { url, ok: false, status: res.status, error: `PDF extract failed: ${msg}`.slice(0, 300) };
+      }
+    }
+
+    const raw = buf.toString('utf8');
+    let body = raw;
+    if (contentType.includes('html') || /<html[\s>]/i.test(raw.slice(0, 500))) {
+      body = stripHtmlToText(raw);
+    } else {
+      body = raw.replace(/\s+/g, ' ').trim();
+    }
+    body = body.slice(0, MAX_CHARS_PER_SOURCE);
+    const titleMatch = raw.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    const title = titleMatch ? stripHtmlToText(titleMatch[1]).slice(0, 200) : undefined;
+    if (!body.trim()) {
+      return { url, ok: false, status: res.status, title, error: 'Empty page text after fetch' };
+    }
+    return { url, ok: true, status: res.status, title, text: body, chars: body.length };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const normalized =
+      /aborted|abort/i.test(msg) ? `Timeout after ${SOURCE_FETCH_TIMEOUT_MS}ms` : msg;
+    return { url, ok: false, error: normalized.slice(0, 300) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function preferBetterFetch(a: FetchedSourceEvidence, b: FetchedSourceEvidence): FetchedSourceEvidence {
+  const aChars = a.ok ? a.chars || a.text?.length || 0 : 0;
+  const bChars = b.ok ? b.chars || b.text?.length || 0 : 0;
+  if (b.ok && bChars > aChars) return b;
+  if (!a.ok && b.ok) return b;
+  return a;
+}
+
+async function fetchOneSourceUrl(url: string): Promise<FetchedSourceEvidence> {
+  let best = await fetchOneSourceUrlOnce(url, SOURCE_FETCH_HEADERS_BROWSER);
+
+  const tryAlt = async () => {
+    const alt = await fetchOneSourceUrlOnce(url, SOURCE_FETCH_HEADERS_BOT);
+    best = preferBetterFetch(best, alt);
+  };
+
+  if (
+    !best.ok ||
+    best.status === 403 ||
+    best.status === 429 ||
+    (best.ok && (best.chars || 0) < SHORT_SOURCE_TEXT_CHARS)
+  ) {
+    await tryAlt();
+  }
+
+  if (isRetryableFetchFailure(best) || (best.ok && (best.chars || 0) < SHORT_SOURCE_TEXT_CHARS)) {
+    await delay(400);
+    const retry = await fetchOneSourceUrlOnce(url, SOURCE_FETCH_HEADERS_BOT);
+    best = preferBetterFetch(best, retry);
+    if (!best.ok || (best.chars || 0) < SHORT_SOURCE_TEXT_CHARS) {
+      const retryBrowser = await fetchOneSourceUrlOnce(url, SOURCE_FETCH_HEADERS_BROWSER);
+      best = preferBetterFetch(best, retryBrowser);
+    }
+  }
+
+  if (best.ok && (best.chars || 0) < SHORT_SOURCE_TEXT_CHARS) {
+    return {
+      ...best,
+      ok: false,
+      text: undefined,
+      chars: undefined,
+      error: `Page text too short after fetch (${best.chars || 0} chars) — likely bot/cookie wall`,
+    };
+  }
+  return best;
+}
+
+export async function fetchSourcesBoxEvidence(campaign: JsonObject): Promise<{
+  urls: string[];
+  results: FetchedSourceEvidence[];
+  pack: string;
+  fetchedOk: number;
+  fetchedFailed: number;
+  fetchErrors: Array<{ url: string; error: string; status?: number }>;
+}> {
+  const urls = extractSourceUrls(campaign);
+  if (!urls.length) {
+    return {
+      urls: [],
+      results: [],
+      fetchedOk: 0,
+      fetchedFailed: 0,
+      fetchErrors: [],
+      pack:
+        'Fetched Sources-box evidence:\n(none — no http(s) URLs found in the Sources box. Do not invent sources from description text. Mark unsupported claims Unverifiable, not false.)',
+    };
+  }
+
+  const results = await mapPool(urls, SOURCE_FETCH_CONCURRENCY, (url) => fetchOneSourceUrl(url));
+  let remaining = MAX_EVIDENCE_CHARS_TOTAL;
+  const blocks: string[] = [
+    'Fetched Sources-box evidence (EXCLUSIVE Fact-Check source set — ignore description-only citations):',
+  ];
+  let fetchedOk = 0;
+  let fetchedFailed = 0;
+  const fetchErrors: Array<{ url: string; error: string; status?: number }> = [];
+
+  results.forEach((row, index) => {
+    if (row.ok && row.text) {
+      fetchedOk += 1;
+      const slice = row.text.slice(0, Math.max(0, remaining));
+      remaining -= slice.length;
+      blocks.push(
+        `\n--- Source fetch ${index + 1} OK ---\nURL: ${row.url}${row.title ? `\nTitle: ${row.title}` : ''}\nExcerpt:\n${slice}${
+          slice.length < row.text.length ? '…' : ''
+        }`
+      );
+    } else {
+      fetchedFailed += 1;
+      fetchErrors.push({
+        url: row.url,
+        error: (row.error || 'unknown').slice(0, 200),
+        status: row.status,
+      });
+      blocks.push(
+        `\n--- Source fetch ${index + 1} FAILED ---\nURL: ${row.url}\nError: ${row.error || 'unknown'}${
+          row.status != null ? ` (HTTP ${row.status})` : ''
+        }\nTreat this Sources-box item as listed-but-unread; do not invent its contents or replace it with open-web results.`
+      );
+    }
+  });
+
+  return { urls, results, pack: blocks.join('\n'), fetchedOk, fetchedFailed, fetchErrors };
+}
+
 function slideshowDescriptions(raw: unknown): string[] {
   return asArray(raw)
     .map((slide) => text(asObject(slide).description))
@@ -726,7 +1089,9 @@ export function buildCampaignContent(campaign: JsonObject): string {
 
   const sources = sourceList(campaign.campaign_sources ?? campaign.sources);
   if (sources.length) {
-    parts.push(`Sources:\n${sources.map((source, i) => `${i + 1}. ${source}`).join('\n')}`);
+    parts.push(`Sources box (authoritative source list):\n${sources.map((source, i) => `${i + 1}. ${source}`).join('\n')}`);
+  } else {
+    parts.push('Sources box (authoritative source list):\n(none provided)');
   }
 
   const slides = slideshowDescriptions(campaign.hero_slideshow);
@@ -740,7 +1105,7 @@ export function buildCampaignContent(campaign: JsonObject): string {
 function buildPrompt(
   promptTemplate: string,
   campaign: JsonObject,
-  options?: { externalResearch?: boolean }
+  options?: { externalResearch?: boolean; evidencePack?: string }
 ): string {
   const campaignContent = buildCampaignContent(campaign);
   const template = promptTemplate.trim() || FALLBACK_PROMPT;
@@ -753,7 +1118,11 @@ function buildPrompt(
     prompt = `${template}\n\nCampaign to evaluate:\n---\n${campaignContent}\n---`;
   }
   const addendum = options?.externalResearch ? EXTERNAL_RESEARCH_ADDENDUM : NO_RESEARCH_CLARIFICATION;
-  return `${prompt}\n\n${addendum}`;
+  const evidence =
+    options?.externalResearch && options.evidencePack
+      ? `\n\n================================================================\nSOURCES-BOX EVIDENCE PACK\n================================================================\n${options.evidencePack}`
+      : '';
+  return `${prompt}\n\n${addendum}${evidence}`;
 }
 
 async function loadPromptFromFirestore(db: Firestore, promptDocId: string): Promise<string> {
@@ -1106,16 +1475,10 @@ async function generatePrescreenGemini(
 ): Promise<PrescreenGenerationResult> {
   const externalResearch = callOptions?.externalResearch === true;
   const timeoutMs = externalResearch ? RESEARCH_TIMEOUT_MS : TIMEOUT_MS;
+  // Sources-box research prefetches URL text into the prompt — no open-web tools.
   const model = vertexAI.getGenerativeModel({
     model: modelName,
-    generationConfig: { temperature: 1.0 },
-    ...(externalResearch
-      ? {
-          // Newer Gemini models require `googleSearch` (not legacy `googleSearchRetrieval`).
-          // SDK typings still lag the API, so cast through unknown.
-          tools: [{ googleSearch: {} } as unknown as import('@google-cloud/vertexai').Tool],
-        }
-      : {}),
+    generationConfig: { temperature: 0.5 },
   });
 
   return traceGeminiCall({
@@ -1124,7 +1487,7 @@ async function generatePrescreenGemini(
     tags: [
       'uuts-prescreen',
       'gemini',
-      externalResearch ? 'external-research' : 'cited-only',
+      externalResearch ? 'sources-box-research' : 'cited-only',
     ],
     metadata: {
       campaignId: metaStr(campaignId),
@@ -1134,6 +1497,7 @@ async function generatePrescreenGemini(
       promptName: metaStr(promptMeta?.promptName || '', 80),
       promptVersion: metaStr(promptMeta?.promptVersion ?? '', 20),
       externalResearch: externalResearch ? 'true' : 'false',
+      researchMode: externalResearch ? 'sources-box' : 'none',
     },
     input: {
       campaignId,
@@ -1178,6 +1542,7 @@ async function generatePrescreenGemini(
           sharedReality: snapshot.sharedReality?.score ?? null,
           schemaValid: health.schemaValid,
           externalResearch,
+          researchMode: externalResearch ? 'sources-box' : 'none',
           raw: responseText.length > 6000 ? `${responseText.slice(0, 6000)}…` : responseText,
         },
         usageDetails: extractVertexUsage(result),
@@ -1210,7 +1575,7 @@ async function generatePrescreenAnthropic(
     tags: [
       'uuts-prescreen',
       'anthropic',
-      externalResearch ? 'external-research' : 'cited-only',
+      externalResearch ? 'sources-box-research' : 'cited-only',
     ],
     metadata: {
       campaignId: metaStr(campaignId),
@@ -1220,6 +1585,7 @@ async function generatePrescreenAnthropic(
       promptName: metaStr(promptMeta?.promptName || '', 80),
       promptVersion: metaStr(promptMeta?.promptVersion ?? '', 20),
       externalResearch: externalResearch ? 'true' : 'false',
+      researchMode: externalResearch ? 'sources-box' : 'none',
     },
     input: {
       campaignId,
@@ -1232,20 +1598,8 @@ async function generatePrescreenAnthropic(
         client.messages.create({
           model: modelName,
           max_tokens: externalResearch ? ANTHROPIC_RESEARCH_MAX_TOKENS : ANTHROPIC_MAX_TOKENS,
-          temperature: 1.0,
+          temperature: 0.5,
           messages: [{ role: 'user', content: prompt }],
-          ...(externalResearch
-            ? {
-                // Server-side web search — Anthropic runs searches within this request.
-                tools: [
-                  {
-                    type: 'web_search_20250305' as const,
-                    name: 'web_search' as const,
-                    max_uses: ANTHROPIC_WEB_SEARCH_MAX_USES,
-                  },
-                ],
-              }
-            : {}),
         }),
         timeoutMs
       );
@@ -1271,14 +1625,6 @@ async function generatePrescreenAnthropic(
         promptName: promptMeta?.promptName,
         promptVersion: promptMeta?.promptVersion,
       });
-      const webSearchRequests =
-        result.usage &&
-        'server_tool_use' in result.usage &&
-        result.usage.server_tool_use &&
-        typeof (result.usage.server_tool_use as { web_search_requests?: number }).web_search_requests ===
-          'number'
-          ? (result.usage.server_tool_use as { web_search_requests: number }).web_search_requests
-          : undefined;
       return {
         result: { snapshot, langfuseTraceId: getActiveLangfuseTraceId() },
         output: {
@@ -1290,7 +1636,7 @@ async function generatePrescreenAnthropic(
           sharedReality: snapshot.sharedReality?.score ?? null,
           schemaValid: health.schemaValid,
           externalResearch,
-          webSearchRequests: webSearchRequests ?? null,
+          researchMode: externalResearch ? 'sources-box' : 'none',
           raw: responseText.length > 6000 ? `${responseText.slice(0, 6000)}…` : responseText,
         },
         usageDetails: {
@@ -1349,7 +1695,34 @@ export async function runUutsPrescreenAndPersist({
   const modelOption = resolveUutsModel(requestedModel);
   const externalResearch = externalResearchRaw === true;
   const promptSource = await loadPrompt(db, promptDocId);
-  const prompt = buildPrompt(promptSource.template, campaign, { externalResearch });
+
+  let evidencePack = '';
+  let sourcesFetchedOk = 0;
+  let sourcesFetchedFailed = 0;
+  let sourcesUrlCount = 0;
+  let sourcesFetchErrors: Array<{ url: string; error: string; status?: number }> = [];
+  if (externalResearch) {
+    const evidence = await fetchSourcesBoxEvidence(campaign);
+    evidencePack = evidence.pack;
+    sourcesFetchedOk = evidence.fetchedOk;
+    sourcesFetchedFailed = evidence.fetchedFailed;
+    sourcesUrlCount = evidence.urls.length;
+    sourcesFetchErrors = evidence.fetchErrors.slice(0, 20);
+    console.log(
+      `UUTS sources-box research for ${campaignId}: ${sourcesUrlCount} urls, ${sourcesFetchedOk} ok, ${sourcesFetchedFailed} failed`
+    );
+    if (sourcesFetchErrors.length) {
+      console.warn(
+        `UUTS sources-box fetch failures for ${campaignId}:`,
+        sourcesFetchErrors.map((row) => `${row.url} → ${row.error}`).join(' | ')
+      );
+    }
+  }
+
+  const prompt = buildPrompt(promptSource.template, campaign, {
+    externalResearch,
+    evidencePack: externalResearch ? evidencePack : undefined,
+  });
   const category = text(campaign.category);
   let attempts = 0;
 
@@ -1360,6 +1733,11 @@ export async function runUutsPrescreenAndPersist({
     uuts_prescreen_model: modelOption.id,
     uuts_prescreen_provider: modelOption.provider,
     uuts_prescreen_external_research: externalResearch,
+    uuts_prescreen_research_mode: externalResearch ? 'sources-box' : null,
+    uuts_prescreen_sources_fetched_ok: externalResearch ? sourcesFetchedOk : null,
+    uuts_prescreen_sources_fetched_failed: externalResearch ? sourcesFetchedFailed : null,
+    uuts_prescreen_sources_url_count: externalResearch ? sourcesUrlCount : null,
+    uuts_prescreen_sources_fetch_errors: externalResearch ? sourcesFetchErrors : null,
     uuts_prescreen_prompt_source: promptSource.source,
     uuts_prescreen_prompt_version: promptSource.promptVersion ?? null,
     uuts_prescreen_started_at: nowIso(),
@@ -1413,7 +1791,7 @@ export async function runUutsPrescreenAndPersist({
         reviewedAt: nowIso(),
         reviewer: 'UUTS Pre-screening skill',
       },
-      createdBy: externalResearch ? 'uuts-prescreen-research' : 'uuts-prescreen',
+      createdBy: externalResearch ? 'uuts-prescreen-external-research' : 'uuts-prescreen',
       model: modelOption.id,
       provider: modelOption.provider,
       refresh: true,
