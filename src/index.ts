@@ -51,6 +51,7 @@ import {
   isUutsPrescreenEnabled,
   isUutsPublishLiveEnabled,
   isUutsSchedulerEnabled,
+  parseExternalResearchFlag,
   resolveUutsModel,
   runUutsPrescreenAndPersist,
   runUutsPrescreenScheduler,
@@ -2438,7 +2439,9 @@ app.post('/data/campaigns/:id/trust-report/refresh', async (req: Request, res: R
  * POST enqueue a new async UUTS pre-screen run for an existing campaign.
  * Always allowed (manual Admin test path). Auto-run on submit remains gated by
  * UUTS_PRESCREEN_ENABLED — this endpoint does not require that flag.
- * Body (optional): { model?: string } — allowlisted Gemini or Claude Opus id.
+ * Body (optional): { model?: string, externalResearch?: boolean }
+ *   - externalResearch: when true, fetch Sources-box URLs only and score Fact-Check
+ *     against that pack (no open-web search; description-only citations are ignored).
  */
 app.post('/data/campaigns/:id/uuts-prescreen/refresh', async (req: Request, res: Response) => {
   try {
@@ -2454,6 +2457,7 @@ app.post('/data/campaigns/:id/uuts-prescreen/refresh', async (req: Request, res:
       const status = typeof err?.status === 'number' ? err.status : 400;
       return res.status(status).json({ error: err.message || 'Invalid model' });
     }
+    const externalResearch = parseExternalResearchFlag(body.externalResearch);
     const campaignRef = db.collection('campaigns').doc(campaignId);
     const campaignSnap = await campaignRef.get();
     if (!campaignSnap.exists) {
@@ -2467,6 +2471,7 @@ app.post('/data/campaigns/:id/uuts-prescreen/refresh', async (req: Request, res:
       uuts_prescreen_error: null,
       uuts_prescreen_model: modelOption.id,
       uuts_prescreen_provider: modelOption.provider,
+      uuts_prescreen_external_research: externalResearch,
       uuts_prescreen_updated_at: queuedAt,
       updatedAt: queuedAt,
     });
@@ -2478,6 +2483,7 @@ app.post('/data/campaigns/:id/uuts-prescreen/refresh', async (req: Request, res:
       campaign,
       promptDocId: AI_PROMPTS_DOC_ID,
       model: modelOption.id,
+      externalResearch,
     }).catch((err) =>
       console.error('UUTS pre-screen refresh background task error:', err)
     );
@@ -2488,6 +2494,7 @@ app.post('/data/campaigns/:id/uuts-prescreen/refresh', async (req: Request, res:
       uuts_prescreen_status: 'queued',
       model: modelOption.id,
       provider: modelOption.provider,
+      externalResearch,
       source: 'manual',
     });
   } catch (error) {
@@ -2511,7 +2518,7 @@ app.get('/uuts-prescreen/config', async (_req: Request, res: Response) => {
 /**
  * POST batch UUTS re-score (Cloud Scheduler). Creates draft versions only.
  * Gated by UUTS_SCHEDULER_ENABLED (default off).
- * Body/query: dryRun, limit, campaignId(s), model.
+ * Body/query: dryRun, limit, campaignId(s), model, externalResearch.
  */
 app.post('/uuts-prescreen/run', async (req: Request, res: Response) => {
   try {
@@ -2542,6 +2549,9 @@ app.post('/uuts-prescreen/run', async (req: Request, res: Response) => {
         : typeof query.model === 'string'
           ? query.model
           : null;
+    const externalResearch = parseExternalResearchFlag(
+      body.externalResearch ?? query.externalResearch
+    );
 
     const result = await runUutsPrescreenScheduler({
       db,
@@ -2550,6 +2560,7 @@ app.post('/uuts-prescreen/run', async (req: Request, res: Response) => {
       limit,
       campaignIds,
       model,
+      externalResearch,
       promptDocId: AI_PROMPTS_DOC_ID,
     });
     res.json(result);

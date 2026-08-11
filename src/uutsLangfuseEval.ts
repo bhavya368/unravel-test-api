@@ -221,6 +221,29 @@ export function scoreActiveUutsFailure(parseError: string): void {
 }
 
 /**
+ * Langfuse sometimes holds a short stub without the full UUTS rubric/JSON schema.
+ * Those stubs cause incomplete outputs (especially with web search). Reject them so we
+ * fall through to Firestore / the hardcoded fallback.
+ */
+export function isCompleteUutsRubric(template: string): boolean {
+  const t = (template || '').toLowerCase();
+  if (t.trim().length < 1500) return false;
+  const hasFact =
+    t.includes('factcheck') || t.includes('fact-check') || t.includes('fact_check') || t.includes('layer 1');
+  const hasComms =
+    t.includes('commsintegrity') ||
+    t.includes('communication integrity') ||
+    t.includes('comms_integrity') ||
+    t.includes('layer 2');
+  const hasSchema =
+    t.includes('"claims"') ||
+    t.includes('atomic claims') ||
+    t.includes('"dims"') ||
+    t.includes('return only valid json');
+  return hasFact && hasComms && hasSchema;
+}
+
+/**
  * Load UUTS prompt template.
  * Order when source=auto (default): Langfuse production → Firestore → hardcoded fallback.
  */
@@ -248,6 +271,13 @@ export async function loadUutsPromptTemplate(opts: {
             ? (raw as Array<{ content?: string }>).map((m) => m.content || '').join('\n\n')
             : '';
       if (!compiled.trim()) return null;
+      if (!isCompleteUutsRubric(compiled)) {
+        console.warn(
+          `[UUTS] Langfuse prompt "${UUTS_LANGFUSE_PROMPT_NAME}" v${prompt.version} is incomplete ` +
+            `(missing full rubric/schema, ${compiled.trim().length} chars); falling through`
+        );
+        return null;
+      }
       return {
         template: compiled,
         source: 'langfuse',
@@ -269,6 +299,12 @@ export async function loadUutsPromptTemplate(opts: {
 
   if (mode === 'firestore') {
     const template = await opts.firestoreLoader();
+    if (template !== opts.fallback && !isCompleteUutsRubric(template)) {
+      console.warn(
+        `[UUTS] Firestore prompt is incomplete (${template.trim().length} chars); using hardcoded fallback`
+      );
+      return { template: opts.fallback, source: 'fallback' };
+    }
     return { template, source: template === opts.fallback ? 'fallback' : 'firestore' };
   }
 
@@ -276,6 +312,12 @@ export async function loadUutsPromptTemplate(opts: {
   const fromLf = await tryLangfuse();
   if (fromLf) return fromLf;
   const template = await opts.firestoreLoader();
+  if (template !== opts.fallback && !isCompleteUutsRubric(template)) {
+    console.warn(
+      `[UUTS] Firestore prompt is incomplete (${template.trim().length} chars); using hardcoded fallback`
+    );
+    return { template: opts.fallback, source: 'fallback' };
+  }
   return { template, source: template === opts.fallback ? 'fallback' : 'firestore' };
 }
 
