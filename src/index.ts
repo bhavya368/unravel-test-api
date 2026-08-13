@@ -30,6 +30,9 @@ import { runCampaignReportDrips, parseCampaignReportDripRequest } from './campai
 import { runCampaignUrgentWindow, parseUrgentWindowRequest } from './campaignUrgentWindow';
 import { sendContributionReceipt, AD_AMPLIFICATION_SPLIT } from './contributionReceipt';
 import {
+  audienceSizeToCampaignPatch,
+  DEFAULT_FACEBOOK_TARGETING,
+  fetchAudienceSizeEstimateSafe,
   fetchFacebookAdInsights,
   insightsToCampaignPatch,
   syncAllPublishedCampaignFacebookInsights,
@@ -2892,6 +2895,9 @@ app.get('/data/:collection/:id', async (req: Request, res: Response) => {
       out.facebook_frequency = data.facebook_frequency ?? null;
       out.facebook_spend = data.facebook_spend ?? null;
       out.facebook_insights_updated_at = data.facebook_insights_updated_at ?? null;
+      out.facebook_audience_size_lower_bound = data.facebook_audience_size_lower_bound ?? null;
+      out.facebook_audience_size_upper_bound = data.facebook_audience_size_upper_bound ?? null;
+      out.facebook_audience_size_updated_at = data.facebook_audience_size_updated_at ?? null;
     }
 
     const response =
@@ -5779,11 +5785,7 @@ status: 'PAUSED',
   const start = new Date();
   const end = new Date();
   end.setDate(end.getDate() + 3);
-  const targeting = {
-    geo_locations: { countries: ['US'] },
-    publisher_platforms: ['facebook', 'audience_network'],
-    facebook_positions: ['feed'],
-  };
+  const targeting = { ...DEFAULT_FACEBOOK_TARGETING };
   let adSetId: string;
   try {
     const adSet = await account.createAdSet([], {
@@ -5839,11 +5841,17 @@ status: 'PAUSED',
     throw new Error(getFacebookErrorMessage(err, 'Create Ad'));
   }
 
+  const audienceSize = await fetchAudienceSizeEstimateSafe(
+    accessToken,
+    targeting as unknown as Record<string, unknown>
+  );
+
   await db.collection('campaigns').doc(campaignId).update({
     facebook_ad_id: adId,
     facebook_campaign_id: fbCampaignId,
     facebook_ad_set_id: adSetId,
     facebook_published_at: new Date(),
+    ...(audienceSize ? audienceSizeToCampaignPatch(audienceSize) : {}),
   });
 
   return { campaignId: fbCampaignId, adId };
@@ -5885,13 +5893,33 @@ app.get('/facebook/campaign/:campaignId/insights', async (req: Request, res: Res
     }
 
     const { summary, rows } = await fetchFacebookAdInsights(facebookAdId, accessToken);
+    const audienceSize = await fetchAudienceSizeEstimateSafe(accessToken);
 
     // Persist latest metrics so GET /data/campaigns/:id and impact reports use real numbers.
     try {
-      await db.collection('campaigns').doc(campaignId).update(insightsToCampaignPatch(summary));
+      await db.collection('campaigns').doc(campaignId).update({
+        ...insightsToCampaignPatch(summary),
+        ...(audienceSize ? audienceSizeToCampaignPatch(audienceSize) : {}),
+      });
     } catch (persistErr) {
       console.error('Failed to persist Facebook insights to campaign:', persistErr);
     }
+
+    const storedLower = Number(data?.facebook_audience_size_lower_bound ?? 0);
+    const storedUpper = Number(data?.facebook_audience_size_upper_bound ?? 0);
+    const audienceSizePayload = audienceSize
+      ? {
+          lower_bound: audienceSize.lowerBound,
+          upper_bound: audienceSize.upperBound,
+          estimate_ready: audienceSize.estimateReady,
+        }
+      : storedLower > 0 && storedUpper > 0
+        ? {
+            lower_bound: storedLower,
+            upper_bound: storedUpper,
+            estimate_ready: data?.facebook_audience_size_estimate_ready !== false,
+          }
+        : null;
 
     return res.json({
       campaignId,
@@ -5914,6 +5942,7 @@ app.get('/facebook/campaign/:campaignId/insights', async (req: Request, res: Res
         total_actions: summary.totalActions,
         actions: summary.actions,
       },
+      audience_size: audienceSizePayload,
       rows,
     });
   } catch (error: any) {
@@ -5937,6 +5966,13 @@ app.post('/facebook/campaign/:campaignId/sync-insights', async (req: Request, re
       campaignId: result.campaignId,
       facebookAdId: result.facebookAdId,
       insights: insightsToCampaignPatch(result.summary),
+      audience_size: result.audienceSize
+        ? {
+            lower_bound: result.audienceSize.lowerBound,
+            upper_bound: result.audienceSize.upperBound,
+            estimate_ready: result.audienceSize.estimateReady,
+          }
+        : null,
       breakdowns: Object.fromEntries(
         Object.entries(result.breakdowns).map(([key, rows]) => [key, rows?.length ?? 0])
       ),

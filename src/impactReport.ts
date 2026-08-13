@@ -14,6 +14,7 @@ import {
   getCampaignPerceptionShiftSource,
   getCampaignTotalContributionCents,
   computePersonalAttribution,
+  computePersonalSaturation,
   filterContributionsByTimeRange,
   buildCumulativeTimeSeries,
   buildCampaignTimeSeries,
@@ -113,6 +114,8 @@ export function computeCumulativePersonalImpactResponse({
   let shiftSum = 0;
   let trustSum = 0;
   let campaignCount = 0;
+  let saturationSum = 0;
+  let saturationCount = 0;
   const campaignSummaries: Record<string, unknown>[] = [];
 
   for (const g of grouped) {
@@ -140,11 +143,21 @@ export function computeCumulativePersonalImpactResponse({
       perceptionShiftPct: shift,
     });
 
+    const saturation = computePersonalSaturation(
+      attr.personalAdViews,
+      campaign,
+      adViews.source
+    );
+
     totalReach += attr.personalAdViews;
     totalActions += attr.personalActions;
     shiftSum += shift;
     if (trust) trustSum += trust;
     campaignCount += 1;
+    if (saturation) {
+      saturationSum += saturation.value;
+      saturationCount += 1;
+    }
 
     campaignSummaries.push({
       campaignId: g.campaignId,
@@ -166,6 +179,8 @@ export function computeCumulativePersonalImpactResponse({
       category: campaign.category ?? null,
       reachSource: adViews.source,
       viewsSource: adViews.source,
+      saturation: saturation?.value ?? null,
+      saturationSource: saturation?.source ?? null,
     });
   }
 
@@ -179,6 +194,8 @@ export function computeCumulativePersonalImpactResponse({
     totalActions,
     avgPerceptionShift: campaignCount ? Math.round((shiftSum / campaignCount) * 10) / 10 : 0,
     avgTrustScore: campaignCount && trustSum ? Math.round(trustSum / campaignCount) : null,
+    saturation: saturationCount ? saturationSum / saturationCount : null,
+    saturationSource: saturationCount ? 'actual' : null,
     campaignsBacked: campaignCount,
     campaignSummaries,
     timeSeries: buildCumulativeTimeSeries(filtered, campaignsById, insightsById, rangeId),
@@ -224,6 +241,12 @@ export function computePerCampaignPersonalImpactResponse({
     perceptionShiftPct: shift,
   });
 
+  const saturation = computePersonalSaturation(
+    attr.personalAdViews,
+    campaign,
+    adViews.source
+  );
+
   return {
     totalContributedCents: totalCents,
     personalReach: attr.personalAdViews,
@@ -240,6 +263,8 @@ export function computePerCampaignPersonalImpactResponse({
     netRating: getCampaignNetRating(campaign),
     reachSource: adViews.source,
     viewsSource: adViews.source,
+    saturation: saturation?.value ?? null,
+    saturationSource: saturation?.source ?? null,
     timeSeries: buildCampaignTimeSeries(campaign, insights, rangeId).map((p) => ({
       ...p,
       reach: Math.round(p.reach * attr.share),

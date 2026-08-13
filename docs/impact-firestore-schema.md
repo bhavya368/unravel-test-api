@@ -45,6 +45,18 @@ Written on successful Stripe checkout when the donor was signed in (`donorUid`).
 | `facebook_total_actions` | number? | Sum of Meta `actions` array |
 | `facebook_actions` | array? | `{ action_type, value }[]` from Meta |
 | `facebook_insights_updated_at` | string? | Same |
+| `facebook_audience_size_lower_bound` | number? | Meta Estimated Audience Size (`/reachestimate`) |
+| `facebook_audience_size_upper_bound` | number? | Same |
+| `facebook_audience_size_estimate_ready` | boolean? | Same |
+| `facebook_audience_size_updated_at` | string? | Same |
+
+### Saturation
+
+```
+saturation_pct = total_reach / ((lower_bound + upper_bound) / 2) × 100
+```
+
+`total_reach` is Meta unique reach (`facebook_reach` / `getCampaignReach`). Denominator is the midpoint of the Estimated Audience Size range.
 
 ### `campaigns/{id}/facebook_insight_breakdowns/{type}`
 
