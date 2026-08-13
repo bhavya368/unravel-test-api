@@ -1,6 +1,7 @@
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import morgan from 'morgan';
+import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
 import { initializeApp, applicationDefault, getApp } from 'firebase-admin/app';
 import { FieldValue, getFirestore } from 'firebase-admin/firestore';
@@ -85,6 +86,14 @@ import {
   recordShareLinkVisit,
   sanitizeShareRef,
 } from './shareAttribution';
+import {
+  validatePartnerApplication,
+  validateJobApplication,
+  validateContactMessage,
+  sendContactConfirmationEvent,
+  sendSubmissionConfirmationEvent,
+  RESUME_MAX_BYTES,
+} from './formSubmissions';
 
 declare global {
   namespace Express {
@@ -6012,6 +6021,248 @@ app.post('/facebook/sync-insights', async (req: Request, res: Response) => {
     const message = error?.message || 'Failed to sync Facebook insights';
     console.error('Facebook bulk sync-insights error:', message, error);
     return res.status(500).json({ error: message });
+  }
+});
+
+// ============ PARTNERS / CAREERS / CONTACT FORM SUBMISSIONS ============
+// Public-facing forms (still gated by the shared x-api-key like every other route — see
+// validateApiKey above). Rate-limited + honeypot-checked per the engineering spec's open
+// question on spam protection ("at minimum needs rate limiting").
+
+/** 5 submissions per 15 minutes per IP, shared across all 3 form routes. */
+const formSubmissionLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many submissions from this device. Please try again in a few minutes.' },
+});
+
+/** Hidden `website` field — real users never see or fill it in; a filled value means a bot. */
+function isHoneypotTripped(body: Record<string, unknown>): boolean {
+  return typeof body.website === 'string' && body.website.trim().length > 0;
+}
+
+app.post('/api/partner-applications', formSubmissionLimiter, async (req: Request, res: Response) => {
+  try {
+    const body = (req.body || {}) as Record<string, unknown>;
+    if (isHoneypotTripped(body)) {
+      // Bot caught by the honeypot — accept quietly so it doesn't learn to avoid the field.
+      return res.status(201).json({ id: 'ignored', status: 'received' });
+    }
+    const result = validatePartnerApplication(body);
+    if ('errors' in result) {
+      return res.status(400).json({ error: 'Validation failed', errors: result.errors });
+    }
+    const { data } = result;
+
+    const docRef = await db.collection('partner_applications').add({
+      ...data,
+      submittedAt: FieldValue.serverTimestamp(),
+      status: 'received',
+    });
+
+    try {
+      await slack.chat.postMessage({
+        channel: process.env.SLACK_CHANNEL || 'moderation',
+        text: `🤝 New Partner Application — ${data.partnershipType}`,
+        blocks: [
+          { type: 'header', text: { type: 'plain_text', text: '🤝 New Partner Application' } },
+          {
+            type: 'section',
+            fields: [
+              { type: 'mrkdwn', text: `*Name:*\n${data.fullName}` },
+              { type: 'mrkdwn', text: `*Email:*\n${data.email}` },
+              { type: 'mrkdwn', text: `*Type:*\n${data.partnershipType}` },
+              { type: 'mrkdwn', text: `*Org/Channel:*\n${data.orgOrChannelName}` },
+            ],
+          },
+          { type: 'section', text: { type: 'mrkdwn', text: `*Link:*\n${data.link}` } },
+          { type: 'section', text: { type: 'mrkdwn', text: `*About their work:*\n${data.aboutWork}` } },
+          {
+            type: 'context',
+            elements: [
+              { type: 'mrkdwn', text: `Application ID: \`${docRef.id}\`` },
+              ...(data.source ? [{ type: 'mrkdwn' as const, text: `Source: \`${data.source}\`` }] : []),
+            ],
+          },
+        ],
+      });
+    } catch (slackError) {
+      console.error('[partner-applications] Slack notification failed:', slackError);
+    }
+
+    try {
+      await sendSubmissionConfirmationEvent({
+        email: data.email,
+        fullName: data.fullName,
+        submissionType: 'partner',
+        partnershipType: data.partnershipType,
+        orgOrChannelName: data.orgOrChannelName,
+      });
+    } catch (klaviyoError) {
+      console.error('[partner-applications] confirmation email failed:', klaviyoError);
+    }
+
+    res.status(201).json({ id: docRef.id, status: 'received' });
+  } catch (error) {
+    console.error('Error creating partner application:', error);
+    res.status(500).json({ error: 'Could not submit partner application' });
+  }
+});
+
+app.post('/api/job-applications', formSubmissionLimiter, async (req: Request, res: Response) => {
+  try {
+    const body = (req.body || {}) as Record<string, unknown>;
+    if (isHoneypotTripped(body)) {
+      return res.status(201).json({ id: 'ignored', status: 'received' });
+    }
+    const result = validateJobApplication(body);
+    if ('errors' in result) {
+      return res.status(400).json({ error: 'Validation failed', errors: result.errors });
+    }
+    const { data } = result;
+
+    // Resume upload: same base64-in-JSON → GCS pattern as /upload-campaign-image, so it's
+    // served back by the existing public /images/:fileName route with no new serving code.
+    let resumeUrl: string | null = null;
+    if (data.resumeBase64 && data.resumeMimeType) {
+      let rawBase64 = data.resumeBase64;
+      const dataUrlMatch = rawBase64.match(/^data:([^;]+);base64,(.+)$/i);
+      if (dataUrlMatch) rawBase64 = dataUrlMatch[2];
+      const buffer = Buffer.from(rawBase64, 'base64');
+      if (buffer.length > RESUME_MAX_BYTES) {
+        return res.status(400).json({ error: 'Validation failed', errors: { resume: 'Resume must be under 10MB.' } });
+      }
+      const ext =
+        data.resumeMimeType === 'application/pdf'
+          ? 'pdf'
+          : data.resumeMimeType === 'application/msword'
+            ? 'doc'
+            : 'docx';
+      const bucketName = process.env.GCS_BUCKET || 'unravel-generated-images';
+      const bucket = storage.bucket(bucketName);
+      const fileName = `resume-${Date.now()}-${Math.random().toString(36).substring(2, 9)}.${ext}`;
+      const file = bucket.file(fileName);
+      await file.save(buffer, { metadata: { contentType: data.resumeMimeType } });
+      const baseUrl = process.env.API_BASE_URL || `${req.protocol}://${req.get('host')}`;
+      resumeUrl = `${baseUrl}/images/${fileName}`;
+    }
+
+    const docRef = await db.collection('job_applications').add({
+      fullName: data.fullName,
+      email: data.email,
+      linkedinUrl: data.linkedinUrl,
+      whyUnravel: data.whyUnravel,
+      roleId: data.roleId,
+      resumeUrl,
+      resumeFileName: data.resumeFileName,
+      submittedAt: FieldValue.serverTimestamp(),
+      status: 'received',
+    });
+
+    try {
+      await slack.chat.postMessage({
+        channel: process.env.SLACK_CHANNEL || 'moderation',
+        text: `📋 New Job Application — ${data.roleId || 'General talent pool'}`,
+        blocks: [
+          { type: 'header', text: { type: 'plain_text', text: '📋 New Job Application' } },
+          {
+            type: 'section',
+            fields: [
+              { type: 'mrkdwn', text: `*Name:*\n${data.fullName}` },
+              { type: 'mrkdwn', text: `*Email:*\n${data.email}` },
+              { type: 'mrkdwn', text: `*Role:*\n${data.roleId || 'General talent pool'}` },
+              { type: 'mrkdwn', text: `*LinkedIn:*\n${data.linkedinUrl || 'N/A'}` },
+            ],
+          },
+          { type: 'section', text: { type: 'mrkdwn', text: `*Why Unravel:*\n${data.whyUnravel}` } },
+          ...(resumeUrl
+            ? [{ type: 'section' as const, text: { type: 'mrkdwn' as const, text: `*Resume:*\n<${resumeUrl}|Download>` } }]
+            : []),
+          {
+            type: 'context',
+            elements: [{ type: 'mrkdwn', text: `Application ID: \`${docRef.id}\`` }],
+          },
+        ],
+      });
+    } catch (slackError) {
+      console.error('[job-applications] Slack notification failed:', slackError);
+    }
+
+    try {
+      await sendSubmissionConfirmationEvent({
+        email: data.email,
+        fullName: data.fullName,
+        submissionType: 'job',
+        roleId: data.roleId,
+      });
+    } catch (klaviyoError) {
+      console.error('[job-applications] confirmation email failed:', klaviyoError);
+    }
+
+    res.status(201).json({ id: docRef.id, status: 'received' });
+  } catch (error) {
+    console.error('Error creating job application:', error);
+    res.status(500).json({ error: 'Could not submit application' });
+  }
+});
+
+app.post('/api/contact', formSubmissionLimiter, async (req: Request, res: Response) => {
+  try {
+    const body = (req.body || {}) as Record<string, unknown>;
+    if (isHoneypotTripped(body)) {
+      return res.status(201).json({ id: 'ignored', status: 'received' });
+    }
+    const result = validateContactMessage(body);
+    if ('errors' in result) {
+      return res.status(400).json({ error: 'Validation failed', errors: result.errors });
+    }
+    const { data } = result;
+
+    const docRef = await db.collection('contact_messages').add({
+      ...data,
+      submittedAt: FieldValue.serverTimestamp(),
+      status: 'received',
+    });
+
+    try {
+      await slack.chat.postMessage({
+        channel: process.env.SLACK_CHANNEL || 'moderation',
+        text: `✉️ New Contact Message — ${data.topic}`,
+        blocks: [
+          { type: 'header', text: { type: 'plain_text', text: '✉️ New Contact Message' } },
+          {
+            type: 'section',
+            fields: [
+              { type: 'mrkdwn', text: `*Name:*\n${data.fullName}` },
+              { type: 'mrkdwn', text: `*Email:*\n${data.email}` },
+              { type: 'mrkdwn', text: `*Topic:*\n${data.topic}` },
+            ],
+          },
+          { type: 'section', text: { type: 'mrkdwn', text: `*Message:*\n${data.message}` } },
+          { type: 'context', elements: [{ type: 'mrkdwn', text: `Message ID: \`${docRef.id}\`` }] },
+        ],
+      });
+    } catch (slackError) {
+      console.error('[contact] Slack notification failed:', slackError);
+    }
+
+    try {
+      await sendContactConfirmationEvent({
+        email: data.email,
+        fullName: data.fullName,
+        topic: data.topic,
+        message: data.message,
+      });
+    } catch (klaviyoError) {
+      console.error('[contact] confirmation email failed:', klaviyoError);
+    }
+
+    res.status(201).json({ id: docRef.id, status: 'received' });
+  } catch (error) {
+    console.error('Error creating contact message:', error);
+    res.status(500).json({ error: 'Could not send message' });
   }
 });
 
