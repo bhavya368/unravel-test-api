@@ -37,6 +37,15 @@ Stored at `campaigns/{id}/facebook_insight_breakdowns/{type}`:
 | `result_rate` | `facebook_objective_result_rate` | Objective result rate |
 | `video_p75_watched_actions` | `facebook_video_p75_watched` | Video engagement |
 | `actions` (array) | `facebook_actions`, `facebook_total_actions` | Engagement breakdown; Actions counts shares, saves, follows, and link clicks |
+| Estimated Audience Size (`/reachestimate`) | `facebook_audience_size_lower_bound`, `facebook_audience_size_upper_bound` | Saturation denominator (midpoint of range) |
+
+## Saturation
+
+```
+saturation (%) = Meta unique reach / average(audience_size_lower, audience_size_upper) × 100
+```
+
+Audience size is fetched from Meta Ad Account `/reachestimate` during insights sync and ad publish.
 
 ## Sync endpoints
 

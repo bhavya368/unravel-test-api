@@ -45,6 +45,18 @@ Written on successful Stripe checkout when the donor was signed in (`donorUid`).
 | `facebook_total_actions` | number? | Sum of Meta `actions` array |
 | `facebook_actions` | array? | `{ action_type, value }[]` from Meta |
 | `facebook_insights_updated_at` | string? | Same |
+| `facebook_audience_size_lower_bound` | number? | Meta Estimated Audience Size (`/reachestimate`) |
+| `facebook_audience_size_upper_bound` | number? | Same |
+| `facebook_audience_size_estimate_ready` | boolean? | Same |
+| `facebook_audience_size_updated_at` | string? | Same |
+
+### Saturation
+
+```
+saturation_pct = total_reach / ((lower_bound + upper_bound) / 2) × 100
+```
+
+`total_reach` is Meta unique reach (`facebook_reach` / `getCampaignReach`). Denominator is the midpoint of the Estimated Audience Size range.
 
 ### `campaigns/{id}/facebook_insight_breakdowns/{type}`
 
@@ -100,15 +112,57 @@ Created by `POST /users/me/share-cards`. Public read via `GET /public/impact/:to
 | `createdAt` | string | ISO |
 | `revoked` | boolean | `true` → 410 on public GET |
 
+## `share_links/{ref}` (UE-188)
+
+Per-user (or guest) share attribution codes. Short opaque `ref` is the document id.
+
+| Field | Type | Notes |
+|-------|------|--------|
+| `ref` | string | Same as doc id (8-char) |
+| `campaignId` | string \| null | Campaign being shared (null for cumulative impact cards) |
+| `surface` | string | `campaign` \| `interstitial` \| `lander` \| `impact_card` |
+| `scope` | string? | `cumulative` \| `campaign` (impact cards) |
+| `shareCardToken` | string? | Linked `share_cards` token when surface is impact_card |
+| `sharerUid` | string \| null | Firebase uid; null for guest shares |
+| `guestDistinctId` | string \| null | PostHog distinct id when guest |
+| `createdAt` | string | ISO |
+| `revoked` | boolean | |
+| `stats.visits` | number | Non-crawler visits (excludes self) |
+| `stats.backs` | number | Attributed completed backs |
+| `stats.amountCents` | number | Gross cents from attributed backs |
+| `stats.reachDriven` | number | Estimated reach from attributed backs |
+
+Subcollection `share_links/{ref}/visits/{id}`: `visitedAt`, `visitorUid?`, `visitorDistinctId?`.
+
+## `share_attributions/{paymentId}`
+
+Idempotent ledger of attributed backs (keyed on PaymentIntent / coupon redemption id).
+
+| Field | Type | Notes |
+|-------|------|--------|
+| `share_ref` | string | |
+| `campaign_id` | string \| null | |
+| `amount_cents` | number | Gross |
+| `reach_driven` | number | |
+| `sharer_uid` | string \| null | |
+| `backer_uid` | string \| null | |
+| `attributed_at` | string | ISO |
+| `attribution_window_days` | number | Snapshot of config at attribution time |
+
+**Attribution window:** env `SHARE_ATTRIBUTION_WINDOW_DAYS` (default **7**), exposed at `GET /config/attribution`. First-touch `?ref=` persists client-side for this window; server attributes a back when a visit (or link creation fallback) falls inside the window.
+
 ## API endpoints (Scope B)
 
 | Method | Path | Auth |
 |--------|------|------|
-| GET | `/users/me/impact?range=all` | Firebase + API key |
-| GET | `/users/me/impact/:campaignId?range=all` | Firebase + API key |
-| POST | `/users/me/share-cards` | Firebase + API key |
+| GET | `/users/me/impact?range=all` | Firebase + API key — includes `shareStats` |
+| GET | `/users/me/impact/:campaignId?range=all` | Firebase + API key — includes per-campaign `shareStats` |
+| POST | `/users/me/share-cards` | Firebase + API key — response includes `ref` on URL |
 | GET | `/public/impact/:token` | None |
 | DELETE | `/users/me/share-cards/:token` | Firebase + API key |
+| POST | `/share-links` | API key; Firebase optional (guest via `posthogDistinctId`) |
+| POST | `/public/share-links/:ref/visit` | None |
+| GET | `/config/attribution` | None |
 | GET | `/facebook/campaign/:id/insights` | API key |
 | POST | `/facebook/campaign/:id/sync-insights` | API key — full sync + breakdowns |
 | POST | `/facebook/sync-insights` | API key — bulk sync all published campaigns |
@@ -117,6 +171,4 @@ Created by `POST /users/me/share-cards`. Public read via `GET /public/impact/:to
 
 ## Frontend
 
-Dashboards default to **demo data** when `VITE_DEMO_IMPACT` is not `false` (see unravel-ui `.env`).
-
-Demo share tokens (`demo`, `demo-campaign`) are client-only and do not use Firestore.
+Personal impact dashboards load live data from `/users/me/impact*`. Share surfaces append `?ref=` from `POST /share-links` (or the `ref` returned with impact share cards).

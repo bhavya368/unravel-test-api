@@ -30,6 +30,9 @@ import { runCampaignReportDrips, parseCampaignReportDripRequest } from './campai
 import { runCampaignUrgentWindow, parseUrgentWindowRequest } from './campaignUrgentWindow';
 import { sendContributionReceipt, AD_AMPLIFICATION_SPLIT } from './contributionReceipt';
 import {
+  audienceSizeToCampaignPatch,
+  DEFAULT_FACEBOOK_TARGETING,
+  fetchAudienceSizeEstimateSafe,
   fetchFacebookAdInsights,
   insightsToCampaignPatch,
   syncAllPublishedCampaignFacebookInsights,
@@ -73,6 +76,15 @@ import {
   summarizePollAggregates,
   upsertPollAnswer,
 } from './campaignPolls';
+import {
+  attributeShareBack,
+  createOrGetShareLink,
+  getShareAttributionWindowDays,
+  isShareSurface,
+  loadShareStatsForUser,
+  recordShareLinkVisit,
+  sanitizeShareRef,
+} from './shareAttribution';
 
 declare global {
   namespace Express {
@@ -145,6 +157,8 @@ interface BackingInput {
   utmMedium: string | null;
   utmTerm: string | null;
   utmContent: string | null;
+  /** UE-188: per-user share ref carried through checkout metadata */
+  shareRef: string | null;
   source: string; // which event produced this
 }
 
@@ -179,12 +193,32 @@ async function upsertBacking(input: BackingInput): Promise<void> {
       utm_medium: input.utmMedium,
       utm_term: input.utmTerm,
       utm_content: input.utmContent,
+      ...(input.shareRef ? { share_ref: input.shareRef } : {}),
       source: input.source,
       created_at: new Date().toISOString(),
     });
   });
 
   if (!isNew) return; // only the first delivery emits the event
+
+  // UE-188: attribute the back to the sharer's ref when within the config window.
+  try {
+    await attributeShareBack(
+      db,
+      {
+        shareRef: input.shareRef,
+        campaignId: input.campaignId,
+        // Gross contribution: charged + discount (zero-balance coupon path has charged=0).
+        amountCents: (input.amountTotal || 0) + (input.amountDiscount || 0),
+        backerUid: input.firebaseUid,
+        backerDistinctId: input.distinctId,
+        paymentIdKey: input.idKey,
+      },
+      getPostHog()
+    );
+  } catch (e) {
+    console.warn('[share] attributeShareBack failed:', e instanceof Error ? e.message : e);
+  }
 
   // Best-effort is_first_backing for logged-in users: any earlier coupon backing?
   let isFirstBacking = false;
@@ -235,6 +269,7 @@ async function upsertBacking(input: BackingInput): Promise<void> {
         utm_medium: input.utmMedium,
         utm_term: input.utmTerm,
         utm_content: input.utmContent,
+        ...(input.shareRef ? { share_ref: input.shareRef } : {}),
         // $set rides the same event, so the person — and this event's person
         // snapshot — carry the username the moment the backing is ingested.
         ...(username ? { $set: { username } } : {}),
@@ -282,6 +317,7 @@ async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session):
     utmMedium: cleanStr(md.utm_medium),
     utmTerm: cleanStr(md.utm_term),
     utmContent: cleanStr(md.utm_content),
+    shareRef: sanitizeShareRef(md.share_ref),
     source: 'checkout.session.completed',
   });
 }
@@ -316,6 +352,7 @@ async function handlePaymentIntentSucceeded(pi: Stripe.PaymentIntent): Promise<v
     utmMedium: cleanStr(md.utm_medium),
     utmTerm: cleanStr(md.utm_term),
     utmContent: cleanStr(md.utm_content),
+    shareRef: sanitizeShareRef(md.share_ref),
     source: 'payment_intent.succeeded',
   });
 }
@@ -811,6 +848,21 @@ app.get('/config/analytics', (_req: Request, res: Response) => {
   });
 });
 
+/**
+ * UE-188: share-ref attribution window (default 7 days).
+ * Client persists `ref` for this many days and the server uses the same window
+ * when attributing completed backs to a share link.
+ */
+app.get('/config/attribution', (_req: Request, res: Response) => {
+  const windowDays = getShareAttributionWindowDays();
+  res.json({
+    windowDays,
+    windowMs: windowDays * 24 * 60 * 60 * 1000,
+    docs:
+      'Share refs (?ref=) persist first-touch for windowDays. Completed backs carrying share_ref within the window attribute to the sharer (link visits, backs driven, reach driven).',
+  });
+});
+
 /** Public poll UI config (Story triggers + funding popup rate). */
 app.get('/config/polls', async (_req: Request, res: Response) => {
   try {
@@ -839,6 +891,14 @@ const validateApiKey = (req: Request, res: Response, next: NextFunction) => {
   }
   // Public shareable personal impact cards (no API key for recipients)
   if (req.path.startsWith('/public/impact/')) {
+    return next();
+  }
+  // UE-188: public share-link visit beacon (ref persistence path)
+  if (req.path.startsWith('/public/share-links/') && req.method === 'POST') {
+    return next();
+  }
+  // Attribution config is public (window days for client persistence)
+  if (req.path === '/config/attribution') {
     return next();
   }
 
@@ -1485,9 +1545,12 @@ app.get('/users/me/impact', async (req: Request, res: Response) => {
       rangeId,
     });
 
+    const shareStats = await loadShareStatsForUser(db, uid);
+
     res.json({
       rangeId,
       impact,
+      shareStats,
     });
   } catch (error) {
     console.error('GET /users/me/impact:', error);
@@ -1524,6 +1587,7 @@ app.get('/users/me/impact/:campaignId', async (req: Request, res: Response) => {
         rangeId,
         campaign: publicCampaignSummary(campaign),
         impact: null,
+        shareStats: await loadShareStatsForUser(db, uid, campaignId),
         similarCampaigns: [],
         hasContributions: false,
       });
@@ -1558,6 +1622,7 @@ app.get('/users/me/impact/:campaignId', async (req: Request, res: Response) => {
       rangeId,
       campaign: publicCampaignSummary(campaign),
       impact,
+      shareStats: await loadShareStatsForUser(db, uid, campaignId),
       similarCampaigns: similarCampaigns.map(publicCampaignSummary),
       hasContributions: true,
     });
@@ -1736,11 +1801,37 @@ app.post('/users/me/share-cards', async (req: Request, res: Response) => {
       thumbnailUrl,
     });
 
+    // UE-188: attach a per-user share ref so impact-card links attribute visits/backs
+    let shareRef: string | null = null;
+    try {
+      const { link } = await createOrGetShareLink(
+        db,
+        {
+          campaignId: campaignId || null,
+          surface: 'impact_card',
+          scope,
+          shareCardToken: token,
+          sharerUid: uid,
+        },
+        getPostHog()
+      );
+      shareRef = link.ref;
+    } catch (e) {
+      console.warn('[share] impact-card share link create failed:', e instanceof Error ? e.message : e);
+    }
+
     const frontendBase = (process.env.FRONTEND_PUBLIC_URL || 'https://unravel.network').replace(/\/$/, '');
+    const pageUrl = shareRef
+      ? `${frontendBase}/impact/share/${token}?ref=${encodeURIComponent(shareRef)}`
+      : `${frontendBase}/impact/share/${token}`;
+    const ogUrl = shareRef
+      ? `${API_PUBLIC_BASE}/og/impact/${token}?ref=${encodeURIComponent(shareRef)}`
+      : `${API_PUBLIC_BASE}/og/impact/${token}`;
     res.status(201).json({
       token,
-      url: `${frontendBase}/impact/share/${token}`,
-      ogUrl: `${API_PUBLIC_BASE}/og/impact/${token}`,
+      ref: shareRef,
+      url: pageUrl,
+      ogUrl,
       cardImageUrl: doc.cardImageUrl,
       scope,
       displayName,
@@ -1833,6 +1924,112 @@ app.delete('/users/me/share-cards/:token', async (req: Request, res: Response) =
   } catch (error) {
     console.error('DELETE /users/me/share-cards/:token:', error);
     res.status(500).json({ error: 'Failed to revoke share card' });
+  }
+});
+
+/**
+ * UE-188: create (or reuse) a per-user share ref link.
+ * Auth optional — guests pass posthogDistinctId so the visitor path still works.
+ */
+app.post('/share-links', async (req: Request, res: Response) => {
+  try {
+    const surfaceRaw = req.body?.surface;
+    if (!isShareSurface(surfaceRaw)) {
+      return res.status(400).json({
+        error: 'surface must be campaign | interstitial | lander | impact_card',
+      });
+    }
+    const campaignId =
+      typeof req.body?.campaignId === 'string' && req.body.campaignId.trim()
+        ? req.body.campaignId.trim()
+        : null;
+    if ((surfaceRaw === 'campaign' || surfaceRaw === 'interstitial' || surfaceRaw === 'lander') && !campaignId) {
+      return res.status(400).json({ error: 'campaignId is required for this surface' });
+    }
+
+    const sharerUid =
+      typeof req.firebaseUid === 'string' && req.firebaseUid.trim() ? req.firebaseUid.trim() : null;
+    const guestDistinctId =
+      typeof req.body?.posthogDistinctId === 'string' && req.body.posthogDistinctId.trim()
+        ? req.body.posthogDistinctId.trim()
+        : null;
+    if (!sharerUid && !guestDistinctId) {
+      return res.status(400).json({ error: 'Sign in or provide posthogDistinctId for guest shares' });
+    }
+
+    const { link, created } = await createOrGetShareLink(
+      db,
+      {
+        campaignId,
+        surface: surfaceRaw,
+        scope: req.body?.scope === 'campaign' ? 'campaign' : req.body?.scope === 'cumulative' ? 'cumulative' : undefined,
+        shareCardToken:
+          typeof req.body?.shareCardToken === 'string' ? req.body.shareCardToken.trim() : null,
+        sharerUid,
+        guestDistinctId,
+      },
+      getPostHog()
+    );
+
+    const frontendBase = (process.env.FRONTEND_PUBLIC_URL || 'https://unravel.network').replace(/\/$/, '');
+    const path = campaignId ? `/campaign/${encodeURIComponent(campaignId)}` : '/campaign-feed';
+    const url = `${frontendBase}${path}?ref=${encodeURIComponent(link.ref)}`;
+
+    try {
+      await getPostHog()?.flush();
+    } catch {
+      /* non-fatal */
+    }
+
+    res.status(created ? 201 : 200).json({
+      ref: link.ref,
+      url,
+      campaignId: link.campaignId,
+      surface: link.surface,
+      created,
+      attributionWindowDays: getShareAttributionWindowDays(),
+    });
+  } catch (error) {
+    console.error('POST /share-links:', error);
+    res.status(500).json({ error: 'Failed to create share link' });
+  }
+});
+
+/** UE-188: record a non-crawler visit to a share ref (public beacon). */
+app.post('/public/share-links/:ref/visit', async (req: Request, res: Response) => {
+  try {
+    const ref = sanitizeShareRef(req.params.ref);
+    if (!ref) return res.status(400).json({ error: 'Invalid ref' });
+
+    const ua = String(req.get('user-agent') || '');
+    const isCrawler = isSharePreviewCrawler(ua);
+    const visitorDistinctId =
+      typeof req.body?.posthogDistinctId === 'string' && req.body.posthogDistinctId.trim()
+        ? req.body.posthogDistinctId.trim()
+        : null;
+    const visitorUid =
+      typeof req.firebaseUid === 'string' && req.firebaseUid.trim()
+        ? req.firebaseUid.trim()
+        : typeof req.body?.firebaseUid === 'string' && req.body.firebaseUid.trim()
+          ? req.body.firebaseUid.trim()
+          : null;
+
+    const result = await recordShareLinkVisit(
+      db,
+      { ref, visitorDistinctId, visitorUid, isCrawler },
+      getPostHog()
+    );
+
+    try {
+      await getPostHog()?.flush();
+    } catch {
+      /* non-fatal */
+    }
+
+    res.json({ ok: result.ok, campaignId: result.campaignId });
+  } catch (error) {
+    console.error('POST /public/share-links/:ref/visit:', error);
+    res.status(500).json({ error: 'Failed to record visit' });
   }
 });
 
@@ -2698,6 +2895,9 @@ app.get('/data/:collection/:id', async (req: Request, res: Response) => {
       out.facebook_frequency = data.facebook_frequency ?? null;
       out.facebook_spend = data.facebook_spend ?? null;
       out.facebook_insights_updated_at = data.facebook_insights_updated_at ?? null;
+      out.facebook_audience_size_lower_bound = data.facebook_audience_size_lower_bound ?? null;
+      out.facebook_audience_size_upper_bound = data.facebook_audience_size_upper_bound ?? null;
+      out.facebook_audience_size_updated_at = data.facebook_audience_size_updated_at ?? null;
     }
 
     const response =
@@ -3294,6 +3494,9 @@ app.get('/og/impact/:token', async (req: Request, res: Response) => {
     const description = impactOgDescription(loaded.payload);
     const canonicalUrl = `${ogRedirectBase(req)}/impact/share/${token}`;
     const ogPageUrl = canonicalUrl;
+    // UE-188: forward ?ref= (and any utm_*) through the crawler→human hop
+    const qsIndex = req.originalUrl.indexOf('?');
+    const forwardedQuery = qsIndex >= 0 ? req.originalUrl.slice(qsIndex) : '';
     const ua = String(req.get('user-agent') || '');
     const isCrawler = isSharePreviewCrawler(ua);
     console.log(`[og/impact] token=${token} ua="${ua}" crawler=${isCrawler}`);
@@ -3322,7 +3525,7 @@ app.get('/og/impact/:token', async (req: Request, res: Response) => {
       return res.send(ogHtml);
     }
 
-    return res.redirect(302, canonicalUrl);
+    return res.redirect(302, `${canonicalUrl}${forwardedQuery}`);
   } catch (error) {
     console.error('OG impact error:', error);
     res.status(500).send('Error loading impact share card');
@@ -4548,6 +4751,7 @@ async function recordCouponOnlyBacking(input: {
   utmMedium?: string;
   utmTerm?: string;
   utmContent?: string;
+  shareRef?: string;
   isGuest: boolean;
 }): Promise<{ funding_current: number }> {
   const redemptionId = 'cpn_' + randomUUID();
@@ -4625,6 +4829,7 @@ async function recordCouponOnlyBacking(input: {
     utmMedium: input.utmMedium ?? null,
     utmTerm: input.utmTerm ?? null,
     utmContent: input.utmContent ?? null,
+    shareRef: sanitizeShareRef(input.shareRef),
     source: 'coupon_zero_balance',
   });
 
@@ -4893,6 +5098,7 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
       promoCode?: string;
       posthogDistinctId?: string;
       utm?: Record<string, unknown>;
+      shareRef?: string;
       couponCode?: string;
       email?: string;
       name?: string;
@@ -4941,6 +5147,7 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
       const utmMedium = sanitizeMetaValue(utmIn.utm_medium);
       const utmTerm = sanitizeMetaValue(utmIn.utm_term);
       const utmContent = sanitizeMetaValue(utmIn.utm_content);
+      const shareRef = sanitizeShareRef(body.shareRef) || undefined;
       const isGuest = !donorUid;
       // Canonical distinct id everywhere: Firebase UID for logged-in users, else the guest's
       // PostHog distinct id. campaignId is preserved in metadata (below).
@@ -4984,6 +5191,7 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
           utmMedium: utmMedium || undefined,
           utmTerm: utmTerm || undefined,
           utmContent: utmContent || undefined,
+          shareRef,
           isGuest,
         });
         return res.json({ ok: true, zeroBalance: true, funding_current });
@@ -5018,6 +5226,7 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
       if (utmMedium) checkoutMetadata.utm_medium = utmMedium;
       if (utmTerm) checkoutMetadata.utm_term = utmTerm;
       if (utmContent) checkoutMetadata.utm_content = utmContent;
+      if (shareRef) checkoutMetadata.share_ref = shareRef;
       if (coupon) {
         // We charge the net, but the fund must still credit the gross — carry both so the
         // recorder uses gross_cents (Stripe's amount_subtotal would only equal the net here).
@@ -5576,11 +5785,7 @@ status: 'PAUSED',
   const start = new Date();
   const end = new Date();
   end.setDate(end.getDate() + 3);
-  const targeting = {
-    geo_locations: { countries: ['US'] },
-    publisher_platforms: ['facebook', 'audience_network'],
-    facebook_positions: ['feed'],
-  };
+  const targeting = { ...DEFAULT_FACEBOOK_TARGETING };
   let adSetId: string;
   try {
     const adSet = await account.createAdSet([], {
@@ -5636,11 +5841,17 @@ status: 'PAUSED',
     throw new Error(getFacebookErrorMessage(err, 'Create Ad'));
   }
 
+  const audienceSize = await fetchAudienceSizeEstimateSafe(
+    accessToken,
+    targeting as unknown as Record<string, unknown>
+  );
+
   await db.collection('campaigns').doc(campaignId).update({
     facebook_ad_id: adId,
     facebook_campaign_id: fbCampaignId,
     facebook_ad_set_id: adSetId,
     facebook_published_at: new Date(),
+    ...(audienceSize ? audienceSizeToCampaignPatch(audienceSize) : {}),
   });
 
   return { campaignId: fbCampaignId, adId };
@@ -5682,13 +5893,33 @@ app.get('/facebook/campaign/:campaignId/insights', async (req: Request, res: Res
     }
 
     const { summary, rows } = await fetchFacebookAdInsights(facebookAdId, accessToken);
+    const audienceSize = await fetchAudienceSizeEstimateSafe(accessToken);
 
     // Persist latest metrics so GET /data/campaigns/:id and impact reports use real numbers.
     try {
-      await db.collection('campaigns').doc(campaignId).update(insightsToCampaignPatch(summary));
+      await db.collection('campaigns').doc(campaignId).update({
+        ...insightsToCampaignPatch(summary),
+        ...(audienceSize ? audienceSizeToCampaignPatch(audienceSize) : {}),
+      });
     } catch (persistErr) {
       console.error('Failed to persist Facebook insights to campaign:', persistErr);
     }
+
+    const storedLower = Number(data?.facebook_audience_size_lower_bound ?? 0);
+    const storedUpper = Number(data?.facebook_audience_size_upper_bound ?? 0);
+    const audienceSizePayload = audienceSize
+      ? {
+          lower_bound: audienceSize.lowerBound,
+          upper_bound: audienceSize.upperBound,
+          estimate_ready: audienceSize.estimateReady,
+        }
+      : storedLower > 0 && storedUpper > 0
+        ? {
+            lower_bound: storedLower,
+            upper_bound: storedUpper,
+            estimate_ready: data?.facebook_audience_size_estimate_ready !== false,
+          }
+        : null;
 
     return res.json({
       campaignId,
@@ -5711,6 +5942,7 @@ app.get('/facebook/campaign/:campaignId/insights', async (req: Request, res: Res
         total_actions: summary.totalActions,
         actions: summary.actions,
       },
+      audience_size: audienceSizePayload,
       rows,
     });
   } catch (error: any) {
@@ -5734,6 +5966,13 @@ app.post('/facebook/campaign/:campaignId/sync-insights', async (req: Request, re
       campaignId: result.campaignId,
       facebookAdId: result.facebookAdId,
       insights: insightsToCampaignPatch(result.summary),
+      audience_size: result.audienceSize
+        ? {
+            lower_bound: result.audienceSize.lowerBound,
+            upper_bound: result.audienceSize.upperBound,
+            estimate_ready: result.audienceSize.estimateReady,
+          }
+        : null,
       breakdowns: Object.fromEntries(
         Object.entries(result.breakdowns).map(([key, rows]) => [key, rows?.length ?? 0])
       ),

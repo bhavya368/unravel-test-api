@@ -56,6 +56,8 @@ export interface CampaignRow {
   facebook_out_of_bubble_impressions?: number;
   facebook_escaped_impressions?: number;
   facebook_total_actions?: number;
+  facebook_audience_size_lower_bound?: number;
+  facebook_audience_size_upper_bound?: number;
   reach?: number;
   perception_shift?: number;
   perception_shift_actual?: number;
@@ -200,6 +202,71 @@ export function getCampaignReach(campaign: CampaignRow, insights?: InsightsPaylo
 
   const budgetDollars = getCampaignTotalContributionCents(campaign) / 100;
   return { value: Math.round(budgetDollars * REACH_PER_DOLLAR), source: 'estimated' };
+}
+
+export interface AudienceSizeEstimateMetric {
+  lowerBound: number;
+  upperBound: number;
+  midpoint: number;
+  source: MetricSource;
+}
+
+/** Meta Estimated Audience Size range (people). Midpoint = avg(lower, upper). */
+export function getAudienceSizeEstimate(campaign: CampaignRow): AudienceSizeEstimateMetric | null {
+  const lower = Number(campaign?.facebook_audience_size_lower_bound ?? 0);
+  const upper = Number(campaign?.facebook_audience_size_upper_bound ?? 0);
+  if (!(lower > 0) || !(upper > 0)) return null;
+  const lo = Math.min(lower, upper);
+  const hi = Math.max(lower, upper);
+  return {
+    lowerBound: lo,
+    upperBound: hi,
+    midpoint: (lo + hi) / 2,
+    source: 'actual',
+  };
+}
+
+/**
+ * Saturation = total reach / average(audience size lower, upper).
+ * Returned as a percentage (e.g. 12.5 means 12.5%).
+ * Uses Meta unique reach as the numerator (people, not impressions).
+ */
+export function computeSaturation(
+  campaign: CampaignRow,
+  insights?: InsightsPayload | null
+): SourcedMetric | null {
+  const audience = getAudienceSizeEstimate(campaign);
+  if (!audience || !(audience.midpoint > 0)) return null;
+
+  const reach = getCampaignReach(campaign, insights);
+  if (!(reach.value >= 0)) return null;
+  const pct = (reach.value / audience.midpoint) * 100;
+
+  return {
+    value: pct,
+    source: reach.source === 'actual' ? 'actual' : 'estimated',
+  };
+}
+
+/**
+ * Personal saturation = attributed personal reach / audience size midpoint.
+ * Used on My Impact (cumulative + per-campaign personal).
+ */
+export function computePersonalSaturation(
+  personalReach: number,
+  campaign: CampaignRow,
+  reachSource: MetricSource = 'estimated'
+): SourcedMetric | null {
+  const audience = getAudienceSizeEstimate(campaign);
+  if (!audience || !(audience.midpoint > 0)) return null;
+  const reach = Number(personalReach);
+  if (!Number.isFinite(reach) || reach < 0) return null;
+  const pct = (reach / audience.midpoint) * 100;
+
+  return {
+    value: pct,
+    source: reachSource,
+  };
 }
 
 export function getCampaignViews(
