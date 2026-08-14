@@ -78,6 +78,14 @@ import {
   upsertPollAnswer,
 } from './campaignPolls';
 import {
+  createComment,
+  listCheckoutTestimonials,
+  listComments,
+  MAX_COMMENT_LENGTH,
+  removeComment,
+  sanitizeCommentText,
+} from './campaignComments';
+import {
   attributeShareBack,
   createOrGetShareLink,
   getShareAttributionWindowDays,
@@ -2304,39 +2312,51 @@ async function enrichCampaignCreators(
 
     const uid = String(data.created_by ?? data.created_by_uid ?? '').trim();
     const user = uid ? byUid.get(uid) : undefined;
-    if (user) {
-      const fields = creatorFieldsFromUserProfile(user);
-      // Prefer live username for public display when available.
+    const fields = creatorFieldsFromUserProfile(user);
+
+    // Display precedence (UE-104 / UE-204):
+    //   1. name an admin explicitly set on the campaign (flagged on write),
+    //   2. the creator's LIVE profile (username, else current first/last name),
+    //   3. the submission-time snapshot only when the profile doc is gone.
+    // `admin_creator_name` is response-only so admin editors can show/edit the
+    // override itself instead of the derived display value.
+    const overrideName =
+      data.creator_name_admin_override === true
+        ? String(data.creator_name ?? data.creator ?? '').trim()
+        : '';
+    data.admin_creator_name = overrideName;
+
+    if (overrideName) {
+      data.creator = overrideName;
+      data.creator_name = overrideName;
+      // The UI prefers creator_username, so it must not outrank the override.
+      delete data.creator_username;
+    } else if (user) {
       if (fields.creator_username) {
         data.creator_username = fields.creator_username;
         data.creator = fields.creator_username;
         data.creator_name = fields.creator_username;
-      } else if (!campaignHasCreatorDisplay(data)) {
-        Object.assign(data, fields);
-      }
-      if (!data.creator_first_name && fields.creator_first_name) {
-        data.creator_first_name = fields.creator_first_name;
-      }
-      if (!data.creator_last_name && fields.creator_last_name) {
-        data.creator_last_name = fields.creator_last_name;
-      }
-      if (!data.creator_email && fields.creator_email) {
-        data.creator_email = fields.creator_email;
-      }
-      if (fields.creator_avatar_url) {
-        data.creator_avatar_url = fields.creator_avatar_url;
       } else {
-        delete data.creator_avatar_url;
+        // The profile has no username (anymore) - a stored one must not win.
+        delete data.creator_username;
+        if (fields.creator_name) {
+          data.creator = fields.creator_name;
+          data.creator_name = fields.creator_name;
+        } else if (!campaignHasCreatorDisplay(data)) {
+          Object.assign(data, fields);
+        }
       }
-    } else {
-      delete data.creator_avatar_url;
+      if (fields.creator_first_name) data.creator_first_name = fields.creator_first_name;
+      if (fields.creator_last_name) data.creator_last_name = fields.creator_last_name;
     }
 
-    // Prefer stored username over a name-only snapshot when both exist.
-    const storedUsername = String(data.creator_username ?? '').trim();
-    if (storedUsername) {
-      data.creator = storedUsername;
-      data.creator_name = storedUsername;
+    if (!data.creator_email && fields.creator_email) {
+      data.creator_email = fields.creator_email;
+    }
+    if (fields.creator_avatar_url) {
+      data.creator_avatar_url = fields.creator_avatar_url;
+    } else {
+      delete data.creator_avatar_url;
     }
 
     return enrichCampaignResponse(data);
@@ -2931,7 +2951,8 @@ app.get('/data/:collection/:id', async (req: Request, res: Response) => {
  * or field falls back to these defaults.
  */
 const SOCIAL_PROOF_DEFAULTS = {
-  social_proof_min_backers: 5,
+  // Tim: show social proof once a campaign has 3+ backers (was 5).
+  social_proof_min_backers: 3,
   social_proof_activity_max_hours: 72,
 };
 
@@ -3200,6 +3221,106 @@ app.get('/data/campaigns/:id/polls/summary', async (req: Request, res: Response)
   } catch (error) {
     console.error('Error fetching poll summary:', error);
     res.status(500).json({ error: 'Failed to fetch poll summary' });
+  }
+});
+
+/** Campaign comments (UE-80). v1: any signed-in Unravel account can comment. */
+
+/** 8 comments per 15 minutes per IP — generous for real use, blunt against spam bursts. */
+const commentSubmissionLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 8,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many comments from this device. Please try again in a few minutes.' },
+});
+
+/** GET newest-first page of visible comments. ?cursor=<lastCommentId>&limit=20 */
+app.get('/data/campaigns/:id/comments', async (req: Request, res: Response) => {
+  try {
+    const campaignId = String(req.params.id || '').trim();
+    if (!campaignId) return res.status(400).json({ error: 'Campaign id is required' });
+
+    const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : null;
+    const limit = req.query.limit != null ? Number(req.query.limit) : undefined;
+    const result = await listComments(db, campaignId, { cursor, limit });
+    res.json(result);
+  } catch (error) {
+    console.error('Error fetching campaign comments:', error);
+    res.status(500).json({ error: 'Failed to fetch comments' });
+  }
+});
+
+/** POST a new comment. Requires a Firebase-authed account (req.firebaseUid). */
+app.post('/data/campaigns/:id/comments', commentSubmissionLimiter, async (req: Request, res: Response) => {
+  try {
+    const campaignId = String(req.params.id || '').trim();
+    if (!campaignId) return res.status(400).json({ error: 'Campaign id is required' });
+    if (!req.firebaseUid) {
+      return res.status(401).json({ error: 'Sign in required to comment' });
+    }
+
+    const { text, error } = sanitizeCommentText((req.body ?? {}).text);
+    if (error || !text) {
+      return res.status(400).json({ error: error || `Comment text is required (max ${MAX_COMMENT_LENGTH} chars)` });
+    }
+
+    const profileSnap = await usersDb.collection('users').doc(req.firebaseUid).get();
+    const profile = profileSnap.exists ? (profileSnap.data() as Record<string, unknown>) : {};
+    const firstName = typeof profile.firstName === 'string' ? profile.firstName.trim() : '';
+    const lastName = typeof profile.lastName === 'string' ? profile.lastName.trim() : '';
+    const authorName = [firstName, lastName].filter(Boolean).join(' ') || 'Unravel member';
+    const authorAvatarUrl = typeof profile.avatarUrl === 'string' && profile.avatarUrl.trim() ? profile.avatarUrl.trim() : null;
+
+    const result = await createComment(db, {
+      campaignId,
+      authorUid: req.firebaseUid,
+      authorName,
+      authorAvatarUrl,
+      text,
+    });
+    if (!result.ok) return res.status(result.status).json({ error: result.error });
+    res.json({ ok: true, comment: result.comment });
+  } catch (error) {
+    console.error('Error posting campaign comment:', error);
+    res.status(500).json({ error: 'Failed to post comment' });
+  }
+});
+
+/** DELETE (soft) a comment — only the comment's own author, in v1. */
+app.delete('/data/campaigns/:id/comments/:commentId', async (req: Request, res: Response) => {
+  try {
+    const campaignId = String(req.params.id || '').trim();
+    const commentId = String(req.params.commentId || '').trim();
+    if (!campaignId || !commentId) {
+      return res.status(400).json({ error: 'Campaign id and comment id are required' });
+    }
+    if (!req.firebaseUid) {
+      return res.status(401).json({ error: 'Sign in required' });
+    }
+    const result = await removeComment(db, { campaignId, commentId, requesterUid: req.firebaseUid });
+    if (!result.ok) return res.status(result.status).json({ error: result.error });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error removing campaign comment:', error);
+    res.status(500).json({ error: 'Failed to remove comment' });
+  }
+});
+
+/**
+ * GET checkout-page testimonials — comments from backers who opted in to show their name
+ * (same UE-186 consent flag as the backer-count widget). Public; no auth required to read.
+ */
+app.get('/data/campaigns/:id/testimonials', async (req: Request, res: Response) => {
+  try {
+    const campaignId = String(req.params.id || '').trim();
+    if (!campaignId) return res.status(400).json({ error: 'Campaign id is required' });
+    const limit = req.query.limit != null ? Number(req.query.limit) : undefined;
+    const testimonials = await listCheckoutTestimonials(db, campaignId, { limit });
+    res.json({ testimonials });
+  } catch (error) {
+    console.error('Error fetching campaign testimonials:', error);
+    res.status(500).json({ error: 'Failed to fetch testimonials' });
   }
 });
 
@@ -3841,6 +3962,7 @@ app.post('/data/:collection', async (req: Request, res: Response) => {
       delete data.creator_last_name;
       delete data.creator_email;
       delete data.creator_username;
+      delete data.creator_name_admin_override;
       if (req.firebaseUid) {
         data.created_by = req.firebaseUid;
         data.created_by_uid = req.firebaseUid;
@@ -4026,6 +4148,8 @@ app.put('/data/:collection/:id', async (req: Request, res: Response) => {
       }
       const prev = snap.data() as Record<string, unknown>;
       sanitizeCampaignContentFields(data);
+      // The admin-override flag is only ever set by the PATCH admin editor path.
+      delete data.creator_name_admin_override;
       const durationResult = applyCampaignDurationPatch(data, prev);
       if (!durationResult.ok) {
         return res.status(400).json({ error: durationResult.error });
@@ -4092,15 +4216,25 @@ app.patch('/data/:collection/:id', async (req: Request, res: Response) => {
       }
       Object.assign(data, impactMetricsResult.patch);
 
-      // Admin editor: allow setting/clearing the public creator display name.
-      if (data.creator_name !== undefined || data.creator !== undefined) {
+      // Never trust a client-supplied override flag.
+      delete data.creator_name_admin_override;
+      if (req.firebaseUid) {
+        // Signed-in creator edits must not touch the public display-name fields.
+        delete data.creator_name;
+        delete data.creator;
+      } else if (data.creator_name !== undefined || data.creator !== undefined) {
+        // Admin editor: allow setting/clearing the public creator display name.
+        // The flag marks it as a deliberate override so the read path shows it
+        // instead of the creator's live profile name (UE-204).
         const display = String(data.creator_name ?? data.creator ?? '').trim().slice(0, 120);
         if (display) {
           data.creator_name = display;
           data.creator = display;
+          data.creator_name_admin_override = true;
         } else {
           data.creator_name = FieldValue.delete();
           data.creator = FieldValue.delete();
+          data.creator_name_admin_override = FieldValue.delete();
         }
       }
 
