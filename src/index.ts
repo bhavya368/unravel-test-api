@@ -4053,7 +4053,10 @@ app.post('/data/:collection', async (req: Request, res: Response) => {
     if (collection === 'campaigns') {
       try {
         await slack.chat.postMessage({
-          channel: process.env.SLACK_CHANNEL || 'moderation',
+          // Own channel var (Tim, Aug 14): these were flooding #moderation, which is meant
+          // for actual review discussion, not routine submission pings. Falls back to the
+          // shared SLACK_CHANNEL / #moderation if unset, so this is a no-op until configured.
+          channel: process.env.SLACK_CAMPAIGN_SUBMISSION_CHANNEL || process.env.SLACK_CHANNEL || 'moderation',
           text: `🆕 New Campaign Submitted for Moderation`,
           blocks: [
             {
