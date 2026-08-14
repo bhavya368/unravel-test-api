@@ -4053,10 +4053,9 @@ app.post('/data/:collection', async (req: Request, res: Response) => {
     if (collection === 'campaigns') {
       try {
         await slack.chat.postMessage({
-          // Own channel var (Tim, Aug 14): these were flooding #moderation, which is meant
-          // for actual review discussion, not routine submission pings. Falls back to the
-          // shared SLACK_CHANNEL / #moderation if unset, so this is a no-op until configured.
-          channel: process.env.SLACK_CAMPAIGN_SUBMISSION_CHANNEL || process.env.SLACK_CHANNEL || 'moderation',
+          // Campaign submissions route to #moderation. #query is reserved for
+          // Contact Us + Careers notifications only.
+          channel: process.env.SLACK_CHANNEL || 'moderation',
           text: `🆕 New Campaign Submitted for Moderation`,
           blocks: [
             {
@@ -6300,7 +6299,8 @@ app.post('/api/job-applications', formSubmissionLimiter, async (req: Request, re
 
     try {
       await slack.chat.postMessage({
-        channel: process.env.SLACK_CHANNEL || 'moderation',
+        // Careers applications route to #query, independent of the shared moderation channel.
+        channel: process.env.SLACK_CAREERS_CHANNEL || process.env.SLACK_CHANNEL || 'moderation',
         text: `📋 New Job Application — ${data.roleId || 'General talent pool'}`,
         blocks: [
           { type: 'header', text: { type: 'plain_text', text: '📋 New Job Application' } },
@@ -6365,7 +6365,8 @@ app.post('/api/contact', formSubmissionLimiter, async (req: Request, res: Respon
 
     try {
       await slack.chat.postMessage({
-        channel: process.env.SLACK_CHANNEL || 'moderation',
+        // Contact Us messages route to #query, independent of the shared moderation channel.
+        channel: process.env.SLACK_CONTACT_CHANNEL || process.env.SLACK_CHANNEL || 'moderation',
         text: `✉️ New Contact Message — ${data.topic}`,
         blocks: [
           { type: 'header', text: { type: 'plain_text', text: '✉️ New Contact Message' } },
