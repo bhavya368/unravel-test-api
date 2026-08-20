@@ -131,6 +131,30 @@ const usersDb = getFirestore(getApp());
 // Initialize Slack client
 const slack = new WebClient(process.env.SLACK_BOT_TOKEN);
 
+/**
+ * Sanitize a value for a Slack block text field. Slack rejects any block text over
+ * 3000 characters, which makes chat.postMessage throw — and our Slack posts swallow
+ * that error, so a single over-long field silently drops the whole notification.
+ * Campaign descriptions (rich HTML) routinely exceed 3000 chars, which is what stalled
+ * the #moderation feed (UE-211). This strips HTML/entities and hard-caps the length so
+ * a post can never be rejected for size.
+ */
+function toSlackText(value: unknown, max = 2800): string {
+  const text = (value == null ? '' : String(value))
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#0?39;/gi, "'")
+    .replace(/[ \t ]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  if (text.length <= max) return text;
+  return `${text.slice(0, max - 14).trimEnd()}… (truncated)`;
+}
+
 // Initialize Vertex AI and Cloud Storage
 const vertexAI = new VertexAI({ project: 'unravelreserchagent', location: 'us-central1' });
 const storage = new Storage({ projectId: 'unravelreserchagent' });
@@ -4065,24 +4089,24 @@ app.post('/data/:collection', async (req: Request, res: Response) => {
             {
               type: 'section',
               fields: [
-                { type: 'mrkdwn', text: `*Title:*\n${data.title || 'N/A'}` },
-                { type: 'mrkdwn', text: `*Category:*\n${data.category || 'N/A'}` },
+                { type: 'mrkdwn', text: `*Title:*\n${toSlackText(data.title, 200) || 'N/A'}` },
+                { type: 'mrkdwn', text: `*Category:*\n${toSlackText(data.category, 80) || 'N/A'}` },
                 { type: 'mrkdwn', text: `*Funding Goal:*\n$${data.funding_goal || 0}` }
               ]
             },
             {
               type: 'section',
-              text: { type: 'mrkdwn', text: `*Short Description:*\n${data.short_description || 'N/A'}` }
+              text: { type: 'mrkdwn', text: `*Short Description:*\n${toSlackText(data.short_description, 600) || 'N/A'}` }
             },
             {
               type: 'section',
-              text: { type: 'mrkdwn', text: `*Long Description:*\n${data.long_description || 'No description'}` }
+              text: { type: 'mrkdwn', text: `*Long Description:*\n${toSlackText(data.long_description, 1500) || 'No description'}` }
             },
             {
               type: 'section',
               text: { 
                 type: 'mrkdwn', 
-                text: `*🤖 AI Moderation Recommendation:*\n${aiModerationRecommendation || 'Analysis pending...'}` 
+                text: `*🤖 AI Moderation Recommendation:*\n${toSlackText(aiModerationRecommendation, 2800) || 'Analysis pending...'}` 
               }
             },
             {
@@ -4098,8 +4122,18 @@ app.post('/data/:collection', async (req: Request, res: Response) => {
         });
         console.log('Slack notification sent to #moderation');
       } catch (slackError) {
-        console.error('Slack notification failed:', slackError);
-        // Don't fail the request if Slack fails
+        // UE-211: never let #moderation go silent. If the rich card fails to post for
+        // any reason, fall back to a minimal plain-text notice so the team still sees
+        // the submission. Never fail the request because of Slack.
+        console.error('Slack notification failed, attempting minimal fallback:', slackError);
+        try {
+          await slack.chat.postMessage({
+            channel: process.env.SLACK_CHANNEL || 'moderation',
+            text: `🆕 New campaign submitted for moderation: *${toSlackText(data.title, 200) || 'Untitled'}* — ID \`${docRef.id}\` (rich preview could not be rendered).`,
+          });
+        } catch (fallbackError) {
+          console.error('Slack fallback notification also failed:', fallbackError);
+        }
       }
       // Bias wheel: run in background only. Do not await — user gets "campaign submitted" after AI moderation, not after bias wheel.
       void analyzeBiasWheelAndUpdate(docRef.id, data).catch((err) =>
