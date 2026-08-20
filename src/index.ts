@@ -46,10 +46,14 @@ import {
   renderImpactOgPng,
 } from './impactOgImage';
 import {
+  campaignReviewDenorm,
+  getLatestTrustReportReview,
   getPublishedTrustReport,
   getTrustReportVersion,
+  isAcceptedDecision,
   listTrustReportVersions,
   publishTrustReport,
+  saveTrustReportReview,
   upsertTrustReport,
 } from './trustReport';
 import {
@@ -2591,6 +2595,18 @@ app.put('/data/campaigns/:id/trust-report', async (req: Request, res: Response) 
         hint: 'Set UUTS_PUBLISH_LIVE_ENABLED=true to connect publish to the live pipeline',
       });
     }
+    if (body.publish === true) {
+      const latest = await getLatestTrustReportReview(db, campaignId);
+      const incomingDecision =
+        body.review && typeof body.review === 'object'
+          ? (body.review as Record<string, unknown>).decision
+          : latest?.review?.decision;
+      if (!isAcceptedDecision(incomingDecision)) {
+        return res.status(409).json({
+          error: 'Trust report can only be published after an Accepted review decision',
+        });
+      }
+    }
     const result = await upsertTrustReport(db, campaignId, {
       initial: body.initial,
       final: body.final,
@@ -2613,6 +2629,79 @@ app.put('/data/campaigns/:id/trust-report', async (req: Request, res: Response) 
     }
     console.error('PUT /data/campaigns/:id/trust-report:', error);
     res.status(500).json({ error: 'Failed to upsert trust report' });
+  }
+});
+
+/**
+ * PUT human review: per-component scores + AI/human acknowledgements + reviewer + decision.
+ * An Accepted decision publishes the trust report.
+ * Body: { layerScores?, final?, review: { layers, assignedReviewer, decision, ... } }
+ */
+app.put('/data/campaigns/:id/trust-report/review', async (req: Request, res: Response) => {
+  try {
+    const campaignId = String(req.params.id || '').trim();
+    if (!campaignId) {
+      return res.status(400).json({ error: 'Campaign id is required' });
+    }
+    const campaignRef = db.collection('campaigns').doc(campaignId);
+    const campaignSnap = await campaignRef.get();
+    if (!campaignSnap.exists) {
+      return res.status(404).json({ error: 'Campaign not found' });
+    }
+    const campaign: Record<string, unknown> = {
+      id: campaignSnap.id,
+      ...(campaignSnap.data() as Record<string, unknown>),
+    };
+    const body = (req.body || {}) as Record<string, unknown>;
+    const layerScoresRaw = body.layerScores;
+    const layerScores =
+      layerScoresRaw && typeof layerScoresRaw === 'object'
+        ? (layerScoresRaw as { factCheck?: number | null; commsIntegrity?: number | null; sharedReality?: number | null })
+        : undefined;
+
+    const saved = await saveTrustReportReview(db, campaignId, {
+      layerScores,
+      final: body.final,
+      review: body.review,
+      createdBy:
+        body.createdBy != null ? String(body.createdBy) : req.firebaseEmail || req.firebaseUid || null,
+    });
+
+    let published: { versionId: string; version: number } | null = null;
+    if (isAcceptedDecision(saved.review.decision)) {
+      try {
+        published = await publishTrustReport(db, campaignId, saved.versionId);
+      } catch (publishErr: any) {
+        const status = typeof publishErr?.status === 'number' ? publishErr.status : 500;
+        if (status >= 400 && status < 500) {
+          return res.status(status).json({ error: publishErr.message || 'Could not publish trust report' });
+        }
+        throw publishErr;
+      }
+    }
+
+    const report = await getTrustReportVersion(db, campaignId, campaign, saved.versionId);
+    const effectiveComposite = report?.composite ?? saved.final.composite ?? null;
+    await campaignRef.set(campaignReviewDenorm(saved.review, { trustScore: effectiveComposite }), {
+      merge: true,
+    });
+
+    res.json({
+      message: isAcceptedDecision(saved.review.decision)
+        ? 'Review saved. Accepted — trust report published.'
+        : 'Review saved',
+      ...saved,
+      published,
+      publishEligible: isAcceptedDecision(saved.review.decision),
+      report,
+    });
+  } catch (error: any) {
+    const status = typeof error?.status === 'number' ? error.status : 500;
+    if (status >= 400 && status < 500) {
+      return res.status(status).json({ error: error.message || 'Bad request' });
+    }
+    console.error('PUT /data/campaigns/:id/trust-report/review:', error);
+    res.status(500).json({ error: 'Failed to save trust report review' });
   }
 });
 
@@ -2640,7 +2729,13 @@ app.post('/data/campaigns/:id/trust-report/refresh', async (req: Request, res: R
         assignedReviewer: null,
         decision: 'pending',
         reviewedAt: null,
+        decidedAt: null,
         reviewer: null,
+        layers: {
+          factCheck: { aiReviewed: true, humanReviewed: false },
+          commsIntegrity: { aiReviewed: true, humanReviewed: false },
+          sharedReality: { aiReviewed: true, humanReviewed: false },
+        },
       },
       createdBy: body.createdBy != null ? String(body.createdBy) : req.firebaseEmail || req.firebaseUid || null,
       refresh: true,
@@ -4172,6 +4267,17 @@ app.put('/data/:collection/:id', async (req: Request, res: Response) => {
       }
       data = durationResult.patch;
       durationDeleteFields = durationResult.deleteFields;
+      if (data.status === 'Approved' && prev.status !== 'Approved') {
+        const latestReview = await getLatestTrustReportReview(db, id);
+        if (!isAcceptedDecision(latestReview?.review?.decision)) {
+          return res.status(409).json({
+            error: 'Campaign cannot be published until the UUTS review decision is Accepted',
+            message: 'Campaign cannot be published until the UUTS review decision is Accepted',
+            uuts_review_decision: latestReview?.review?.decision ?? 'pending',
+            publishEligible: false,
+          });
+        }
+      }
     }
 
     const updatePayload = buildCampaignUpdatePayload(data, durationDeleteFields);
@@ -4231,6 +4337,19 @@ app.patch('/data/:collection/:id', async (req: Request, res: Response) => {
         return res.status(400).json({ error: impactMetricsResult.error });
       }
       Object.assign(data, impactMetricsResult.patch);
+
+      const becomingApproved = data.status === 'Approved' && prev.status !== 'Approved';
+      if (becomingApproved) {
+        const latestReview = await getLatestTrustReportReview(db, id);
+        if (!isAcceptedDecision(latestReview?.review?.decision)) {
+          return res.status(409).json({
+            error: 'Campaign cannot be published until the UUTS review decision is Accepted',
+            message: 'Campaign cannot be published until the UUTS review decision is Accepted',
+            uuts_review_decision: latestReview?.review?.decision ?? 'pending',
+            publishEligible: false,
+          });
+        }
+      }
 
       // Never trust a client-supplied override flag.
       delete data.creator_name_admin_override;

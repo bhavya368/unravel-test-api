@@ -329,11 +329,22 @@ export function resolveUutsModel(requested?: string | null): UutsModelOption {
   return models[0];
 }
 
+/** Internal reviewers shown in the admin review-console dropdown. */
+export function listUutsReviewers(): string[] {
+  const raw = (process.env.UUTS_REVIEWERS || '').trim();
+  if (!raw) return [];
+  return raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
 export function getUutsConfig() {
   return {
     prescreenEnabled: isUutsPrescreenEnabled(),
     publishLiveEnabled: isUutsPublishLiveEnabled(),
     schedulerEnabled: isUutsSchedulerEnabled(),
+    reviewers: listUutsReviewers(),
     models: listUutsModels(),
     defaultModel: defaultGeminiModel(),
     /** Admin can opt into web search / grounding per run for A/B tests. Default off. */
@@ -2472,7 +2483,13 @@ export async function runUutsPrescreenAndPersist({
         assignedReviewer: null,
         decision: 'pending',
         reviewedAt: nowIso(),
-        reviewer: 'UUTS Pre-screening skill',
+        decidedAt: null,
+        reviewer: null,
+        layers: {
+          factCheck: { aiReviewed: true, humanReviewed: false },
+          commsIntegrity: { aiReviewed: true, humanReviewed: false },
+          sharedReality: { aiReviewed: true, humanReviewed: false },
+        },
       },
       createdBy: externalResearch ? 'uuts-prescreen-external-research' : 'uuts-prescreen',
       model: modelOption.id,
