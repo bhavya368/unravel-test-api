@@ -3123,6 +3123,8 @@ app.get('/data/campaigns/:id/backers', async (req: Request, res: Response) => {
       donorName?: string;
       showName: boolean;
       lastAt: number;
+      /** Gross contribution in cents (charged + coupon discount) for the latest backing. */
+      amountCents: number;
     };
     const byBacker = new Map<string, BackerAgg>();
     for (const doc of snapshot.docs) {
@@ -3133,6 +3135,8 @@ app.get('/data/campaigns/:id/backers', async (req: Request, res: Response) => {
       const email = String(data.donor_email || '').trim().toLowerCase();
       const key = donorUid || (email ? `e:${email}` : `r:${doc.id}`);
       const donorName = String(data.donor_name || '').trim() || undefined;
+      const amountCents =
+        (Number(data.amount_total) || 0) + (Number(data.amount_discount) || 0);
       const prev = byBacker.get(key);
       if (!prev || at > prev.lastAt) {
         byBacker.set(key, {
@@ -3142,6 +3146,7 @@ app.get('/data/campaigns/:id/backers', async (req: Request, res: Response) => {
           // their mind on a later contribution.
           showName: data.show_name === true,
           lastAt: at,
+          amountCents: amountCents > 0 ? amountCents : prev?.amountCents || 0,
         });
       }
     }
@@ -3154,11 +3159,13 @@ app.get('/data/campaigns/:id/backers', async (req: Request, res: Response) => {
     }
 
     const now = Date.now();
-    const recent = [...byBacker.values()].sort((a, b) => b.lastAt - a.lastAt).slice(0, 5);
+    // UE-216 ticker panel needs a slightly longer list than the quiet activity line.
+    const recent = [...byBacker.values()].sort((a, b) => b.lastAt - a.lastAt).slice(0, 12);
 
     // Resolve first names ONLY for opted-in backers. Stripe-path records carry no
     // donor_name, so fall back to the user profile for logged-in donors.
-    const recentBackers: { firstName: string | null; hoursAgo: number }[] = [];
+    const recentBackers: { firstName: string | null; hoursAgo: number; amountCents: number }[] =
+      [];
     for (const b of recent) {
       let firstName: string | null = null;
       if (b.showName) {
@@ -3176,8 +3183,9 @@ app.get('/data/campaigns/:id/backers', async (req: Request, res: Response) => {
         }
       }
       recentBackers.push({
-        firstName, // null renders as "Someone" on the client
+        firstName, // null renders as "Someone" / "Anonymous" on the client
         hoursAgo: Math.max(0, Math.floor((now - b.lastAt) / 3_600_000)),
+        amountCents: Math.max(0, Math.round(b.amountCents || 0)),
       });
     }
 
@@ -4002,7 +4010,7 @@ function sanitizeCampaignContentFields(data: Record<string, unknown>): void {
             : undefined;
           const youtubeUrl = s.youtubeUrl ? String(s.youtubeUrl).trim().slice(0, 500) : undefined;
           const imageUrl = s.imageUrl ? String(s.imageUrl).trim().slice(0, 2048) : undefined;
-          if (!description) return null;
+          // Caption is optional (UE-216); media is required.
           if (youtubeVideoId || youtubeUrl) {
             const out: Record<string, string> = { description };
             if (youtubeUrl) out.youtubeUrl = youtubeUrl;
