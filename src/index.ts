@@ -3527,6 +3527,19 @@ function resolveThumbnailUrl(raw: unknown, apiBase: string): string {
 }
 
 app.get('/og/campaign/:id', async (req: Request, res: Response) => {
+  await sendCampaignOg(req, res, { pathSuffix: '' });
+});
+
+/** Audience-view share target — same preview card, human click lands on /campaign/:id/audience. */
+app.get('/og/campaign/:id/audience', async (req: Request, res: Response) => {
+  await sendCampaignOg(req, res, { pathSuffix: '/audience' });
+});
+
+async function sendCampaignOg(
+  req: Request,
+  res: Response,
+  { pathSuffix }: { pathSuffix: '' | '/audience' },
+): Promise<void> {
   try {
     const { id } = req.params;
     const doc = await db.collection('campaigns').doc(id).get();
@@ -3540,7 +3553,7 @@ app.get('/og/campaign/:id', async (req: Request, res: Response) => {
     // Always resolve image paths against the API's own public URL (not forwarded host —
     // requests arrive here via nginx proxy from unravel.network, which doesn't host /images/).
     const image = resolveThumbnailUrl(data?.thumbnail_url, API_PUBLIC_BASE);
-    const canonicalUrl = `${ogRedirectBase(req)}/campaign/${id}`;
+    const canonicalUrl = `${ogRedirectBase(req)}/campaign/${id}${pathSuffix}`;
     // Use the canonical frontend URL for FB preview display.
     // Otherwise the OG endpoint URL leaks as the visible "source" domain.
     const ogPageUrl = canonicalUrl;
@@ -3553,7 +3566,7 @@ app.get('/og/campaign/:id', async (req: Request, res: Response) => {
     const isCrawler = isSharePreviewCrawler(ua);
     // Diagnostic log so we can confirm which crawler (if any) is hitting /og/campaign/:id in prod.
     // Safe to leave on — low volume, no PII. Remove once preview-card issue is verified fixed.
-    console.log(`[og/campaign] id=${id} ua="${ua}" crawler=${isCrawler} image=${image}`);
+    console.log(`[og/campaign${pathSuffix}] id=${id} ua="${ua}" crawler=${isCrawler} image=${image}`);
 
     const ogHtml = `<!DOCTYPE html>
 <html lang="en">
@@ -3579,15 +3592,16 @@ app.get('/og/campaign/:id', async (req: Request, res: Response) => {
     if (isCrawler) {
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
       res.setHeader('Cache-Control', 'public, max-age=300');
-      return res.send(ogHtml);
+      res.send(ogHtml);
+      return;
     }
 
-    return res.redirect(302, `${canonicalUrl}${forwardedQuery}`);
+    res.redirect(302, `${canonicalUrl}${forwardedQuery}`);
   } catch (error) {
     console.error('OG campaign error:', error);
     res.status(500).send('Error loading campaign');
   }
-});
+}
 
 /** Campaign id from a path or full URL containing `/campaign/:id` (matches unravel-ui lander helpers). */
 function extractCampaignIdFromUrl(raw: unknown): string | null {
