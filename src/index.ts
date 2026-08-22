@@ -46,6 +46,12 @@ import {
   renderImpactOgPng,
 } from './impactOgImage';
 import {
+  TRUST_OG_HEIGHT,
+  TRUST_OG_WIDTH,
+  type TrustReportOgPayload,
+  renderTrustReportOgPng,
+} from './trustReportOgImage';
+import {
   campaignReviewDenorm,
   getLatestTrustReportReview,
   getPublishedTrustReport,
@@ -55,6 +61,7 @@ import {
   publishTrustReport,
   saveTrustReportReview,
   upsertTrustReport,
+  type TrustReportPayload,
 } from './trustReport';
 import {
   getUutsConfig,
@@ -3814,6 +3821,140 @@ app.get('/og/impact/:token', async (req: Request, res: Response) => {
   } catch (error) {
     console.error('OG impact error:', error);
     res.status(500).send('Error loading impact share card');
+  }
+});
+
+/**
+ * UE-175 — share-to-social Trust Score card.
+ * /og/report/:id serves crawlers a preview whose image is the rendered score card
+ * (each component's score + campaign/assessment summary) and 302s humans to the
+ * report page. Works without a published report too: the card then shows the
+ * "Review in progress" state instead of scores, so shared links never break.
+ */
+const TRUST_OG_LAYERS: Array<{ key: 'factCheck' | 'commsIntegrity' | 'sharedReality'; label: string; weightPct: number }> = [
+  { key: 'factCheck', label: 'Fact-Checking', weightPct: 45 },
+  { key: 'commsIntegrity', label: 'Communications Integrity', weightPct: 30 },
+  { key: 'sharedReality', label: 'Shared Reality', weightPct: 25 },
+];
+
+function trustReportOgPayload(
+  campaign: Record<string, unknown>,
+  report: TrustReportPayload | null,
+): TrustReportOgPayload {
+  const summaryRaw = String(campaign.short_description ?? campaign.tagline ?? '')
+    .replace(/<[^>]*>/g, '')
+    .trim();
+  return {
+    campaignTitle: String(campaign.title ?? 'Campaign'),
+    category: campaign.category ? String(campaign.category) : null,
+    composite: report?.composite ?? null,
+    band: report?.band ?? null,
+    layers: TRUST_OG_LAYERS.map(({ key, label, weightPct }) => {
+      const layer = report?.[key];
+      const scored = layer?.status === 'scored' && layer.score != null && Number.isFinite(Number(layer.score));
+      return { label, weightPct, score: scored ? Number(layer!.score) : null };
+    }),
+    summary: summaryRaw || null,
+  };
+}
+
+function trustReportOgDescription(payload: TrustReportOgPayload): string {
+  const scores = payload.layers
+    .map((l) => `${l.label} ${l.score != null ? `${Math.round(l.score)}/100` : 'not yet scored'}`)
+    .join(' · ');
+  const lead = payload.band ? `${payload.band}. ` : 'Independent review in progress. ';
+  return `${lead}${scores}.${payload.summary ? ` ${payload.summary}` : ''}`.slice(0, 300);
+}
+
+async function loadTrustReportForOg(
+  campaignId: string,
+): Promise<{ ok: false; status: number; message: string } | { ok: true; campaign: Record<string, unknown>; report: TrustReportPayload | null }> {
+  const doc = await db.collection('campaigns').doc(campaignId).get();
+  if (!doc.exists) return { ok: false, status: 404, message: 'Campaign not found' };
+  const campaign = { id: doc.id, ...(doc.data() as Record<string, unknown>) };
+  let report: TrustReportPayload | null = null;
+  try {
+    report = await getPublishedTrustReport(db, campaignId, campaign);
+  } catch (e) {
+    console.error('[og/report] published report load failed; serving unscored card', e);
+  }
+  return { ok: true, campaign, report };
+}
+
+app.get('/og/report/:id/image', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const loaded = await loadTrustReportForOg(id);
+    if (!loaded.ok) {
+      res.status(loaded.status).send(loaded.message);
+      return;
+    }
+    const png = renderTrustReportOgPng(trustReportOgPayload(loaded.campaign, loaded.report));
+    res.setHeader('Content-Type', 'image/png');
+    // Reports can be re-reviewed and republished — cache briefly, never immutable.
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.send(png);
+  } catch (error) {
+    console.error('OG report image error:', error);
+    res.status(500).send('Error generating trust report share image');
+  }
+});
+
+app.get('/og/report/:id', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const loaded = await loadTrustReportForOg(id);
+    if (!loaded.ok) {
+      res.status(loaded.status).send(loaded.message);
+      return;
+    }
+    const payload = trustReportOgPayload(loaded.campaign, loaded.report);
+    const title =
+      payload.composite != null
+        ? `Trust Score ${Math.round(payload.composite)}/100 — ${payload.campaignTitle}`
+        : `Trust Score Report — ${payload.campaignTitle}`;
+    const description = trustReportOgDescription(payload);
+    const image = `${API_PUBLIC_BASE}/og/report/${encodeURIComponent(id)}/image`;
+    const canonicalUrl = `${ogRedirectBase(req)}/campaign/${id}/report`;
+    // Forward share-link UTMs through the crawler→human hop (same as /og/campaign).
+    const qsIndex = req.originalUrl.indexOf('?');
+    const forwardedQuery = qsIndex >= 0 ? req.originalUrl.slice(qsIndex) : '';
+    const ua = String(req.get('user-agent') || '');
+    const isCrawler = isSharePreviewCrawler(ua);
+
+    const ogHtml = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${escapeHtml(title)} | Unravel</title>
+  <meta property="og:title" content="${escapeHtml(title)}">
+  <meta property="og:description" content="${escapeHtml(description)}">
+  <meta property="og:image" content="${escapeHtml(image)}">
+  <meta property="og:image:secure_url" content="${escapeHtml(image)}">
+  <meta property="og:image:width" content="${TRUST_OG_WIDTH}">
+  <meta property="og:image:height" content="${TRUST_OG_HEIGHT}">
+  <meta property="og:url" content="${escapeHtml(canonicalUrl)}">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Unravel">
+  <meta property="fb:app_id" content="${escapeHtml(FB_APP_ID)}">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="${escapeHtml(title)}">
+  <meta name="twitter:description" content="${escapeHtml(description)}">
+  <meta name="twitter:image" content="${escapeHtml(image)}">
+</head>
+<body><p>${escapeHtml(title)}</p></body>
+</html>`;
+    if (isCrawler) {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.setHeader('Cache-Control', 'public, max-age=300');
+      return res.send(ogHtml);
+    }
+
+    return res.redirect(302, `${canonicalUrl}${forwardedQuery}`);
+  } catch (error) {
+    console.error('OG report error:', error);
+    res.status(500).send('Error loading trust report share card');
   }
 });
 
