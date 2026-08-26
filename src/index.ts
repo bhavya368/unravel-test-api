@@ -12,6 +12,7 @@ import { Storage } from '@google-cloud/storage';
 import Stripe from 'stripe';
 import { PostHog } from 'posthog-node';
 import { randomUUID } from 'crypto';
+import sanitizeHtml from 'sanitize-html';
 import {
   computeCumulativePersonalImpactSnapshot,
   computePerCampaignPersonalImpactSnapshot,
@@ -305,6 +306,21 @@ async function upsertBacking(input: BackingInput): Promise<void> {
     }
   }
 
+  // Stamp the readable campaign title so PostHog breakdowns show names, not just
+  // the campaign_id slug — parity with the client campaign_viewed/donate events.
+  let campaignTitle: string | null = null;
+  if (input.campaignId) {
+    try {
+      const campaignDoc = await db.collection('campaigns').doc(input.campaignId).get();
+      if (campaignDoc.exists) {
+        const data = campaignDoc.data() as Record<string, unknown>;
+        campaignTitle = String(data?.title || data?.name || '').trim() || null;
+      }
+    } catch {
+      /* lookup failure — the event simply stays campaign_id-only */
+    }
+  }
+
   const ph = getPostHog();
   if (ph && input.distinctId) {
     ph.capture({
@@ -316,6 +332,7 @@ async function upsertBacking(input: BackingInput): Promise<void> {
         amount_total: input.amountTotal,
         amount_discount: input.amountDiscount,
         campaign_id: input.campaignId,
+        campaign_title: campaignTitle,
         is_guest: input.isGuest,
         is_first_backing: isFirstBacking,
         utm_source: input.utmSource,
@@ -565,6 +582,56 @@ async function createStripeProductForApprovedCampaign(
   return { productId: product.id, donationPriceId };
 }
 
+// UE-223 — ToS 4.2 compliance word list ("Prohibited Content and Uses"). Mirrors
+// unravel-ui/src/constants/forbiddenWords.js — keep both lists in sync (no shared
+// package between the two repos). Server-side check is defense in depth behind the
+// client-side live check on the Create a Campaign wizard's Submit step.
+const FORBIDDEN_WORDS = ['verified', 'certified', 'guaranteed', 'truth-checked', 'fact-certified', 'endorsed'];
+
+function stripHtmlForWordScan(html: unknown): string {
+  return String(html ?? '').replace(/<[^>]*>/g, ' ');
+}
+
+/** Returns the FORBIDDEN_WORDS found (case-insensitive, tag-stripped) across the given fields. */
+function findForbiddenWords(...fields: unknown[]): string[] {
+  const haystack = fields.map(stripHtmlForWordScan).join(' ').toLowerCase();
+  return FORBIDDEN_WORDS.filter((word) => haystack.includes(word));
+}
+
+/** Same copy deck as unravel-ui/src/constants/forbiddenWords.js's forbiddenWordsMessage(). */
+function forbiddenWordsMessage(hits: string[]): string {
+  return `Language review: "${hits.join('", "')}" is not allowed on Unravel`;
+}
+
+// UE-223/C4 — long_description and why_backers_should_care are creator-authored TipTap HTML,
+// rendered raw via dangerouslySetInnerHTML on public pages. Allowlist matches exactly what the
+// editor's toolbar (StarterKit + Underline + Link + TextStyle/FontSize/Color + Youtube +
+// the custom SocialEmbed node, see unravel-ui/src/pages/CreateCampaign.jsx + extensions/SocialEmbed.js)
+// can actually produce — nothing else survives.
+const SANITIZE_HTML_OPTIONS: sanitizeHtml.IOptions = {
+  allowedTags: [
+    'p', 'br', 'strong', 'em', 'u', 's', 'blockquote', 'code', 'pre',
+    'h1', 'h2', 'h3', 'h4', 'ul', 'ol', 'li', 'a', 'img', 'span', 'div', 'iframe',
+  ],
+  allowedAttributes: {
+    a: ['href', 'target', 'rel'],
+    img: ['src', 'alt', 'width', 'height'],
+    span: ['style'],
+    div: ['data-type', 'data-embed-src', 'data-embed-type', 'class'],
+    iframe: ['src', 'width', 'height', 'frameborder', 'allowfullscreen', 'loading', 'class', 'title'],
+  },
+  allowedStyles: {
+    span: {
+      color: [/^#[0-9a-fA-F]{3,8}$/],
+      'font-size': [/^\d{1,3}px$/],
+    },
+  },
+  // Only the 3 embed providers CreateCampaign.jsx's toolbar can insert; blocks arbitrary iframe injection.
+  allowedIframeHostnames: ['www.youtube.com', 'platform.twitter.com', 'www.facebook.com'],
+  allowedSchemes: ['http', 'https', 'mailto'],
+  allowProtocolRelative: false,
+};
+
 // Function to analyze campaign content with AI moderation
 async function analyzeCampaignWithAI(title: string, description: string, tagline?: string): Promise<string> {
   try {
@@ -644,6 +711,90 @@ Tagline: ${tagline || 'N/A'}
     
     return 'AI moderation unavavailable for this campaign. Please review manually.';
   }
+}
+
+// UE-223 — Create a Campaign wizard, Step 6 "The story, in summary" cards. Three
+// independent prompts (Chloe, 20 Aug sprint call) drafted from the creator's own copy;
+// the creator's edit always wins over a re-generate (never called automatically). Prompt
+// text lives in Firestore (ai_prompts/{doc}.campaign_summary.*, editable via
+// GET/PUT /ai-prompts/campaign-summary, same pattern as ai_moderation) so it can be tuned
+// without a deploy; these are the defaults the first call seeds if nothing is set yet.
+const DEFAULT_CAMPAIGN_SUMMARY_PROMPTS = {
+  what_this_is_about:
+    "Summarize this campaign in 2-3 plain sentences for someone skimming a feed. State the concrete problem or event, who's involved, and what the campaign is asking people to do. Use only facts from the text below; no adjectives about importance, no speculation. Write in third person, present tense.\n\n{{REFERENCE_TEXT}}",
+  who_its_for:
+    "In 1-2 sentences, describe the specific audience this campaign is meant to reach and their situation or identity, not demographics like age/income unless stated. Base it only on the target audience text below; do not invent a broader audience.\n\n{{REFERENCE_TEXT}}",
+  why_it_matters_to_you:
+    'In 2-3 sentences, explain why a backer should care, grounded in the stakes described below (who\'s affected, what changes if this gets attention). Do not use the forbidden compliance words (verified, certified, guaranteed, truth-checked, fact-certified, endorsed); use "reviewed" or "evaluated" instead if referencing review status. No hype language, no exclamation points.\n\n{{REFERENCE_TEXT}}',
+};
+
+type CampaignSummaryInput = {
+  title?: string;
+  category?: string;
+  short_description?: string;
+  long_description?: string;
+  target_audience?: string;
+  why_it_matters?: string;
+  why_backers_should_care?: string;
+};
+
+type CampaignSummaryResult = {
+  what_this_is_about: string;
+  who_its_for: string;
+  why_it_matters_to_you: string;
+};
+
+async function generateCampaignSummary(input: CampaignSummaryInput): Promise<CampaignSummaryResult> {
+  const promptDoc = await db.collection('ai_prompts').doc(AI_PROMPTS_DOC_ID).get();
+  const stored = (promptDoc.exists ? promptDoc.data()?.campaign_summary : null) as
+    | Partial<typeof DEFAULT_CAMPAIGN_SUMMARY_PROMPTS>
+    | null
+    | undefined;
+  const prompts = { ...DEFAULT_CAMPAIGN_SUMMARY_PROMPTS, ...(stored ?? {}) };
+
+  const referenceText = {
+    what_this_is_about: [
+      `Campaign title: ${input.title || 'N/A'}`,
+      `Category: ${input.category || 'N/A'}`,
+      `Short description: ${input.short_description || 'N/A'}`,
+      `Full campaign description: ${stripHtmlForWordScan(input.long_description) || 'N/A'}`,
+    ].join('\n'),
+    who_its_for: [
+      `Target audience: ${input.target_audience || 'N/A'}`,
+      `Why would it matter to them: ${input.why_it_matters || 'N/A'}`,
+    ].join('\n'),
+    why_it_matters_to_you: `Why should backers care: ${stripHtmlForWordScan(input.why_backers_should_care) || 'N/A'}`,
+  };
+
+  const modelName = process.env.GEMINI_MODEL_CAMPAIGN_SUMMARY || 'gemini-2.5-flash-lite';
+  const model = vertexAI.getGenerativeModel({ model: modelName });
+
+  const runOne = (cardKey: keyof CampaignSummaryResult) =>
+    traceGeminiCall({
+      name: `campaign-summary-${cardKey}`,
+      model: modelName,
+      tags: ['campaign-summary'],
+      metadata: { title: metaStr(input.title, 120), card: cardKey },
+      input: { prompt: prompts[cardKey].replace('{{REFERENCE_TEXT}}', referenceText[cardKey]) },
+      run: async () => {
+        const result = await model.generateContent({
+          contents: [{
+            role: 'user',
+            parts: [{ text: prompts[cardKey].replace('{{REFERENCE_TEXT}}', referenceText[cardKey]) }],
+          }],
+        });
+        const text = (result.response.candidates?.[0]?.content?.parts?.[0]?.text || '').trim();
+        return { result: text, output: text, usageDetails: extractVertexUsage(result) };
+      },
+    });
+
+  const [what_this_is_about, who_its_for, why_it_matters_to_you] = await Promise.all([
+    runOne('what_this_is_about'),
+    runOne('who_its_for'),
+    runOne('why_it_matters_to_you'),
+  ]);
+
+  return { what_this_is_about, who_its_for, why_it_matters_to_you };
 }
 
 // Bias wheel: evidence, facts, perspective, tone (1-5), direction (categorical)
@@ -4093,6 +4244,50 @@ app.put('/ai-prompts/bias-wheel', async (req: Request, res: Response) => {
   }
 });
 
+// GET - Fetch the UE-223 campaign-summary prompts (3 sub-prompts) from Firestore,
+// falling back to the built-in defaults when nothing has been saved yet.
+app.get('/ai-prompts/campaign-summary', async (req: Request, res: Response) => {
+  try {
+    const doc = await db.collection('ai_prompts').doc(AI_PROMPTS_DOC_ID).get();
+    const stored = (doc.exists ? doc.data()?.campaign_summary : null) as
+      | Partial<typeof DEFAULT_CAMPAIGN_SUMMARY_PROMPTS>
+      | null
+      | undefined;
+    res.json({ campaign_summary: { ...DEFAULT_CAMPAIGN_SUMMARY_PROMPTS, ...(stored ?? {}) } });
+  } catch (error: unknown) {
+    const err = error as { message?: string; code?: number };
+    console.error('Error fetching campaign summary prompts:', err?.message ?? error, err?.code);
+    res.status(500).json({ error: 'Failed to fetch campaign summary prompts', detail: err?.message ?? String(error) });
+  }
+});
+
+// PUT - Update one or more of the 3 campaign-summary sub-prompts (merge, not replace-all).
+app.put('/ai-prompts/campaign-summary', async (req: Request, res: Response) => {
+  try {
+    const { campaign_summary } = req.body;
+    if (!campaign_summary || typeof campaign_summary !== 'object') {
+      return res.status(400).json({ error: 'campaign_summary object is required in request body' });
+    }
+    const allowedKeys = Object.keys(DEFAULT_CAMPAIGN_SUMMARY_PROMPTS);
+    const update: Record<string, string> = {};
+    for (const key of allowedKeys) {
+      const v = (campaign_summary as Record<string, unknown>)[key];
+      if (v !== undefined) {
+        if (typeof v !== 'string') {
+          return res.status(400).json({ error: `campaign_summary.${key} must be a string` });
+        }
+        update[key] = v;
+      }
+    }
+    await db.collection('ai_prompts').doc(AI_PROMPTS_DOC_ID).set({ campaign_summary: update }, { merge: true });
+    res.json({ campaign_summary: update, message: 'Campaign summary prompts updated successfully' });
+  } catch (error: unknown) {
+    const err = error as { message?: string; code?: number };
+    console.error('Error updating campaign summary prompts:', err?.message ?? error, err?.code);
+    res.status(500).json({ error: 'Failed to update campaign summary prompts', detail: err?.message ?? String(error) });
+  }
+});
+
 // Delete files from GCS by their public image URLs (e.g. .../images/fileName.png)
 async function deleteGeneratedImagesFromGcs(imageUrls: string[]): Promise<void> {
   if (!imageUrls?.length) return;
@@ -4189,6 +4384,47 @@ function sanitizeCampaignContentFields(data: Record<string, unknown>): void {
   if (data.short_description !== undefined && data.short_description !== null) {
     data.short_description = String(data.short_description).trim().slice(0, 500);
   }
+
+  // UE-223 — new wizard fields. Rich-text fields (creator-authored HTML, rendered raw via
+  // dangerouslySetInnerHTML on the public pages) are sanitized here, the single write path
+  // both fields go through.
+  if (data.long_description !== undefined && data.long_description !== null) {
+    data.long_description = sanitizeHtml(String(data.long_description), SANITIZE_HTML_OPTIONS);
+  }
+  if (data.why_backers_should_care !== undefined && data.why_backers_should_care !== null) {
+    data.why_backers_should_care = sanitizeHtml(String(data.why_backers_should_care), SANITIZE_HTML_OPTIONS);
+  }
+
+  if (data.organization_name !== undefined && data.organization_name !== null) {
+    const v = String(data.organization_name).trim().slice(0, 120);
+    if (v) data.organization_name = v;
+    else delete data.organization_name;
+  }
+  if (data.target_audience !== undefined && data.target_audience !== null) {
+    data.target_audience = String(data.target_audience).trim().slice(0, 1000);
+  }
+
+  for (const key of ['what_this_is_about', 'who_its_for', 'why_it_matters_to_you', 'why_it_matters_backer'] as const) {
+    if (data[key] !== undefined && data[key] !== null) {
+      const v = String(data[key]).trim().slice(0, 600);
+      if (v) data[key] = v;
+      else delete data[key];
+    }
+  }
+  if (data.same_why_it_matters !== undefined) {
+    data.same_why_it_matters = Boolean(data.same_why_it_matters);
+  }
+  if (data.image_rights_confirmed !== undefined) {
+    data.image_rights_confirmed = Boolean(data.image_rights_confirmed);
+  }
+  if (data.terms_attested !== undefined) {
+    // Note: this function runs on both create (.add(), no FieldValue.delete() allowed) and
+    // update (.update(), where it would be allowed) — so un-attesting just leaves any prior
+    // terms_attested_at in place rather than clearing it; not a real path in this feature.
+    data.terms_attested = Boolean(data.terms_attested);
+    if (data.terms_attested) data.terms_attested_at = new Date().toISOString();
+    else delete data.terms_attested_at;
+  }
 }
 
 // POST - Create a new document
@@ -4200,6 +4436,47 @@ app.post('/data/:collection', async (req: Request, res: Response) => {
     // AI moderation for campaigns
     let aiModerationRecommendation = '';
     if (collection === 'campaigns') {
+      // UE-223 — ToS 4.2 gate, checked before anything else (no AI call, no Slack post,
+      // no write, if the creator's own copy contains a banned word). Client-side check
+      // on the wizard's Submit step is the same list; this is defense in depth.
+      const bannedHits = findForbiddenWords(data.title, data.short_description, data.long_description);
+      if (bannedHits.length) {
+        return res.status(400).json({ error: forbiddenWordsMessage(bannedHits), forbiddenWords: bannedHits });
+      }
+
+      // Creator UID from verified Firebase token only (not client-supplied).
+      // Admin-created campaigns may set a public display name via creator_name.
+      const isAdminCreated = data.admin_created === true || data.admin_created === 'true';
+      const adminCreatorDisplay = isAdminCreated
+        ? String(data.creator_name ?? data.creator ?? '').trim().slice(0, 120)
+        : '';
+
+      // Funding goal: admin sets it separately at approval (existing behavior, default 0).
+      // Public creator flow (UE-223 wizard) sets it up front and it's authoritative — admin
+      // can still override before Approve — so it's re-validated server-side here, not trusted.
+      if (!isAdminCreated) {
+        if (data.funding_goal === undefined || data.funding_goal === null) {
+          return res.status(400).json({ error: 'funding_goal is required and must be at least $100' });
+        }
+        const goal = Number(data.funding_goal);
+        if (!Number.isFinite(goal) || goal < 100) {
+          return res.status(400).json({ error: 'funding_goal must be at least $100' });
+        }
+        data.funding_goal = goal;
+      } else if (data.funding_goal === undefined || data.funding_goal === null) {
+        data.funding_goal = 0;
+      }
+
+      // Funding window (14/30/45/60 days) reuses the same validator the admin approval
+      // PATCH path already relies on (applyCampaignDurationPatch) — see UE-223 plan.
+      if (data.duration_days !== undefined) {
+        const durationResult = applyCampaignDurationPatch(data, {});
+        if (!durationResult.ok) {
+          return res.status(400).json({ error: durationResult.error });
+        }
+        Object.assign(data, durationResult.patch);
+      }
+
       try {
         console.log('Running AI moderation analysis...');
         // Frontend sends short_description and long_description; combine for AI
@@ -4216,14 +4493,10 @@ app.post('/data/:collection', async (req: Request, res: Response) => {
         console.error('AI moderation failed:', aiError);
         aiModerationRecommendation = 'AI moderation analysis unavailable. Please review manually.';
       }
-      
+
       // Set default status to "Pending" if not provided
       if (!data.status) {
         data.status = 'Pending';
-      }
-      // Funding goal is set by admin on approve; default to 0 when user creates campaign
-      if (data.funding_goal === undefined || data.funding_goal === null) {
-        data.funding_goal = 0;
       }
       // Set default funding_current to 0 (how much money was given to campaign)
       if (data.funding_current === undefined) {
@@ -4243,13 +4516,6 @@ app.post('/data/:collection', async (req: Request, res: Response) => {
       delete data.unusedGeneratedImageUrls; // do not store in Firestore
 
       sanitizeCampaignContentFields(data);
-
-      // Creator UID from verified Firebase token only (not client-supplied).
-      // Admin-created campaigns may set a public display name via creator_name.
-      const isAdminCreated = data.admin_created === true || data.admin_created === 'true';
-      const adminCreatorDisplay = isAdminCreated
-        ? String(data.creator_name ?? data.creator ?? '').trim().slice(0, 120)
-        : '';
       delete data.created_by;
       delete data.created_by_uid;
       delete data.creator;
@@ -4512,6 +4778,28 @@ app.patch('/data/:collection/:id', async (req: Request, res: Response) => {
       }
       const prev = snap.data() as Record<string, unknown>;
 
+      // UE-223 — same ToS 4.2 gate as create, checked against the post-patch effective
+      // values (this patch's fields win, else fall back to what's already stored) so an
+      // edit can't sneak a banned word in one field at a time across multiple PATCHes.
+      const bannedHits = findForbiddenWords(
+        data.title ?? prev.title,
+        data.short_description ?? prev.short_description,
+        data.long_description ?? prev.long_description
+      );
+      if (bannedHits.length) {
+        return res.status(400).json({ error: forbiddenWordsMessage(bannedHits), forbiddenWords: bannedHits });
+      }
+
+      // Public creator PATCH (edit/resubmit) re-validates funding_goal the same way create
+      // does; admin PATCH (no firebaseUid) may still set/clear it directly at approval.
+      if (req.firebaseUid && data.funding_goal !== undefined && data.funding_goal !== null) {
+        const goal = Number(data.funding_goal);
+        if (!Number.isFinite(goal) || goal < 100) {
+          return res.status(400).json({ error: 'funding_goal must be at least $100' });
+        }
+        data.funding_goal = goal;
+      }
+
       const unusedGeneratedImageUrls = data.unusedGeneratedImageUrls;
       if (Array.isArray(unusedGeneratedImageUrls) && unusedGeneratedImageUrls.length > 0) {
         deleteGeneratedImagesFromGcs(unusedGeneratedImageUrls).catch((err) =>
@@ -4658,6 +4946,23 @@ app.delete('/data/:collection/:id', async (req: Request, res: Response) => {
 });
 
 // POST - Upload a campaign image (base64 data URL or raw base64 → GCS, same bucket as generated images)
+/** Sniffs magic bytes to confirm `buffer` is actually one of these 4 image formats. */
+function sniffImageFormat(buffer: Buffer): 'jpeg' | 'png' | 'webp' | 'gif' | null {
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return 'jpeg';
+  if (
+    buffer.length >= 8 &&
+    buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47 &&
+    buffer[4] === 0x0d && buffer[5] === 0x0a && buffer[6] === 0x1a && buffer[7] === 0x0a
+  ) return 'png';
+  if (
+    buffer.length >= 12 &&
+    buffer.toString('ascii', 0, 4) === 'RIFF' &&
+    buffer.toString('ascii', 8, 12) === 'WEBP'
+  ) return 'webp';
+  if (buffer.length >= 6 && buffer.toString('ascii', 0, 6).match(/^GIF8[79]a$/)) return 'gif';
+  return null;
+}
+
 app.post('/upload-campaign-image', async (req: Request, res: Response) => {
   try {
     const { imageBase64 } = req.body as { imageBase64?: string };
@@ -4677,6 +4982,15 @@ app.post('/upload-campaign-image', async (req: Request, res: Response) => {
     }
     if (buffer.length < 32) {
       return res.status(400).json({ error: 'Invalid image data' });
+    }
+    // UE-223/C9 — verify the bytes are actually one of the image formats the endpoint
+    // serves back out (unravel-api's /images/:fileName route makes this public), not just
+    // trusting the client-declared mimeType. Shared by every uploader on the site (campaign
+    // visuals/ad, hero slideshow, profile photo, etc.) so this checks magic bytes for the
+    // formats already supported below rather than narrowing what's accepted.
+    const sniffedFormat = sniffImageFormat(buffer);
+    if (!sniffedFormat) {
+      return res.status(400).json({ error: 'File is not a valid JPG, PNG, WebP or GIF image' });
     }
     const bucketName = process.env.GCS_BUCKET || 'unravel-generated-images';
     const bucket = storage.bucket(bucketName);
@@ -4794,6 +5108,28 @@ async function generateSingleImage(description: string): Promise<GeneratedImage 
     return null;
   }
 }
+
+// POST - UE-223: draft the 3 "story, in summary" cards from the creator's own copy.
+// Stateless (no draft/campaign id required — the wizard can call this before a draft
+// even exists). Auth required so this can't be scraped as a free Gemini proxy.
+app.post('/generate-campaign-summary', async (req: Request, res: Response) => {
+  const uid = await requireFirebaseUid(req, res);
+  if (!uid) return;
+  try {
+    const {
+      title, category, short_description, long_description,
+      target_audience, why_it_matters, why_backers_should_care,
+    } = req.body ?? {};
+    const summary = await generateCampaignSummary({
+      title, category, short_description, long_description, target_audience, why_it_matters, why_backers_should_care,
+    });
+    res.json(summary);
+  } catch (error: unknown) {
+    const err = error as { message?: string; code?: number };
+    console.error('POST /generate-campaign-summary:', err?.message ?? error, err?.code);
+    res.status(500).json({ error: 'Failed to generate campaign summary', detail: err?.message ?? String(error) });
+  }
+});
 
 // POST - Generate 3 images using Vertex AI and store in Cloud Storage
 app.post('/generate-image', async (req: Request, res: Response) => {
