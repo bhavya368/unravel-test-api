@@ -6541,16 +6541,65 @@ function resolveCreativeImageUrlForFacebookAd(data: any, thumbnailOverride?: str
   return 'https://www.facebook.com/images/fb_icon_325x325.png';
 }
 
+const FACEBOOK_OBJECTIVE_PRESETS = {
+  traffic: {
+    key: 'traffic',
+    label: 'Objective: Traffic · Optimized: Link clicks',
+    objective: 'OUTCOME_TRAFFIC',
+    optimization_goal: 'LINK_CLICKS',
+    billing_event: 'IMPRESSIONS',
+  },
+  reach: {
+    key: 'reach',
+    label: 'Objective: Awareness · Optimized: Reach',
+    objective: 'OUTCOME_AWARENESS',
+    optimization_goal: 'REACH',
+    billing_event: 'IMPRESSIONS',
+  },
+  awareness: {
+    key: 'awareness',
+    label: 'Objective: Awareness · Optimized: Impressions',
+    objective: 'OUTCOME_AWARENESS',
+    optimization_goal: 'IMPRESSIONS',
+    billing_event: 'IMPRESSIONS',
+  },
+  engagement: {
+    key: 'engagement',
+    label: 'Objective: Engagement · Optimized: Post engagement',
+    objective: 'OUTCOME_ENGAGEMENT',
+    optimization_goal: 'POST_ENGAGEMENT',
+    billing_event: 'IMPRESSIONS',
+  },
+} as const;
+
+type FacebookObjectivePresetKey = keyof typeof FACEBOOK_OBJECTIVE_PRESETS;
+
+function resolveFacebookObjectivePreset(
+  raw: unknown
+): (typeof FACEBOOK_OBJECTIVE_PRESETS)[FacebookObjectivePresetKey] {
+  const key = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  if (key && key in FACEBOOK_OBJECTIVE_PRESETS) {
+    return FACEBOOK_OBJECTIVE_PRESETS[key as FacebookObjectivePresetKey];
+  }
+  if (raw == null || raw === '') {
+    return FACEBOOK_OBJECTIVE_PRESETS.traffic;
+  }
+  const allowed = Object.keys(FACEBOOK_OBJECTIVE_PRESETS).join(', ');
+  throw new Error(`Invalid objective_preset. Allowed: ${allowed}`);
+}
+
 async function publishFacebookAdForCampaign(
   campaignId: string,
-  thumbnailOverride?: string
-): Promise<{ campaignId: string; adId: string }> {
+  thumbnailOverride?: string,
+  objectivePresetRaw?: unknown
+): Promise<{ campaignId: string; adId: string; objective_preset: string }> {
   const bizSdk = require('facebook-nodejs-business-sdk');
   const AdAccount = bizSdk.AdAccount;
   const accessToken = process.env.FACEBOOK_ACCESS_TOKEN;
   const adAccountId = process.env.FACEBOOK_AD_ACCOUNT_ID;
   const pageId = process.env.FACEBOOK_PAGE_ID;
   const frontendBaseUrl = (process.env.FRONTEND_BASE_URL || '').replace(/\/$/, '');
+  const preset = resolveFacebookObjectivePreset(objectivePresetRaw);
 
   if (!accessToken || !adAccountId || !pageId || !frontendBaseUrl) {
     throw new Error('Facebook ad config missing: set FACEBOOK_ACCESS_TOKEN, FACEBOOK_AD_ACCOUNT_ID, FACEBOOK_PAGE_ID, FRONTEND_BASE_URL in .env');
@@ -6582,12 +6631,12 @@ async function publishFacebookAdForCampaign(
   try {
     const campaign = await account.createCampaign([], {
       name: baseName + ' Campaign',
-      objective: 'OUTCOME_TRAFFIC',
-status: 'PAUSED',
-    special_ad_categories: [],
-    is_adset_budget_sharing_enabled: false,
-  });
-  fbCampaignId = campaign.id;
+      objective: preset.objective,
+      status: 'PAUSED',
+      special_ad_categories: [],
+      is_adset_budget_sharing_enabled: false,
+    });
+    fbCampaignId = campaign.id;
   } catch (err: any) {
     console.error('Facebook createCampaign failed:', err?.response ?? err);
     throw new Error(getFacebookErrorMessage(err, 'Create Campaign'));
@@ -6606,8 +6655,8 @@ status: 'PAUSED',
       bid_amount: '10',
       start_time: toISO(start),
       end_time: toISO(end),
-      billing_event: 'IMPRESSIONS',
-      optimization_goal: 'LINK_CLICKS',
+      billing_event: preset.billing_event,
+      optimization_goal: preset.optimization_goal,
       targeting: JSON.stringify(targeting),
       status: 'PAUSED',
     });
@@ -6662,26 +6711,30 @@ status: 'PAUSED',
     facebook_campaign_id: fbCampaignId,
     facebook_ad_set_id: adSetId,
     facebook_published_at: new Date(),
+    facebook_objective_preset: preset.key,
+    facebook_objective: preset.objective,
+    facebook_optimization_goal: preset.optimization_goal,
     ...(audienceSize ? audienceSizeToCampaignPatch(audienceSize) : {}),
   });
 
-  return { campaignId: fbCampaignId, adId };
+  return { campaignId: fbCampaignId, adId, objective_preset: preset.key };
 }
 
 app.post('/facebook/publish-ad', async (req: Request, res: Response) => {
-  const { campaignId, thumbnail_url } = req.body;
+  const { campaignId, thumbnail_url, objective_preset } = req.body;
   if (!campaignId || typeof campaignId !== 'string') {
     return res.status(400).json({ error: 'campaignId is required' });
   }
   const thumbnailOverride =
     typeof thumbnail_url === 'string' && thumbnail_url.trim() ? thumbnail_url.trim() : undefined;
   try {
-    const result = await publishFacebookAdForCampaign(campaignId, thumbnailOverride);
+    const result = await publishFacebookAdForCampaign(campaignId, thumbnailOverride, objective_preset);
     return res.json({ ok: true, ...result });
   } catch (error: any) {
     const message = error?.message || 'Failed to publish ad to Facebook';
+    const status = typeof message === 'string' && message.startsWith('Invalid objective_preset') ? 400 : 500;
     console.error('Facebook publish-ad error:', message, error);
-    return res.status(500).json({ error: message });
+    return res.status(status).json({ error: message });
   }
 });
 
