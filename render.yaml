@@ -1,0 +1,87 @@
+# Render blueprint — deploys the Unravel API.
+#
+# The frontend lives in its own repo (unravel-network/unravel-ui) and carries its own
+# blueprint. This service is the backend only.
+#
+# Values marked `sync: false` are NOT stored here. Render prompts for them on first
+# deploy, so no secret is ever committed to git. Set them in the dashboard under the
+# service → Environment.
+#
+# Google credentials: the app calls applicationDefault(), which reads the JSON key at
+# GOOGLE_APPLICATION_CREDENTIALS. Upload the key under the service → Secret Files as
+# `sa-key.json` (Render mounts it at /etc/secrets/sa-key.json) and leave the env var
+# below pointing at that path.
+#
+# NOTE: do NOT set FIRESTORE_EMULATOR_HOST here. It only exists for local development;
+# setting it in a deploy makes the API try to reach an emulator that isn't running.
+
+services:
+  - type: web
+    name: unravel-api
+    runtime: node
+    rootDir: .
+    branch: main
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      # Render supplies PORT; the app already reads it (defaults to 8080).
+      - key: GOOGLE_APPLICATION_CREDENTIALS
+        value: /etc/secrets/sa-key.json
+
+      # --- core ---
+      - key: API_KEY
+        sync: false
+      - key: FRONTEND_ORIGIN
+        sync: false
+      - key: FRONTEND_BASE_URL
+        sync: false
+      - key: API_BASE_URL
+        sync: false
+      - key: GCS_BUCKET
+        sync: false
+
+      # --- AI ---
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL_CAMPAIGN_DRAFT
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+
+      # --- payments ---
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_PUBLISHABLE_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+
+      # --- analytics ---
+      - key: POSTHOG_KEY
+        sync: false
+      - key: POSTHOG_HOST
+        sync: false
+
+      # --- Reddit Ads ---
+      - key: REDDIT_CLIENT_ID
+        sync: false
+      - key: REDDIT_CLIENT_SECRET
+        sync: false
+      - key: REDDIT_REFRESH_TOKEN
+        sync: false
+      - key: REDDIT_AD_ACCOUNT_ID
+        sync: false
+      - key: REDDIT_FUNDING_INSTRUMENT_ID
+        sync: false
+      - key: REDDIT_USER_AGENT
+        sync: false
+
+      # --- Slack (moderation notifications) ---
+      - key: SLACK_BOT_TOKEN
+        sync: false
+      - key: SLACK_CHANNEL
+        sync: false
