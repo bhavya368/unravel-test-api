@@ -31,6 +31,13 @@ import {
 import { runCampaignReportDrips, parseCampaignReportDripRequest } from './campaignReportDrips';
 import { runCampaignUrgentWindow, parseUrgentWindowRequest } from './campaignUrgentWindow';
 import { sendContributionReceipt, AD_AMPLIFICATION_SPLIT } from './contributionReceipt';
+import { createRedditAdCampaign, verifyRedditAdsConnection } from './redditAds';
+import {
+  isAutoSyndicationEnabled,
+  publishCampaignToReddit,
+  publishCampaignToX,
+  syndicateApprovedCampaign,
+} from './socialSyndication';
 import {
   audienceSizeToCampaignPatch,
   DEFAULT_FACEBOOK_TARGETING,
@@ -74,6 +81,7 @@ import {
   runUutsPrescreenAndPersist,
   runUutsPrescreenScheduler,
 } from './uutsPrescreen';
+import { generateCampaignDraft } from './campaignDraftGenerator';
 import {
   extractVertexUsage,
   forceFlushLangfuse,
@@ -4769,6 +4777,9 @@ app.patch('/data/:collection/:id', async (req: Request, res: Response) => {
     let stripeProductId: string | undefined;
     let stripeDonationPriceId: string | undefined;
     let durationDeleteFields: string[] = [];
+    // Set on the Pending -> Approved transition; acted on after the write lands,
+    // because syndication re-reads the campaign and requires status 'Approved'.
+    let syndicateAfterUpdate = false;
 
     if (collection === 'campaigns') {
       const ref = db.collection(collection).doc(id);
@@ -4824,6 +4835,7 @@ app.patch('/data/:collection/:id', async (req: Request, res: Response) => {
       Object.assign(data, impactMetricsResult.patch);
 
       const becomingApproved = data.status === 'Approved' && prev.status !== 'Approved';
+      syndicateAfterUpdate = becomingApproved;
       if (becomingApproved) {
         const latestReview = await getLatestTrustReportReview(db, id);
         if (!isAcceptedDecision(latestReview?.review?.decision)) {
@@ -4892,12 +4904,35 @@ app.patch('/data/:collection/:id', async (req: Request, res: Response) => {
 
     await db.collection(collection).doc(id).update(updatePayload);
 
+    // Cross-post the freshly approved campaign to Unravel's X and Reddit accounts.
+    // Awaited so the admin sees the outcome, but it never throws: a platform
+    // outage must not turn a successful approval into a 500.
+    const syndication =
+      syndicateAfterUpdate && isAutoSyndicationEnabled()
+        ? await syndicateApprovedCampaign(db, id)
+        : undefined;
+
+    // Create the Reddit ad for a freshly approved campaign. Always PAUSED, and
+    // never fatal: an ads outage must not turn a successful approval into a 500.
+    let redditAd: Awaited<ReturnType<typeof createRedditAdCampaign>> | undefined;
+    if (syndicateAfterUpdate) {
+      try {
+        redditAd = await createRedditAdCampaign(db, id);
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(`[reddit-ads] campaign ${id} failed:`, message);
+        redditAd = { status: 'failed', error: message };
+      }
+    }
+
     const responseBody: Record<string, unknown> = {
       message: 'Document updated',
       id,
       ...data,
       ...(stripeProductId ? { stripe_product_id: stripeProductId } : {}),
       ...(stripeDonationPriceId ? { stripe_donation_price_id: stripeDonationPriceId } : {}),
+      ...(syndication ? { syndication } : {}),
+      ...(redditAd ? { redditAd } : {}),
     };
 
     res.json(
@@ -5128,6 +5163,35 @@ app.post('/generate-campaign-summary', async (req: Request, res: Response) => {
     const err = error as { message?: string; code?: number };
     console.error('POST /generate-campaign-summary:', err?.message ?? error, err?.code);
     res.status(500).json({ error: 'Failed to generate campaign summary', detail: err?.message ?? String(error) });
+  }
+});
+
+// ============ CAMPAIGN DRAFT GENERATION ============
+
+/** 6 requests per 15 minutes per IP — this is a paid multi-hundred-token Claude call, keep it tight. */
+const campaignDraftLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 6,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many campaign drafts requested from this device. Please try again in a few minutes.' },
+});
+
+// POST - Analyze a free-form campaign description and generate structured content for every
+// section of the campaign builder (basics, story, sources, ad copy, image prompts, slides).
+app.post('/generate-campaign-draft', campaignDraftLimiter, async (req: Request, res: Response) => {
+  try {
+    const { description } = req.body as { description?: string };
+    if (!description || typeof description !== 'string' || description.trim().length < 30) {
+      return res.status(400).json({ error: 'A campaign description of at least 30 characters is required' });
+    }
+
+    const draft = await generateCampaignDraft(description.trim());
+    res.json({ draft });
+  } catch (error: unknown) {
+    const err = error as { message?: string; status?: number };
+    console.error('Error generating campaign draft:', err?.message ?? error);
+    res.status(err?.status || 500).json({ error: 'Failed to generate campaign draft', details: err?.message });
   }
 });
 
@@ -6739,6 +6803,75 @@ app.post('/facebook/publish-ad', async (req: Request, res: Response) => {
 });
 
 // GET Facebook ad insights for a campaign (impressions, reach, clicks, spend, etc.)
+/**
+ * Manually cross-post an approved campaign to X and/or Reddit.
+ *
+ * Approval already syndicates automatically; these exist to retry after a token
+ * expiry or an outage, and to post campaigns approved before this shipped.
+ * `force: true` bypasses the already-posted guard and will create a duplicate.
+ */
+app.post('/social/publish', async (req: Request, res: Response) => {
+  const { campaignId, platform, force, subreddit } = req.body ?? {};
+  if (!campaignId || typeof campaignId !== 'string') {
+    return res.status(400).json({ error: 'campaignId is required' });
+  }
+  const target = typeof platform === 'string' ? platform.toLowerCase() : 'all';
+  if (!['x', 'reddit', 'all'].includes(target)) {
+    return res.status(400).json({ error: "platform must be 'x', 'reddit' or 'all'" });
+  }
+
+  const options = {
+    force: force === true,
+    subreddit: typeof subreddit === 'string' && subreddit.trim() ? subreddit.trim() : undefined,
+  };
+
+  try {
+    if (target === 'all') {
+      const results = await syndicateApprovedCampaign(db, campaignId, options);
+      const failed = results.find(r => r.status === 'failed');
+      // Surface a partial failure rather than reporting a clean success.
+      return res.status(failed ? 502 : 200).json({ ok: !failed, results });
+    }
+    const result =
+      target === 'x'
+        ? await publishCampaignToX(db, campaignId, options)
+        : await publishCampaignToReddit(db, campaignId, options);
+    return res.json({ ok: true, ...result });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : 'Failed to publish';
+    console.error(`Social publish error (${target}):`, message);
+    return res.status(500).json({ error: message });
+  }
+});
+
+/**
+ * Create the Reddit ad for an approved campaign by hand.
+ *
+ * Approval does this automatically; this is the retry path, and the way to cover
+ * campaigns approved before the integration shipped. The ad is always created
+ * PAUSED — a human activates it in Reddit Ads Manager.
+ */
+app.post('/reddit-ads/publish', async (req: Request, res: Response) => {
+  const { campaignId, force } = req.body ?? {};
+  if (!campaignId || typeof campaignId !== 'string') {
+    return res.status(400).json({ error: 'campaignId is required' });
+  }
+  try {
+    const result = await createRedditAdCampaign(db, campaignId, { force: force === true });
+    return res.json({ ok: result.status !== 'failed', ...result });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : 'Failed to create Reddit ad';
+    console.error('Reddit ads publish error:', message);
+    return res.status(500).json({ error: message });
+  }
+});
+
+/** Read-only health check for the Reddit Ads connection. Creates nothing. */
+app.get('/reddit-ads/status', async (_req: Request, res: Response) => {
+  const result = await verifyRedditAdsConnection();
+  return res.status(result.ok ? 200 : 503).json(result);
+});
+
 app.get('/facebook/campaign/:campaignId/insights', async (req: Request, res: Response) => {
   const { campaignId } = req.params;
   const accessToken = process.env.FACEBOOK_ACCESS_TOKEN;
