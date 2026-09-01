@@ -9,7 +9,11 @@
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
     "langfuse:setup-uuts": "ts-node -r dotenv/config --transpile-only scripts/langfuse/setupUutsEval.ts",
     "langfuse:seed-uuts": "ts-node -r dotenv/config --transpile-only scripts/langfuse/seedUutsDataset.ts",
-    "langfuse:experiment-uuts": "ts-node -r dotenv/config --transpile-only scripts/langfuse/runUutsExperiment.ts"
+    "langfuse:experiment-uuts": "ts-node -r dotenv/config --transpile-only scripts/langfuse/runUutsExperiment.ts",
+    "emulator": "firebase emulators:start --only firestore",
+    "emulator:export": "firebase emulators:start --only firestore --import ./local-dev/firestore-data --export-on-exit",
+    "x:authorize": "ts-node -r dotenv/config --transpile-only scripts/x/authorize.ts",
+    "x:verify": "ts-node -r dotenv/config --transpile-only scripts/x/verify.ts"
   },
   "keywords": [],
   "author": "",
@@ -46,6 +50,7 @@
     "@types/node": "^20.10.5",
     "@types/pdf-parse": "^1.1.5",
     "@types/sanitize-html": "^2.16.1",
+    "firebase-tools": "^15.28.1",
     "ts-node-dev": "^2.0.0",
     "typescript": "^5.3.3"
   }
