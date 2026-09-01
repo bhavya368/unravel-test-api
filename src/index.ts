@@ -139,14 +139,22 @@ declare global {
 dotenv.config();
 initLangfuse();
 
-// Initialize Firebase Admin (uses default credentials on Cloud Run)
+// Initialize Firebase Admin (uses default credentials on Cloud Run).
+// FIREBASE_PROJECT_ID must match the project the frontend signs in against, or
+// verifyIdToken rejects every token as "Invalid or expired".
 initializeApp({
   credential: applicationDefault(),
-  projectId: 'unravelreserchagent',
+  projectId: process.env.FIREBASE_PROJECT_ID || 'unravelreserchagent',
 });
 
-/** Named DB: campaigns, ai_prompts, etc. (existing data) */
-const db = getFirestore(getApp(), 'unravel');
+/** Named DB: campaigns, ai_prompts, etc. (existing data). A standalone deployment that
+ *  only has the `(default)` database sets FIRESTORE_DB_NAME=default to point both handles
+ *  at it — a named DB that doesn't exist fails every read with an opaque 500. */
+const FIRESTORE_DB_NAME = process.env.FIRESTORE_DB_NAME || 'unravel';
+const db =
+  FIRESTORE_DB_NAME === 'default'
+    ? getFirestore(getApp())
+    : getFirestore(getApp(), FIRESTORE_DB_NAME);
 /** Default DB `(default)`: user profiles */
 const usersDb = getFirestore(getApp());
 
