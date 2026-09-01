@@ -1,5 +1,7 @@
-import type { Firestore } from 'firebase-admin/firestore';
+import type { Firestore, QueryDocumentSnapshot } from 'firebase-admin/firestore';
 import type { VertexAI } from '@google-cloud/vertexai';
+import Anthropic from '@anthropic-ai/sdk';
+import { WebClient } from '@slack/web-api';
 import {
   applyConfidenceModifiers,
   computeComposite,
@@ -10,21 +12,355 @@ import {
   upsertTrustReport,
 } from './trustReport';
 
+import {
+  extractVertexUsage,
+  getActiveLangfuseTraceId,
+  metaStr,
+  traceGeminiCall,
+} from './langfuseInstrumentation';
+import {
+  evaluateUutsSchemaHealth,
+  loadUutsPromptTemplate,
+  scoreActiveUutsFailure,
+  scoreActiveUutsRun,
+  type UutsPromptSource,
+} from './uutsLangfuseEval';
+
 export const UUTS_PRESCREEN_PROMPT_FIELD = 'uuts_prescreen';
 
 const DEFAULT_PROMPT_DOC_ID = 'ucZnWEWd4t1f32H9f9Tj';
-const DEFAULT_MODEL = 'gemini-2.5-flash-lite';
+
+function slackUutsChannel(): string {
+  return text(process.env.SLACK_UUTS_CHANNEL, 'uuts-prescreen');
+}
+
+function frontendBaseUrl(): string {
+  const raw = text(process.env.FRONTEND_ORIGIN) || text(process.env.FRONTEND_BASE_URL);
+  return raw.replace(/\/+$/, '') || 'http://localhost:5173';
+}
+
+/** Notify #uuts-prescreen (or SLACK_UUTS_CHANNEL). Never throws — Slack must not fail the run. */
+async function notifyUutsPrescreenSlack(payload: {
+  status: 'complete' | 'manual_required';
+  campaignId: string;
+  title: string;
+  category?: string;
+  composite?: number | null;
+  model?: string;
+  provider?: string;
+  externalResearch?: boolean;
+  sourcesFetchedOk?: number | null;
+  sourcesFetchedFailed?: number | null;
+  sourcesUrlCount?: number | null;
+  versionNumber?: number | null;
+  error?: string | null;
+}): Promise<void> {
+  const token = text(process.env.SLACK_BOT_TOKEN);
+  if (!token) {
+    console.warn('UUTS Slack notify skipped: SLACK_BOT_TOKEN not set');
+    return;
+  }
+
+  const channel = slackUutsChannel();
+  const adminUrl = `${frontendBaseUrl()}/admin`;
+  const ok = payload.status === 'complete';
+  const header = ok ? 'UUTS pre-screen complete' : 'UUTS pre-screen needs manual review';
+  const emoji = ok ? '✅' : '⚠️';
+
+  const fields: Array<{ type: 'mrkdwn'; text: string }> = [
+    { type: 'mrkdwn', text: `*Title:*\n${payload.title || 'N/A'}` },
+    { type: 'mrkdwn', text: `*Category:*\n${payload.category || 'N/A'}` },
+    {
+      type: 'mrkdwn',
+      text: `*Composite:*\n${payload.composite != null ? String(payload.composite) : '—'}`,
+    },
+    {
+      type: 'mrkdwn',
+      text: `*Model:*\n${payload.model || 'N/A'}${payload.provider ? ` (${payload.provider})` : ''}`,
+    },
+    {
+      type: 'mrkdwn',
+      text: `*External research:*\n${payload.externalResearch ? 'sources-box' : 'off'}`,
+    },
+  ];
+
+  if (payload.externalResearch) {
+    fields.push({
+      type: 'mrkdwn',
+      text: `*Sources fetch:*\n${payload.sourcesFetchedOk ?? 0} ok / ${payload.sourcesFetchedFailed ?? 0} failed${
+        payload.sourcesUrlCount != null ? ` of ${payload.sourcesUrlCount}` : ''
+      }`,
+    });
+  }
+  if (payload.versionNumber != null) {
+    fields.push({
+      type: 'mrkdwn',
+      text: `*Trust report:*\nv${payload.versionNumber}`,
+    });
+  }
+
+  try {
+    const slack = new WebClient(token);
+    await slack.chat.postMessage({
+      channel,
+      text: `${emoji} ${header}: ${payload.title || payload.campaignId}`,
+      blocks: [
+        {
+          type: 'header',
+          text: { type: 'plain_text', text: `${emoji} ${header}` },
+        },
+        { type: 'section', fields: fields.slice(0, 10) },
+        ...(payload.error
+          ? [
+              {
+                type: 'section' as const,
+                text: {
+                  type: 'mrkdwn' as const,
+                  text: `*Error:*\n\`\`\`${payload.error.slice(0, 500)}\`\`\``,
+                },
+              },
+            ]
+          : []),
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `*Admin:* <${adminUrl}|Open Admin → UUTS preview>\nCampaign ID: \`${payload.campaignId}\``,
+          },
+        },
+      ],
+    });
+    console.log(`UUTS Slack notify sent to #${channel} (${payload.status}) for ${payload.campaignId}`);
+  } catch (err) {
+    console.error('UUTS Slack notify failed:', err);
+  }
+}
+const DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash-lite';
+const DEFAULT_ANTHROPIC_MODEL = 'claude-opus-4-6';
 // A reasoning model scoring the full three-layer rubric routinely runs past a minute.
 // Worst case across all attempts is roughly TIMEOUT_MS * MAX_ATTEMPTS plus backoff; the
 // admin preview's poll window must stay above that or it reports a false timeout.
 const TIMEOUT_MS = 120_000;
+/** External research (web search / grounding) needs headroom beyond the base score call. */
+const RESEARCH_TIMEOUT_MS = 300_000;
 const MAX_RETRIES = 2;
 const MAX_ATTEMPTS = MAX_RETRIES + 1;
+const ANTHROPIC_MAX_TOKENS = 8192;
+const ANTHROPIC_RESEARCH_MAX_TOKENS = 16384;
+
+/** Fair external research: fetch Sources-box URLs only (no open-web roaming). */
+const MAX_SOURCE_FETCHES = 15;
+/** Slow agency/journal pages often exceed 8s under parallel load. */
+const SOURCE_FETCH_TIMEOUT_MS = 20_000;
+const SOURCE_FETCH_CONCURRENCY = 3;
+/** Firecrawl free tier allows ~2 concurrent scrapes. */
+const FIRECRAWL_FETCH_CONCURRENCY = 2;
+const FIRECRAWL_TIMEOUT_MS = 45_000;
+const FIRECRAWL_API_URL = 'https://api.firecrawl.dev/v2/scrape';
+const MAX_CHARS_PER_SOURCE = 12_000;
+/** Total evidence budget — split fairly across fetched sources so late box entries are not empty. */
+const MAX_EVIDENCE_CHARS_TOTAL = 90_000;
+const MIN_CHARS_PER_SOURCE = 2_500;
+/** Cap download size so huge pages don't blow the timeout budget. PDFs need more bytes to parse. */
+const MAX_SOURCE_DOWNLOAD_BYTES = 1_500_000;
+const MAX_PDF_DOWNLOAD_BYTES = 12_000_000;
+
+function firecrawlApiKey(): string {
+  return text(process.env.FIRECRAWL_API_KEY);
+}
+
+const SOURCE_FETCH_HEADERS_BROWSER: Record<string, string> = {
+  Accept:
+    'text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf;q=0.8,text/plain;q=0.8,*/*;q=0.5',
+  'Accept-Language': 'en-US,en;q=0.9',
+  // Browser-like UA: some agencies block custom bot UAs.
+  'User-Agent':
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+};
+
+const SOURCE_FETCH_HEADERS_BOT: Record<string, string> = {
+  Accept:
+    'text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf;q=0.8,text/plain;q=0.8,*/*;q=0.5',
+  'Accept-Language': 'en-US,en;q=0.9',
+  // Honest bot UA: some publishers (e.g. BMC) serve full HTML to bots but cookie-walls to browsers.
+  'User-Agent': 'UnravelUUTSPrescreen/1.0 (+https://unravel.network; source-verification)',
+};
+
+/** Retry with the other UA when the first response is blocked or nearly empty. */
+const SHORT_SOURCE_TEXT_CHARS = 400;
+
+const EXTERNAL_RESEARCH_ADDENDUM = `
+================================================================
+EXTERNAL RESEARCH MODE — SOURCES BOX ONLY (fair)
+================================================================
+We fetched pages linked in the campaign Sources box and included their text below
+(or noted fetch failures). That evidence pack is the ONLY allowed source set for Fact-Check.
+
+Hard rules for sources:
+- The Sources box (numbered list + fetched pack below) is the exclusive evidence list.
+- Do NOT web-search, invent, or add sources mentioned only in the campaign description,
+  slideshow, or body text unless that same source also appears in the Sources box.
+- Do NOT treat inline URLs/citations in the description as Sources-box entries.
+- Do NOT use open-web knowledge to "fill in" missing Sources-box evidence.
+- claim.source MUST be copied from a Sources-box line (prefer "N. <exact Sources-box text>")
+  or null. Never invent a publisher/URL that is not in the Sources box.
+- Evidence blocks below are labeled "Sources box N" and match the same N as the Sources-box list.
+  When citing fetched evidence, set claim.source to that numbered Sources-box line.
+- Do NOT extract meta claims about Unravel, UUTS, "universal trust score", "patent pending"
+  scores, or this campaign's own trust rating — omit those claims entirely (do not score them).
+- When the campaign cites several Sources-box entries, prefer covering distinct box entries
+  across claims rather than repeating one source and ignoring others.
+- If you cannot connect a factual claim to a Sources-box line, either omit it or mark it
+  Unverifiable with source null. Do not assign a positive tier to source-less claims.
+
+Fair scoring stance — evidence-based, not harsh:
+- Still analyze the full campaign description, slideshow, and framing for all three layers.
+- For Fact-Check support, rely only on Sources-box entries and the fetched pack.
+- If a Sources-box excerpt supports a claim's core fact (figures, findings, classifications),
+  you MUST mark it Supported or Partially supported. Do NOT mark Unverifiable merely because
+  the publisher is an advocacy NGO, a secondary summary, news/analysis, or imperfectly worded.
+- Advocacy/NGO analyses of primary data are scoreable (typically Tier 4–5) when the excerpt
+  supports the claim — advocacy status alone is not Unverifiable.
+- Give credit when a claim is substantially true and reasonably supported by a Sources-box item,
+  even if wording is imperfect.
+- Prefer Partially supported over Unsupported when the core fact holds but details need nuance.
+- Use Unverifiable ONLY when: no Sources-box citation, the fetch failed / excerpt is unusable,
+  or the excerpt does not address the claim. A missing citation is NOT the same as "false".
+- Apply penalties only for clear, material issues. Do not stack minor deductions.
+- Honest advocacy can score well on Comms / Shared Reality; do not punish taking a side.
+- Score Comms Integrity and Shared Reality independently of Fact-Check.
+- Return ONLY the COMPLETE JSON object matching the schema — no prose, no markdown fences.
+`.trim();
+
+const NO_RESEARCH_CLARIFICATION = `
+Scoring clarification (no external research on this run):
+- Analyze the full campaign description and framing.
+- For Fact-Check, only use Sources listed in the Sources box (as listed — pages were not fetched).
+- Do NOT treat URLs/citations that appear only in the description as Sources-box entries.
+- claim.source MUST match a Sources-box line (or null). Never invent sources.
+- Do NOT extract meta claims about Unravel/UUTS/"universal trust score"/this campaign's own score.
+- If a claim has no Sources-box citation, mark it Unverifiable — do not treat a missing citation as "false".
+- Give credit when claims are substantially supported by Sources-box entries; prefer Partially supported over Unsupported when the core fact holds.
+- Score Comms Integrity and Shared Reality independently of Fact-Check.
+`.trim();
+
+export type UutsProvider = 'gemini' | 'anthropic';
+
+export interface UutsModelOption {
+  id: string;
+  provider: UutsProvider;
+  label: string;
+}
+
+function envFlagEnabled(name: string): boolean {
+  const raw = (process.env[name] || '').trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
+}
 
 /** Opt-in kill switch. Off unless UUTS_PRESCREEN_ENABLED=true (deploy without connecting). */
 export function isUutsPrescreenEnabled(): boolean {
-  const raw = (process.env.UUTS_PRESCREEN_ENABLED || '').trim().toLowerCase();
-  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
+  return envFlagEnabled('UUTS_PRESCREEN_ENABLED');
+}
+
+/**
+ * When false (default), POST .../trust-report/publish is blocked so admin republish
+ * cannot affect the live public trust-report pipeline yet.
+ */
+export function isUutsPublishLiveEnabled(): boolean {
+  return envFlagEnabled('UUTS_PUBLISH_LIVE_ENABLED');
+}
+
+/** Opt-in scheduled UUTS batch runner. Off unless UUTS_SCHEDULER_ENABLED=true. */
+export function isUutsSchedulerEnabled(): boolean {
+  return envFlagEnabled('UUTS_SCHEDULER_ENABLED');
+}
+
+export function defaultGeminiModel(): string {
+  return (process.env.GEMINI_MODEL_UUTS_PRESCREEN || DEFAULT_GEMINI_MODEL).trim() || DEFAULT_GEMINI_MODEL;
+}
+
+export function defaultAnthropicModel(): string {
+  return (
+    (process.env.ANTHROPIC_MODEL_UUTS_PRESCREEN || DEFAULT_ANTHROPIC_MODEL).trim() ||
+    DEFAULT_ANTHROPIC_MODEL
+  );
+}
+
+/** Models available for Admin model picker / request allowlist. */
+export function listUutsModels(): UutsModelOption[] {
+  const geminiLiteId = DEFAULT_GEMINI_MODEL;
+  const geminiDefaultId = defaultGeminiModel();
+  const models: UutsModelOption[] = [
+    {
+      id: geminiLiteId,
+      provider: 'gemini',
+      label: 'Gemini 2.5 Flash Lite',
+    },
+  ];
+  // If GEMINI_MODEL_UUTS_PRESCREEN points at a different Gemini id, offer it too.
+  if (geminiDefaultId && geminiDefaultId !== geminiLiteId) {
+    models.push({
+      id: geminiDefaultId,
+      provider: 'gemini',
+      label: `Gemini (${geminiDefaultId})`,
+    });
+  }
+  models.push({
+    id: defaultAnthropicModel(),
+    provider: 'anthropic',
+    label: 'Claude Opus',
+  });
+  return models;
+}
+
+export function resolveUutsModel(requested?: string | null): UutsModelOption {
+  const models = listUutsModels();
+  const want = (requested || '').trim();
+  if (want) {
+    const match = models.find((m) => m.id === want);
+    if (!match) {
+      throw Object.assign(
+        new Error(`Unsupported UUTS model "${want}". Allowed: ${models.map((m) => m.id).join(', ')}`),
+        { status: 400 }
+      );
+    }
+    return match;
+  }
+  return models[0];
+}
+
+/** Internal reviewers shown in the admin review-console dropdown. */
+export function listUutsReviewers(): string[] {
+  const raw = (process.env.UUTS_REVIEWERS || '').trim();
+  if (!raw) return [];
+  return raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+export function getUutsConfig() {
+  return {
+    prescreenEnabled: isUutsPrescreenEnabled(),
+    publishLiveEnabled: isUutsPublishLiveEnabled(),
+    schedulerEnabled: isUutsSchedulerEnabled(),
+    reviewers: listUutsReviewers(),
+    models: listUutsModels(),
+    defaultModel: defaultGeminiModel(),
+    /** Admin can opt into web search / grounding per run for A/B tests. Default off. */
+    externalResearchSupported: true,
+    externalResearchDefault: false,
+  };
+}
+
+/** Coerce request/body flags into a boolean (default false). */
+export function parseExternalResearchFlag(value: unknown): boolean {
+  if (value === true || value === 1) return true;
+  if (typeof value === 'string') {
+    const raw = value.trim().toLowerCase();
+    return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
+  }
+  return false;
 }
 
 type JsonObject = Record<string, unknown>;
@@ -153,8 +489,9 @@ export const PRESCREEN_UNCERTAINTY_VISIBILITY = 1.0;
 
 const FALLBACK_PROMPT = `You are the UUTS Pre-screening skill for Unravel.
 
-Score the campaign in ONE pass across three layers. Be strict, evidence-based, and consistent.
-Do NOT invent sources. If a claim has no citation, treat it as unverifiable/weak.
+Score the campaign in ONE pass across three layers. Be fair, evidence-based, and consistent — not harsh.
+Do NOT invent sources. If a claim has no citation, treat it as Unverifiable (not as false).
+claim.source must come from the Sources box only (or null). Omit meta claims about Unravel/UUTS/trust scores.
 Return ONLY valid JSON (no markdown, no commentary).
 
 ================================================================
@@ -162,7 +499,10 @@ LAYER 1 — FACT-CHECK / ACCURACY (45% of composite)
 ================================================================
 Goal: Are the factual claims true, sourced, and honestly framed?
 
-Extract atomic claims (3–12). Score EACH claim with the per-claim formula:
+Extract atomic claims (3–12) about the campaign topic — never about Unravel's own UUTS/trust score.
+Each claim.source must be a Sources-box line (e.g. "3. …") or null.
+Only use source null for Unverifiable / Not scored claims.
+Score EACH claim with the per-claim formula:
   claimScore = tierBase × evidenceWeight × consensusFactor × regionalBonus   (cap at 100)
 
 Evidence tiers — tierBase:
@@ -478,6 +818,13 @@ export interface RunUutsPrescreenParams {
   campaignId: string;
   campaign: JsonObject;
   promptDocId?: string;
+  /** Optional allowlisted model id (Gemini or Claude Opus). */
+  model?: string | null;
+  /**
+   * When true, enable provider web search / Google Search grounding so the model can
+   * research claims beyond sources cited in the submission. Default false (cited-only).
+   */
+  externalResearch?: boolean;
 }
 
 function nowIso(): string {
@@ -552,6 +899,501 @@ function sourceList(raw: unknown): string[] {
   return [];
 }
 
+function addSourceUrl(candidate: string, found: string[]): void {
+  const cleaned = candidate.trim().replace(/[.,;:]+$/g, '');
+  if (!cleaned) return;
+  try {
+    const u = new URL(/^https?:\/\//i.test(cleaned) ? cleaned : `https://${cleaned}`);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return;
+    const host = u.hostname.toLowerCase();
+    if (
+      host === 'localhost' ||
+      host === '127.0.0.1' ||
+      host === '::1' ||
+      host.endsWith('.local') ||
+      host.startsWith('10.') ||
+      host.startsWith('192.168.') ||
+      /^172\.(1[6-9]|2\d|3[0-1])\./.test(host)
+    ) {
+      return;
+    }
+    if (!found.includes(u.toString())) found.push(u.toString());
+  } catch {
+    // ignore invalid URLs
+  }
+}
+
+function urlsFromText(value: unknown): string[] {
+  const s = text(value);
+  if (!s) return [];
+  const found: string[] = [];
+  const matches =
+    s.match(/https?:\/\/[^\s<>"'`)\]]+/gi) ||
+    s.match(/\b(?:[a-z0-9-]+\.)+[a-z]{2,}(?:\/[^\s<>"'`)\]]*)?/gi) ||
+    [];
+  for (const match of matches) addSourceUrl(match, found);
+  return found;
+}
+
+export type SourceFetchTarget = {
+  /** 1-based Sources-box index (matches "N." in the campaign Sources list). */
+  boxIndex: number;
+  boxLine: string;
+  url: string;
+};
+
+/**
+ * One fetch target per Sources-box entry that has a URL.
+ * Preserves box numbering so the evidence pack can cite the same N.
+ */
+export function extractSourceFetchTargets(campaign: JsonObject): SourceFetchTarget[] {
+  const lines = sourceList(campaign.campaign_sources ?? campaign.sources);
+  const targets: SourceFetchTarget[] = [];
+  const seenUrls = new Set<string>();
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const boxLine = lines[i];
+    const urls = urlsFromText(boxLine);
+    const url = urls[0];
+    if (!url || seenUrls.has(url)) continue;
+    seenUrls.add(url);
+    targets.push({ boxIndex: i + 1, boxLine, url });
+    if (targets.length >= MAX_SOURCE_FETCHES) break;
+  }
+
+  return targets;
+}
+
+/** Pull URLs from Sources-box entries only (never from description text). */
+export function extractSourceUrls(campaign: JsonObject): string[] {
+  return extractSourceFetchTargets(campaign).map((row) => row.url);
+}
+
+function normalizeUrlForMatch(raw: string): { host: string; path: string; href: string } | null {
+  try {
+    const u = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+    const host = u.hostname.toLowerCase().replace(/^www\./, '');
+    const path = (u.pathname || '/').replace(/\/+$/, '').toLowerCase() || '/';
+    return { host, path, href: `https://${host}${path}` };
+  } catch {
+    return null;
+  }
+}
+
+function stripHtmlToText(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+export type FetchedSourceEvidence = {
+  url: string;
+  ok: boolean;
+  status?: number;
+  title?: string;
+  text?: string;
+  error?: string;
+  chars?: number;
+  /** How the excerpt was obtained (for logs / evidence pack). */
+  via?: 'firecrawl' | 'legacy';
+  /** 1-based Sources-box index when known. */
+  boxIndex?: number;
+  boxLine?: string;
+};
+
+async function mapPool<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(concurrency, Math.max(items.length, 1)) }, async () => {
+    while (true) {
+      const index = next;
+      next += 1;
+      if (index >= items.length) return;
+      results[index] = await fn(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+function isRetryableFetchFailure(row: FetchedSourceEvidence): boolean {
+  if (row.ok) return false;
+  const err = (row.error || '').toLowerCase();
+  if (err.includes('abort') || err.includes('timeout') || err.includes('network') || err.includes('fetch failed')) {
+    return true;
+  }
+  return row.status === 408 || row.status === 425 || row.status === 429 || row.status === 500 || row.status === 502 || row.status === 503 || row.status === 504;
+}
+
+async function readResponseBytes(res: Response, maxBytes: number): Promise<Buffer> {
+  if (!res.body) {
+    const ab = await res.arrayBuffer();
+    return Buffer.from(ab).subarray(0, maxBytes);
+  }
+  const reader = res.body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  while (total < maxBytes) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value?.length) continue;
+    const buf = Buffer.from(value);
+    const room = maxBytes - total;
+    chunks.push(buf.length > room ? buf.subarray(0, room) : buf);
+    total += Math.min(buf.length, room);
+    if (buf.length > room) {
+      try {
+        await reader.cancel();
+      } catch {
+        // ignore cancel errors
+      }
+      break;
+    }
+  }
+  return Buffer.concat(chunks, total);
+}
+
+async function extractPdfText(buf: Buffer): Promise<string> {
+  // pdf-parse is CJS; keep require so ts-node/dev doesn't need esModuleInterop tweaks.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const pdfParse = require('pdf-parse') as (data: Buffer) => Promise<{ text?: string }>;
+  const parsed = await pdfParse(buf);
+  return text(parsed?.text);
+}
+
+function isLikelyPdfUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return parsed.pathname.toLowerCase().endsWith('.pdf');
+  } catch {
+    return url.toLowerCase().includes('.pdf');
+  }
+}
+
+async function fetchOneSourceUrlOnce(
+  url: string,
+  headers: Record<string, string>
+): Promise<FetchedSourceEvidence> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SOURCE_FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      method: 'GET',
+      redirect: 'follow',
+      signal: controller.signal,
+      headers,
+    });
+    if (!res.ok) {
+      return { url, ok: false, status: res.status, error: `HTTP ${res.status}` };
+    }
+
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+    const headerSaysPdf = contentType.includes('application/pdf') || isLikelyPdfUrl(url);
+    const buf = await readResponseBytes(
+      res,
+      headerSaysPdf ? MAX_PDF_DOWNLOAD_BYTES : MAX_SOURCE_DOWNLOAD_BYTES
+    );
+    const looksPdf = headerSaysPdf || buf.subarray(0, 5).toString('utf8') === '%PDF-';
+
+    if (looksPdf) {
+      try {
+        const pdfText = (await extractPdfText(buf)).replace(/\s+/g, ' ').trim().slice(0, MAX_CHARS_PER_SOURCE);
+        if (!pdfText) {
+          return { url, ok: false, status: res.status, error: 'Empty PDF text after extract' };
+        }
+        return {
+          url,
+          ok: true,
+          status: res.status,
+          title: 'PDF document',
+          text: pdfText,
+          chars: pdfText.length,
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { url, ok: false, status: res.status, error: `PDF extract failed: ${msg}`.slice(0, 300) };
+      }
+    }
+
+    const raw = buf.toString('utf8');
+    let body = raw;
+    if (contentType.includes('html') || /<html[\s>]/i.test(raw.slice(0, 500))) {
+      body = stripHtmlToText(raw);
+    } else {
+      body = raw.replace(/\s+/g, ' ').trim();
+    }
+    body = body.slice(0, MAX_CHARS_PER_SOURCE);
+    const titleMatch = raw.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    const title = titleMatch ? stripHtmlToText(titleMatch[1]).slice(0, 200) : undefined;
+    if (!body.trim()) {
+      return { url, ok: false, status: res.status, title, error: 'Empty page text after fetch' };
+    }
+    return { url, ok: true, status: res.status, title, text: body, chars: body.length };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const normalized =
+      /aborted|abort/i.test(msg) ? `Timeout after ${SOURCE_FETCH_TIMEOUT_MS}ms` : msg;
+    return { url, ok: false, error: normalized.slice(0, 300) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function preferBetterFetch(a: FetchedSourceEvidence, b: FetchedSourceEvidence): FetchedSourceEvidence {
+  const aChars = a.ok ? a.chars || a.text?.length || 0 : 0;
+  const bChars = b.ok ? b.chars || b.text?.length || 0 : 0;
+  if (b.ok && bChars > aChars) return b;
+  if (!a.ok && b.ok) return b;
+  return a;
+}
+
+/** Legacy direct HTTP fetch (browser/bot UA retries + PDF parse). */
+async function fetchOneSourceUrlLegacy(url: string): Promise<FetchedSourceEvidence> {
+  let best = await fetchOneSourceUrlOnce(url, SOURCE_FETCH_HEADERS_BROWSER);
+
+  const tryAlt = async () => {
+    const alt = await fetchOneSourceUrlOnce(url, SOURCE_FETCH_HEADERS_BOT);
+    best = preferBetterFetch(best, alt);
+  };
+
+  if (
+    !best.ok ||
+    best.status === 403 ||
+    best.status === 429 ||
+    (best.ok && (best.chars || 0) < SHORT_SOURCE_TEXT_CHARS)
+  ) {
+    await tryAlt();
+  }
+
+  if (isRetryableFetchFailure(best) || (best.ok && (best.chars || 0) < SHORT_SOURCE_TEXT_CHARS)) {
+    await delay(400);
+    const retry = await fetchOneSourceUrlOnce(url, SOURCE_FETCH_HEADERS_BOT);
+    best = preferBetterFetch(best, retry);
+    if (!best.ok || (best.chars || 0) < SHORT_SOURCE_TEXT_CHARS) {
+      const retryBrowser = await fetchOneSourceUrlOnce(url, SOURCE_FETCH_HEADERS_BROWSER);
+      best = preferBetterFetch(best, retryBrowser);
+    }
+  }
+
+  if (best.ok && (best.chars || 0) < SHORT_SOURCE_TEXT_CHARS) {
+    return {
+      ...best,
+      via: 'legacy',
+      ok: false,
+      text: undefined,
+      chars: undefined,
+      error: `Page text too short after fetch (${best.chars || 0} chars) — likely bot/cookie wall`,
+    };
+  }
+  return { ...best, via: 'legacy' };
+}
+
+/** Primary path: Firecrawl /v2/scrape → clean markdown for LLM evidence packs. */
+async function fetchOneSourceUrlViaFirecrawl(
+  url: string,
+  apiKey: string
+): Promise<FetchedSourceEvidence> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FIRECRAWL_TIMEOUT_MS);
+  try {
+    const res = await fetch(FIRECRAWL_API_URL, {
+      method: 'POST',
+      redirect: 'follow',
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        url,
+        formats: ['markdown'],
+        onlyMainContent: true,
+      }),
+    });
+
+    const rawBody = await res.text();
+    let parsed: JsonObject = {};
+    try {
+      parsed = asObject(JSON.parse(rawBody));
+    } catch {
+      // non-JSON error body
+    }
+
+    if (!res.ok) {
+      const errMsg =
+        text(parsed.error) ||
+        text(parsed.message) ||
+        rawBody.slice(0, 200) ||
+        `HTTP ${res.status}`;
+      return {
+        url,
+        ok: false,
+        status: res.status,
+        via: 'firecrawl',
+        error: `Firecrawl ${errMsg}`.slice(0, 300),
+      };
+    }
+
+    const data = asObject(parsed.data);
+    const markdown = text(data.markdown);
+    const metadata = asObject(data.metadata);
+    const title =
+      text(metadata.title) ||
+      text(metadata.ogTitle) ||
+      text(data.title) ||
+      undefined;
+    const body = markdown.replace(/\s+/g, ' ').trim().slice(0, MAX_CHARS_PER_SOURCE);
+
+    if (!body || body.length < SHORT_SOURCE_TEXT_CHARS) {
+      return {
+        url,
+        ok: false,
+        status: res.status,
+        title,
+        via: 'firecrawl',
+        error: `Firecrawl returned too little text (${body.length} chars)`,
+        chars: body.length || undefined,
+      };
+    }
+
+    return {
+      url,
+      ok: true,
+      status: res.status,
+      title: title ? title.slice(0, 200) : undefined,
+      text: body,
+      chars: body.length,
+      via: 'firecrawl',
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const normalized = /aborted|abort/i.test(msg)
+      ? `Firecrawl timeout after ${FIRECRAWL_TIMEOUT_MS}ms`
+      : `Firecrawl ${msg}`;
+    return { url, ok: false, via: 'firecrawl', error: normalized.slice(0, 300) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Firecrawl-first when FIRECRAWL_API_KEY is set; legacy HTTP fetch is the fallback
+ * (and the only path when the key is missing).
+ */
+async function fetchOneSourceUrl(url: string): Promise<FetchedSourceEvidence> {
+  const apiKey = firecrawlApiKey();
+  if (apiKey) {
+    const primary = await fetchOneSourceUrlViaFirecrawl(url, apiKey);
+    if (primary.ok && (primary.chars || 0) >= SHORT_SOURCE_TEXT_CHARS) {
+      return primary;
+    }
+    const legacy = await fetchOneSourceUrlLegacy(url);
+    return preferBetterFetch(primary, legacy);
+  }
+  return fetchOneSourceUrlLegacy(url);
+}
+
+export async function fetchSourcesBoxEvidence(campaign: JsonObject): Promise<{
+  urls: string[];
+  results: FetchedSourceEvidence[];
+  pack: string;
+  fetchedOk: number;
+  fetchedFailed: number;
+  fetchErrors: Array<{ url: string; error: string; status?: number }>;
+}> {
+  const targets = extractSourceFetchTargets(campaign);
+  const urls = targets.map((t) => t.url);
+  if (!targets.length) {
+    return {
+      urls: [],
+      results: [],
+      fetchedOk: 0,
+      fetchedFailed: 0,
+      fetchErrors: [],
+      pack:
+        'Fetched Sources-box evidence:\n(none — no http(s) URLs found in the Sources box. Do not invent sources from description text. Mark unsupported claims Unverifiable, not false.)',
+    };
+  }
+
+  const concurrency = firecrawlApiKey()
+    ? Math.min(FIRECRAWL_FETCH_CONCURRENCY, SOURCE_FETCH_CONCURRENCY)
+    : SOURCE_FETCH_CONCURRENCY;
+  const results = await mapPool(targets, concurrency, async (target) => {
+    const fetched = await fetchOneSourceUrl(target.url);
+    return {
+      ...fetched,
+      boxIndex: target.boxIndex,
+      boxLine: target.boxLine,
+    };
+  });
+
+  const okCount = results.filter((row) => row.ok && row.text).length;
+  const fairCap =
+    okCount > 0
+      ? Math.min(
+          MAX_CHARS_PER_SOURCE,
+          Math.max(MIN_CHARS_PER_SOURCE, Math.floor(MAX_EVIDENCE_CHARS_TOTAL / okCount))
+        )
+      : MAX_CHARS_PER_SOURCE;
+
+  const blocks: string[] = [
+    'Fetched Sources-box evidence (EXCLUSIVE Fact-Check source set — ignore description-only citations):',
+    'Each block is labeled with the same N as the Sources-box list above. Cite claim.source as "N. <exact Sources-box line>".',
+    `Each OK source includes up to ~${fairCap} characters (fair share of the evidence budget).`,
+    firecrawlApiKey()
+      ? '(Primary extractor: Firecrawl; legacy HTTP fetch used only as fallback.)'
+      : '(Extractor: legacy HTTP fetch — set FIRECRAWL_API_KEY to enable Firecrawl-first scraping.)',
+  ];
+  let fetchedOk = 0;
+  let fetchedFailed = 0;
+  const fetchErrors: Array<{ url: string; error: string; status?: number }> = [];
+
+  results.forEach((row) => {
+    const n = row.boxIndex ?? 0;
+    const via = row.via ? ` via ${row.via}` : '';
+    const boxLine = row.boxLine ? `${n}. ${row.boxLine}` : `Sources box ${n}`;
+    if (row.ok && row.text) {
+      fetchedOk += 1;
+      const slice = row.text.slice(0, fairCap);
+      blocks.push(
+        `\n--- Sources box ${n} OK${via} ---\nSources-box entry: ${boxLine}\nFetched URL: ${row.url}${
+          row.title ? `\nTitle: ${row.title}` : ''
+        }\nExcerpt:\n${slice}${slice.length < row.text.length ? '…' : ''}`
+      );
+    } else {
+      fetchedFailed += 1;
+      fetchErrors.push({
+        url: row.url,
+        error: (row.error || 'unknown').slice(0, 200),
+        status: row.status,
+      });
+      blocks.push(
+        `\n--- Sources box ${n} FAILED${via} ---\nSources-box entry: ${boxLine}\nFetched URL: ${row.url}\nError: ${
+          row.error || 'unknown'
+        }${row.status != null ? ` (HTTP ${row.status})` : ''}\nTreat this Sources-box item as listed-but-unread; do not invent its contents or replace it with open-web results.`
+      );
+    }
+  });
+
+  return { urls, results, pack: blocks.join('\n'), fetchedOk, fetchedFailed, fetchErrors };
+}
+
 function slideshowDescriptions(raw: unknown): string[] {
   return asArray(raw)
     .map((slide) => text(asObject(slide).description))
@@ -559,7 +1401,7 @@ function slideshowDescriptions(raw: unknown): string[] {
     .slice(0, 30);
 }
 
-function buildCampaignContent(campaign: JsonObject): string {
+export function buildCampaignContent(campaign: JsonObject): string {
   const parts = [
     `Title: ${text(campaign.title, 'N/A')}`,
     `Category: ${text(campaign.category, 'N/A')}`,
@@ -572,7 +1414,9 @@ function buildCampaignContent(campaign: JsonObject): string {
 
   const sources = sourceList(campaign.campaign_sources ?? campaign.sources);
   if (sources.length) {
-    parts.push(`Sources:\n${sources.map((source, i) => `${i + 1}. ${source}`).join('\n')}`);
+    parts.push(`Sources box (authoritative source list):\n${sources.map((source, i) => `${i + 1}. ${source}`).join('\n')}`);
+  } else {
+    parts.push('Sources box (authoritative source list):\n(none provided)');
   }
 
   const slides = slideshowDescriptions(campaign.hero_slideshow);
@@ -583,19 +1427,30 @@ function buildCampaignContent(campaign: JsonObject): string {
   return parts.join('\n\n');
 }
 
-function buildPrompt(promptTemplate: string, campaign: JsonObject): string {
+function buildPrompt(
+  promptTemplate: string,
+  campaign: JsonObject,
+  options?: { externalResearch?: boolean; evidencePack?: string }
+): string {
   const campaignContent = buildCampaignContent(campaign);
   const template = promptTemplate.trim() || FALLBACK_PROMPT;
+  let prompt: string;
   if (template.includes('{{campaign_content}}')) {
-    return template.split('{{campaign_content}}').join(campaignContent);
+    prompt = template.split('{{campaign_content}}').join(campaignContent);
+  } else if (template.includes('{campaign_content}')) {
+    prompt = template.split('{campaign_content}').join(campaignContent);
+  } else {
+    prompt = `${template}\n\nCampaign to evaluate:\n---\n${campaignContent}\n---`;
   }
-  if (template.includes('{campaign_content}')) {
-    return template.split('{campaign_content}').join(campaignContent);
-  }
-  return `${template}\n\nCampaign to evaluate:\n---\n${campaignContent}\n---`;
+  const addendum = options?.externalResearch ? EXTERNAL_RESEARCH_ADDENDUM : NO_RESEARCH_CLARIFICATION;
+  const evidence =
+    options?.externalResearch && options.evidencePack
+      ? `\n\n================================================================\nSOURCES-BOX EVIDENCE PACK\n================================================================\n${options.evidencePack}`
+      : '';
+  return `${prompt}\n\n${addendum}${evidence}`;
 }
 
-async function loadPrompt(db: Firestore, promptDocId: string): Promise<string> {
+async function loadPromptFromFirestore(db: Firestore, promptDocId: string): Promise<string> {
   try {
     const snap = await db.collection('ai_prompts').doc(promptDocId).get();
     const prompt = snap.exists ? snap.data()?.[UUTS_PRESCREEN_PROMPT_FIELD] : null;
@@ -605,6 +1460,13 @@ async function loadPrompt(db: Firestore, promptDocId: string): Promise<string> {
     console.warn('UUTS pre-screen prompt load failed; using fallback prompt:', error);
   }
   return FALLBACK_PROMPT;
+}
+
+async function loadPrompt(db: Firestore, promptDocId: string): Promise<UutsPromptSource> {
+  return loadUutsPromptTemplate({
+    fallback: FALLBACK_PROMPT,
+    firestoreLoader: () => loadPromptFromFirestore(db, promptDocId),
+  });
 }
 
 function extractJson(textValue: string): JsonObject {
@@ -645,6 +1507,186 @@ function isUnscoredClaim(tierLabel: string, verdict: string): boolean {
   return /not scored|not applicable|n\/a|opinion|hyperbole/i.test(`${tierLabel} ${verdict}`);
 }
 
+/** Drop self-referential Unravel/UUTS marketing claims — not external facts. */
+export function isMetaTrustScoreClaim(claimText: string): boolean {
+  const t = claimText.toLowerCase();
+  if (!t) return false;
+  if (/patent\s*pending/.test(t) && /(trust|uuts|score)/.test(t)) return true;
+  if (/(uuts|universal trust score|trust score)/.test(t) && /(this campaign|scores this|our |unravel)/.test(t)) {
+    return true;
+  }
+  if (/scores this campaign/.test(t) && /(trust|uuts|high trust|gold standard|\b\d{2,3}\b)/.test(t)) {
+    return true;
+  }
+  return false;
+}
+
+function normalizeForSourceMatch(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/https?:\/\//g, '')
+    .replace(/^www\./, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Force claim.source to a Sources-box line when possible.
+ * Returns fromBox=false when the model invented a source outside the box.
+ */
+export function resolveClaimSourceAgainstBox(
+  claimed: string | null,
+  sourcesBox: string[]
+): { source: string | null; fromBox: boolean } {
+  if (!claimed) return { source: null, fromBox: true };
+  if (!sourcesBox.length) return { source: null, fromBox: false };
+
+  const claimedNorm = normalizeForSourceMatch(claimed);
+  const claimedBody = claimedNorm.replace(/^\s*(?:source\s*)?\d{1,2}\s*[.:)\-–—]\s*/i, '');
+  const claimedUrls = urlsFromText(claimed).map(normalizeUrlForMatch).filter(Boolean) as Array<{
+    host: string;
+    path: string;
+    href: string;
+  }>;
+
+  // Direct "Sources box N" / "Source fetch N" references (aligned with evidence pack labels).
+  // Do NOT early-match bare "N. …" — that can steal the wrong box row when the label text disagrees.
+  const boxNumMatch = claimed.match(
+    /\b(?:sources?\s*box|source\s*fetch)\s*#?\s*(\d{1,2})\b/i
+  );
+  if (boxNumMatch) {
+    const idx = Number(boxNumMatch[1]) - 1;
+    if (idx >= 0 && idx < sourcesBox.length) {
+      return { source: `${idx + 1}. ${sourcesBox[idx]}`, fromBox: true };
+    }
+  }
+
+  const aliases: Array<{ needles: string[]; tags: string[] }> = [
+    { needles: ['environmental working group', 'ewg'], tags: ['ewg'] },
+    { needles: ['national health and nutrition', 'nhanes'], tags: ['nhanes', 'cdc'] },
+    { needles: ['82 percent', '81.2', 'urine', 'sampled by the cdc'], tags: ['cdc', 'nhanes', 'stacks.cdc'] },
+    { needles: ['87 percent', 'children tested', 'detectable levels'], tags: ['ewg'] },
+    { needles: ['not likely to be carcinogenic'], tags: ['epa', 'glyphosate'] },
+    { needles: ['97 percent', 'food samples', 'epa tolerances', 'pesticide residue monitoring'], tags: ['fda'] },
+    { needles: ['european food safety', 'efsa'], tags: ['efsa'] },
+    { needles: ['critical areas of concern', 'renewed approval', 'through 2033'], tags: ['efsa', 'food.ec.europa', 'ec.europa'] },
+    { needles: ['international agency for research', 'iarc'], tags: ['iarc'] },
+    { needles: ['probably carcinogenic'], tags: ['iarc'] },
+    { needles: ['consumer reports'], tags: ['consumerreports', 'consumer reports'] },
+    { needles: ['organic diet', '70 percent', 'six days'], tags: ['consumerreports', 'consumer reports', 'organic'] },
+    { needles: ['genetic literacy'], tags: ['geneticliteracyproject', 'genetic literacy'] },
+    { needles: ['retraction', 'industry funded', 'legal future'], tags: ['geneticliteracyproject', 'genetic literacy'] },
+    { needles: ['george mason'], tags: ['gmu', 'george mason', 'publichealth.gmu'] },
+    { needles: ['multiple cancer types', 'rats', 'low doses'], tags: ['gmu', 'george mason', 'publichealth.gmu'] },
+    { needles: ['european commission', 'food.ec.europa'], tags: ['food.ec.europa', 'ec.europa'] },
+    { needles: ['51 million', '826 million', 'use has climbed'], tags: ['temporal trends', 'pmc', 'ncbi'] },
+  ];
+
+  const scored: Array<{ index: number; score: number }> = [];
+  for (let i = 0; i < sourcesBox.length; i += 1) {
+    const entry = sourcesBox[i];
+    const entryNorm = normalizeForSourceMatch(entry);
+    const entryUrls = urlsFromText(entry).map(normalizeUrlForMatch).filter(Boolean) as Array<{
+      host: string;
+      path: string;
+      href: string;
+    }>;
+    let score = 0;
+
+    for (const claimedUrl of claimedUrls) {
+      for (const entryUrl of entryUrls) {
+        if (claimedUrl.href === entryUrl.href) score += 200;
+        else if (claimedUrl.host === entryUrl.host && claimedUrl.path.length > 1 && entryUrl.path.startsWith(claimedUrl.path)) {
+          score += 160;
+        } else if (claimedUrl.host === entryUrl.host && entryUrl.path.length > 1 && claimedUrl.path.startsWith(entryUrl.path)) {
+          score += 160;
+        } else if (claimedUrl.host === entryUrl.host) {
+          score += 110;
+        }
+      }
+    }
+
+    const needles = [
+      ...(entry.match(/https?:\/\/[^\s<>"'`)\]]+/gi) || []),
+      ...(entry.match(/\b(?:[a-z0-9-]+\.)+[a-z]{2,}(?:\/[^\s<>"'`)\]]*)?/gi) || []),
+    ];
+    for (const needleRaw of needles) {
+      const needle = normalizeForSourceMatch(needleRaw).replace(/\/$/, '');
+      if (needle.length >= 8 && claimedNorm.includes(needle)) score += 100;
+      const host = needle.split('/')[0];
+      if (host.length >= 6 && claimedNorm.includes(host)) score += 80;
+    }
+
+    for (const alias of aliases) {
+      const claimHasAlias = alias.needles.some((n) => claimedNorm.includes(n));
+      const entryHasAlias =
+        alias.needles.some((n) => entryNorm.includes(n)) ||
+        alias.tags.some((t) => entryNorm.includes(t));
+      if (claimHasAlias && entryHasAlias) score += 90;
+    }
+
+    const tokens = claimedBody.split(/[^a-z0-9]+/).filter((t) => t.length >= 3);
+    const tokenHits = tokens.filter((t) => entryNorm.includes(t)).length;
+    if (tokenHits >= 2) score += tokenHits * 12;
+
+    const agencyTokens = ['epa', 'efsa', 'iarc', 'fda', 'cdc', 'ewg', 'who', 'nhanes'];
+    for (const agency of agencyTokens) {
+      if (
+        tokens.includes(agency) &&
+        (entryNorm.startsWith(agency) ||
+          entryNorm.includes(` ${agency}`) ||
+          entryNorm.includes(`${agency}.`) ||
+          entryNorm.includes(`${agency} `))
+      ) {
+        score += 35;
+      }
+    }
+
+    // Numbered "N." only gets a big boost when this entry already has textual affinity —
+    // otherwise a wrong index (e.g. "3. EWG..." while #3 is EPA) steals the match.
+    const numMatch =
+      claimed.match(/^\s*(?:source\s*)?(\d{1,2})\s*[.:)\-–—]/i) ||
+      claimed.match(/\b(?:source|sources?\s*box|source\s*fetch)\s*#?\s*(\d{1,2})\b/i);
+    if (numMatch && Number(numMatch[1]) - 1 === i) {
+      if (score >= 25 || tokenHits >= 1 || claimedUrls.length > 0) score += 45;
+      else score += 10;
+    }
+
+    const entryStart = entryNorm.slice(0, 48);
+    if (entryStart.length >= 12 && claimedNorm.includes(entryStart)) score += 50;
+
+    if (score > 0) scored.push({ index: i, score });
+  }
+
+  scored.sort((a, b) => b.score - a.score);
+  if (scored.length && scored[0].score >= 25) {
+    const i = scored[0].index;
+    return { source: `${i + 1}. ${sourcesBox[i]}`, fromBox: true };
+  }
+
+  // Explicit citation that shares no URL/host/alias with any box entry → invented.
+  return { source: null, fromBox: false };
+}
+
+function recomputeFactCheckScore(
+  claims: Array<{ score: number | null }>,
+  penalties: Array<{ points: number }>
+): { claimsMean: number | null; score: number | null; penaltyTotal: number } {
+  const scoredClaims = claims.filter((claim) => claim.score != null);
+  const claimsMean = scoredClaims.length
+    ? round1(scoredClaims.reduce((sum, claim) => sum + (claim.score as number), 0) / scoredClaims.length)
+    : null;
+  const penaltyTotal = Math.min(
+    MAX_FACT_CHECK_PENALTY_TOTAL,
+    penalties.reduce((sum, penalty) => sum + penalty.points, 0)
+  );
+  const score =
+    claimsMean == null
+      ? null
+      : Math.max(0, Math.min(100, Math.round(claimsMean * (1 - penaltyTotal / 100))));
+  return { claimsMean, score, penaltyTotal };
+}
+
 /** Normalize a penalty to the Layer 1 matrix magnitude so the model cannot inflate deductions. */
 function resolvePenaltyPoints(type: string, rawPoints: unknown): number {
   const provided = Math.abs(Number(rawPoints) || 0);
@@ -655,37 +1697,210 @@ function resolvePenaltyPoints(type: string, rawPoints: unknown): number {
   return 0;
 }
 
-function mapFactCheck(raw: JsonObject): FactCheckLayer {
+/** Map of Sources-box index → fetched excerpt text (successful fetches only). */
+export type FetchedEvidenceIndex = Record<number, { url: string; text: string }>;
+
+export function buildEvidenceIndex(results: FetchedSourceEvidence[]): FetchedEvidenceIndex {
+  const index: FetchedEvidenceIndex = {};
+  for (const row of results) {
+    if (row.ok && row.text && row.boxIndex != null && row.boxIndex > 0) {
+      index[row.boxIndex] = { url: row.url, text: row.text };
+    }
+  }
+  return index;
+}
+
+function parseBoxIndexFromSource(source: string | null): number | null {
+  if (!source) return null;
+  const match = source.match(/^\s*(\d{1,2})\s*[.:)\-–—]/);
+  if (!match) return null;
+  const n = Number(match[1]);
+  return n >= 1 ? n : null;
+}
+
+const CLAIM_SUPPORT_STOPWORDS = new Set([
+  'about',
+  'after',
+  'agency',
+  'according',
+  'analysis',
+  'because',
+  'before',
+  'between',
+  'calls',
+  'classifies',
+  'controlled',
+  'detectable',
+  'during',
+  'found',
+  'humans',
+  'industry',
+  'international',
+  'levels',
+  'monitoring',
+  'multiple',
+  'percent',
+  'reported',
+  'samples',
+  'shows',
+  'study',
+  'their',
+  'there',
+  'these',
+  'through',
+  'within',
+]);
+
+/**
+ * Lightweight claim↔excerpt support check using distinctive numbers/tokens from the claim.
+ * Used to stop Unverifiable verdicts when Firecrawl (or legacy) already returned supporting text.
+ */
+export function assessClaimExcerptSupport(
+  claimText: string,
+  excerpt: string
+): 'strong' | 'partial' | 'none' {
+  const claim = claimText.toLowerCase();
+  const body = excerpt.toLowerCase();
+  if (!claim || body.length < 40) return 'none';
+
+  const rawNums = claim.match(/\d+(?:\.\d+)?/g) || [];
+  const nums = [...new Set(rawNums.filter((n) => n.length >= 2 || Number(n) >= 10))];
+  // Match "70" against "70%" / "70 percent" etc.
+  const numHits = nums.filter((n) => body.includes(n)).length;
+
+  const tokens = claim
+    .split(/[^a-z0-9]+/)
+    .filter((t) => t.length >= 5 && !CLAIM_SUPPORT_STOPWORDS.has(t));
+  const tokenHits = tokens.filter((t) => body.includes(t)).length;
+
+  if (nums.length >= 1 && numHits >= Math.max(1, Math.ceil(nums.length * 0.5)) && tokenHits >= 1) {
+    return 'strong';
+  }
+  if (numHits >= 1 && tokenHits >= 1) return 'partial';
+  if (tokenHits >= 3) return 'partial';
+  if (nums.length === 0 && tokenHits >= 2) return 'partial';
+  return 'none';
+}
+
+function applyEvidenceGrounding(
+  claimText: string,
+  source: string | null,
+  tier: string,
+  verdict: string,
+  evidenceIndex: FetchedEvidenceIndex
+): { tier: string; verdict: string; grounded: boolean } {
+  const looksUnverifiable = /unverifiab|contested/i.test(`${tier} ${verdict}`);
+  const looksUnsupported = /unsupported/i.test(verdict);
+  if (!looksUnverifiable && !looksUnsupported) {
+    return { tier, verdict, grounded: false };
+  }
+
+  const boxIndex = parseBoxIndexFromSource(source);
+  if (boxIndex == null || !evidenceIndex[boxIndex]?.text) {
+    return { tier, verdict, grounded: false };
+  }
+
+  const support = assessClaimExcerptSupport(claimText, evidenceIndex[boxIndex].text);
+  if (support === 'none') return { tier, verdict, grounded: false };
+
+  if (support === 'strong') {
+    return { tier: 'Tier 3', verdict: 'Supported', grounded: true };
+  }
+  return { tier: 'Tier 3', verdict: 'Partially supported', grounded: true };
+}
+
+function mapFactCheck(
+  raw: JsonObject,
+  sourcesBox: string[] = [],
+  evidenceIndex: FetchedEvidenceIndex = {}
+): FactCheckLayer {
   const modelScore = clamp(firstPresent(raw, ['score', 'overallScore']), 0, 100);
   const subs = asObject(raw.subscores);
 
-  const claims = asArray(firstPresent(raw, ['claims', 'atomicClaims'])).map((claim, index) => {
-    const row = asObject(claim);
-    const tier = text(row.tier, 'Unverifiable');
-    const verdict = text(row.verdict, 'Needs review');
-    const defaults = resolveTier(tier);
-    const tierBase = clamp(row.tierBase, 0, 100) ?? defaults.base;
-    const evidenceWeight = inRange(row.evidenceWeight, 0.5, 1, defaults.weight);
-    const consensusFactor = inRange(row.consensusFactor, 0.4, 1, 1);
-    const regionalBonus = inRange(row.regionalBonus, 0.9, 1.1, 1);
-    const scored = !isUnscoredClaim(tier, verdict);
-    const score = scored
-      ? Math.max(0, Math.min(100, round1(tierBase * evidenceWeight * consensusFactor * regionalBonus)))
-      : null;
+  const mapped = asArray(firstPresent(raw, ['claims', 'atomicClaims']))
+    .map((claim) => {
+      const row = asObject(claim);
+      const claimText = text(firstPresent(row, ['text', 'claim']));
+      if (isMetaTrustScoreClaim(claimText)) return null;
 
-    return {
-      id: text(row.id, `C${index + 1}`),
-      text: text(firstPresent(row, ['text', 'claim'])),
-      source: row.source == null ? null : text(row.source),
-      tier,
-      verdict,
-      tierBase,
-      evidenceWeight,
-      consensusFactor,
-      regionalBonus,
-      score,
-    };
-  });
+      let tier = text(row.tier, 'Unverifiable');
+      let verdict = text(row.verdict, 'Needs review');
+      const claimedSource = row.source == null ? null : text(row.source);
+      const resolvedFromSource = claimedSource
+        ? resolveClaimSourceAgainstBox(claimedSource, sourcesBox)
+        : { source: null as string | null, fromBox: true };
+      const resolvedFromClaim = resolveClaimSourceAgainstBox(claimText, sourcesBox);
+      // Prefer an explicit source citation; fall back to claim-text → box matching.
+      const resolved = resolvedFromSource.source
+        ? resolvedFromSource
+        : resolvedFromClaim.source
+          ? resolvedFromClaim
+          : resolvedFromSource;
+
+      // Invented = model named a source that cannot be tied to the box at all
+      // (not merely a fuzzy miss when the claim text clearly maps to a box entry).
+      const inventedSource = Boolean(
+        claimedSource &&
+          !resolvedFromSource.source &&
+          !resolvedFromSource.fromBox &&
+          !resolvedFromClaim.source
+      );
+      const missingBoxSource = !resolved.source;
+
+      // Only strip credit for invented sources, or truly source-less claims.
+      let grounded = false;
+      if (inventedSource || missingBoxSource) {
+        tier = 'Unverifiable/Contested';
+        verdict = 'Unverifiable';
+      } else {
+        // If we fetched supporting text for this Sources-box row, do not leave the claim Unverifiable.
+        const groundedResult = applyEvidenceGrounding(
+          claimText,
+          resolved.source,
+          tier,
+          verdict,
+          evidenceIndex
+        );
+        if (groundedResult.grounded) {
+          tier = groundedResult.tier;
+          verdict = groundedResult.verdict;
+          grounded = true;
+        }
+      }
+
+      const defaults = resolveTier(tier);
+      const forceUnverifiable = inventedSource || missingBoxSource;
+      const tierBase = forceUnverifiable
+        ? UNVERIFIABLE_TIER.base
+        : grounded
+          ? defaults.base
+          : clamp(row.tierBase, 0, 100) ?? defaults.base;
+      const evidenceWeight = forceUnverifiable
+        ? UNVERIFIABLE_TIER.weight
+        : inRange(row.evidenceWeight, 0.5, 1, defaults.weight);
+      const consensusFactor = inRange(row.consensusFactor, 0.4, 1, 1);
+      const regionalBonus = inRange(row.regionalBonus, 0.9, 1.1, 1);
+      const scored = !isUnscoredClaim(tier, verdict);
+      const score = scored
+        ? Math.max(0, Math.min(100, round1(tierBase * evidenceWeight * consensusFactor * regionalBonus)))
+        : null;
+
+      return {
+        id: 'C0',
+        text: claimText,
+        source: resolved.source,
+        tier,
+        verdict,
+        tierBase,
+        evidenceWeight,
+        consensusFactor,
+        regionalBonus,
+        score,
+      };
+    })
+    .filter((claim): claim is NonNullable<typeof claim> => claim != null);
+
+  const claims = mapped.map((claim, index) => ({ ...claim, id: `C${index + 1}` }));
 
   const penalties = asArray(raw.penalties).map((penalty) => {
     const row = asObject(penalty);
@@ -693,20 +1908,7 @@ function mapFactCheck(raw: JsonObject): FactCheckLayer {
     return { type, points: resolvePenaltyPoints(type, row.points) };
   });
 
-  const scoredClaims = claims.filter((claim) => claim.score != null);
-  const claimsMean = scoredClaims.length
-    ? round1(scoredClaims.reduce((sum, claim) => sum + (claim.score as number), 0) / scoredClaims.length)
-    : null;
-  const penaltyTotal = Math.min(
-    MAX_FACT_CHECK_PENALTY_TOTAL,
-    penalties.reduce((sum, penalty) => sum + penalty.points, 0)
-  );
-
-  // Recompute from the claim rows so the header score can never disagree with what admins see.
-  const recomputed =
-    claimsMean == null
-      ? null
-      : Math.max(0, Math.min(100, Math.round(claimsMean * (1 - penaltyTotal / 100))));
+  const { claimsMean, score: recomputed } = recomputeFactCheckScore(claims, penalties);
   const score = recomputed ?? modelScore;
   if (score == null) throw new Error('UUTS fact-check score is missing');
 
@@ -869,9 +2071,18 @@ function mapSharedReality(raw: JsonObject): SharedRealityLayer {
   };
 }
 
-export function mapUutsPrescreenOutput(raw: unknown, category = ''): ScoreSnapshot {
+export function mapUutsPrescreenOutput(
+  raw: unknown,
+  category = '',
+  sourcesBox: string[] = [],
+  evidenceIndex: FetchedEvidenceIndex = {}
+): ScoreSnapshot {
   const root = asObject(raw);
-  const factCheck = mapFactCheck(pickObject(root, ['factCheck', 'fact_check', 'accuracy']));
+  const factCheck = mapFactCheck(
+    pickObject(root, ['factCheck', 'fact_check', 'accuracy']),
+    sourcesBox,
+    evidenceIndex
+  );
   const commsIntegrity = mapCommsIntegrity(
     pickObject(root, ['commsIntegrity', 'communicationsIntegrity', 'communicationIntegrity', 'fairness']),
     category
@@ -918,29 +2129,245 @@ async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   }
 }
 
+export type PrescreenGenerationResult = {
+  snapshot: ScoreSnapshot;
+  langfuseTraceId: string | null;
+};
+
+type PrescreenCallOptions = {
+  externalResearch?: boolean;
+  /** Authoritative Sources-box lines — claim.source must resolve against these. */
+  sourcesBox?: string[];
+  /** Successful Sources-box fetches keyed by box index — used to ground Unverifiable claims. */
+  evidenceIndex?: FetchedEvidenceIndex;
+};
+
+async function generatePrescreenGemini(
+  vertexAI: VertexAI,
+  modelName: string,
+  prompt: string,
+  category: string,
+  campaignId: string,
+  promptMeta?: Pick<UutsPromptSource, 'promptName' | 'promptVersion' | 'source'>,
+  callOptions?: PrescreenCallOptions
+): Promise<PrescreenGenerationResult> {
+  const externalResearch = callOptions?.externalResearch === true;
+  const timeoutMs = externalResearch ? RESEARCH_TIMEOUT_MS : TIMEOUT_MS;
+  // Sources-box research prefetches URL text into the prompt — no open-web tools.
+  const model = vertexAI.getGenerativeModel({
+    model: modelName,
+    generationConfig: { temperature: 0.5 },
+  });
+
+  return traceGeminiCall({
+    name: 'prescreen-uuts',
+    model: modelName,
+    tags: [
+      'uuts-prescreen',
+      'gemini',
+      externalResearch ? 'sources-box-research' : 'cited-only',
+    ],
+    metadata: {
+      campaignId: metaStr(campaignId),
+      category: metaStr(category, 80),
+      provider: 'gemini',
+      promptSource: metaStr(promptMeta?.source || 'unknown', 40),
+      promptName: metaStr(promptMeta?.promptName || '', 80),
+      promptVersion: metaStr(promptMeta?.promptVersion ?? '', 20),
+      externalResearch: externalResearch ? 'true' : 'false',
+      researchMode: externalResearch ? 'sources-box' : 'none',
+    },
+    input: {
+      campaignId,
+      category,
+      externalResearch,
+      prompt: prompt.length > 8000 ? `${prompt.slice(0, 8000)}…` : prompt,
+    },
+    run: async () => {
+      const result = await withTimeout(
+        model.generateContent({
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        }),
+        timeoutMs
+      );
+      const responseText =
+        result.response?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
+      if (!responseText) {
+        scoreActiveUutsFailure('UUTS pre-screen returned an empty response');
+        throw new Error('UUTS pre-screen returned an empty response');
+      }
+      let snapshot: ScoreSnapshot;
+      try {
+        snapshot = mapUutsPrescreenOutput(
+          extractJson(responseText),
+          category,
+          callOptions?.sourcesBox || [],
+          callOptions?.evidenceIndex || {}
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        scoreActiveUutsFailure(msg);
+        throw err;
+      }
+      const health = evaluateUutsSchemaHealth(snapshot);
+      scoreActiveUutsRun(snapshot, health, {
+        promptName: promptMeta?.promptName,
+        promptVersion: promptMeta?.promptVersion,
+      });
+      return {
+        result: { snapshot, langfuseTraceId: getActiveLangfuseTraceId() },
+        output: {
+          composite: snapshot.composite,
+          compositeBase: snapshot.compositeBase ?? null,
+          confidenceFactor: snapshot.confidenceFactor ?? null,
+          factCheck: snapshot.factCheck?.score ?? null,
+          commsIntegrity: snapshot.commsIntegrity?.score ?? null,
+          sharedReality: snapshot.sharedReality?.score ?? null,
+          schemaValid: health.schemaValid,
+          externalResearch,
+          researchMode: externalResearch ? 'sources-box' : 'none',
+          raw: responseText.length > 6000 ? `${responseText.slice(0, 6000)}…` : responseText,
+        },
+        usageDetails: extractVertexUsage(result),
+      };
+    },
+  });
+}
+
+async function generatePrescreenAnthropic(
+  modelName: string,
+  prompt: string,
+  category: string,
+  campaignId: string,
+  promptMeta?: Pick<UutsPromptSource, 'promptName' | 'promptVersion' | 'source'>,
+  callOptions?: PrescreenCallOptions
+): Promise<PrescreenGenerationResult> {
+  const externalResearch = callOptions?.externalResearch === true;
+  const timeoutMs = externalResearch ? RESEARCH_TIMEOUT_MS : TIMEOUT_MS;
+  const apiKey = (process.env.ANTHROPIC_API_KEY || '').trim();
+  if (!apiKey) {
+    throw Object.assign(new Error('ANTHROPIC_API_KEY is required for Claude UUTS models'), {
+      status: 500,
+    });
+  }
+  const client = new Anthropic({ apiKey });
+
+  return traceGeminiCall({
+    name: 'prescreen-uuts',
+    model: modelName,
+    tags: [
+      'uuts-prescreen',
+      'anthropic',
+      externalResearch ? 'sources-box-research' : 'cited-only',
+    ],
+    metadata: {
+      campaignId: metaStr(campaignId),
+      category: metaStr(category, 80),
+      provider: 'anthropic',
+      promptSource: metaStr(promptMeta?.source || 'unknown', 40),
+      promptName: metaStr(promptMeta?.promptName || '', 80),
+      promptVersion: metaStr(promptMeta?.promptVersion ?? '', 20),
+      externalResearch: externalResearch ? 'true' : 'false',
+      researchMode: externalResearch ? 'sources-box' : 'none',
+    },
+    input: {
+      campaignId,
+      category,
+      externalResearch,
+      prompt: prompt.length > 8000 ? `${prompt.slice(0, 8000)}…` : prompt,
+    },
+    run: async () => {
+      const result = await withTimeout(
+        client.messages.create({
+          model: modelName,
+          max_tokens: externalResearch ? ANTHROPIC_RESEARCH_MAX_TOKENS : ANTHROPIC_MAX_TOKENS,
+          temperature: 0.5,
+          messages: [{ role: 'user', content: prompt }],
+        }),
+        timeoutMs
+      );
+      const responseText = result.content
+        .filter((block) => block.type === 'text')
+        .map((block) => (block.type === 'text' ? block.text : ''))
+        .join('\n')
+        .trim();
+      if (!responseText) {
+        scoreActiveUutsFailure('UUTS pre-screen (Claude) returned an empty response');
+        throw new Error('UUTS pre-screen (Claude) returned an empty response');
+      }
+      let snapshot: ScoreSnapshot;
+      try {
+        snapshot = mapUutsPrescreenOutput(
+          extractJson(responseText),
+          category,
+          callOptions?.sourcesBox || [],
+          callOptions?.evidenceIndex || {}
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        scoreActiveUutsFailure(msg);
+        throw err;
+      }
+      const health = evaluateUutsSchemaHealth(snapshot);
+      scoreActiveUutsRun(snapshot, health, {
+        promptName: promptMeta?.promptName,
+        promptVersion: promptMeta?.promptVersion,
+      });
+      return {
+        result: { snapshot, langfuseTraceId: getActiveLangfuseTraceId() },
+        output: {
+          composite: snapshot.composite,
+          compositeBase: snapshot.compositeBase ?? null,
+          confidenceFactor: snapshot.confidenceFactor ?? null,
+          factCheck: snapshot.factCheck?.score ?? null,
+          commsIntegrity: snapshot.commsIntegrity?.score ?? null,
+          sharedReality: snapshot.sharedReality?.score ?? null,
+          schemaValid: health.schemaValid,
+          externalResearch,
+          researchMode: externalResearch ? 'sources-box' : 'none',
+          raw: responseText.length > 6000 ? `${responseText.slice(0, 6000)}…` : responseText,
+        },
+        usageDetails: {
+          input: result.usage?.input_tokens,
+          output: result.usage?.output_tokens,
+          total:
+            result.usage?.input_tokens != null && result.usage?.output_tokens != null
+              ? result.usage.input_tokens + result.usage.output_tokens
+              : undefined,
+        },
+      };
+    },
+  });
+}
+
 async function generatePrescreen(
   vertexAI: VertexAI,
+  modelOption: UutsModelOption,
   prompt: string,
-  category: string
-): Promise<ScoreSnapshot> {
-  const model = vertexAI.getGenerativeModel({
-    model: process.env.GEMINI_MODEL_UUTS_PRESCREEN || DEFAULT_MODEL,
-    // Sampling makes the same campaign score differently on every run, so scores are
-    // not reproducible and reviewers cannot compare a re-run against a stored version.
-    generationConfig: { temperature: 0 },
-  });
-  const result = await withTimeout(
-    model.generateContent({
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    }),
-    TIMEOUT_MS
-  );
-  const responseText =
-    result.response?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
-  if (!responseText) {
-    throw new Error('UUTS pre-screen returned an empty response');
+  category: string,
+  campaignId: string,
+  promptMeta?: Pick<UutsPromptSource, 'promptName' | 'promptVersion' | 'source'>,
+  callOptions?: PrescreenCallOptions
+): Promise<PrescreenGenerationResult> {
+  if (modelOption.provider === 'anthropic') {
+    return generatePrescreenAnthropic(
+      modelOption.id,
+      prompt,
+      category,
+      campaignId,
+      promptMeta,
+      callOptions
+    );
   }
-  return mapUutsPrescreenOutput(extractJson(responseText), category);
+  return generatePrescreenGemini(
+    vertexAI,
+    modelOption.id,
+    prompt,
+    category,
+    campaignId,
+    promptMeta,
+    callOptions
+  );
 }
 
 export async function runUutsPrescreenAndPersist({
@@ -949,10 +2376,43 @@ export async function runUutsPrescreenAndPersist({
   campaignId,
   campaign,
   promptDocId = DEFAULT_PROMPT_DOC_ID,
+  model: requestedModel,
+  externalResearch: externalResearchRaw,
 }: RunUutsPrescreenParams): Promise<void> {
   const campaignRef = db.collection('campaigns').doc(campaignId);
-  const promptTemplate = await loadPrompt(db, promptDocId);
-  const prompt = buildPrompt(promptTemplate, campaign);
+  const modelOption = resolveUutsModel(requestedModel);
+  const externalResearch = externalResearchRaw === true;
+  const promptSource = await loadPrompt(db, promptDocId);
+
+  let evidencePack = '';
+  let evidenceIndex: FetchedEvidenceIndex = {};
+  let sourcesFetchedOk = 0;
+  let sourcesFetchedFailed = 0;
+  let sourcesUrlCount = 0;
+  let sourcesFetchErrors: Array<{ url: string; error: string; status?: number }> = [];
+  if (externalResearch) {
+    const evidence = await fetchSourcesBoxEvidence(campaign);
+    evidencePack = evidence.pack;
+    evidenceIndex = buildEvidenceIndex(evidence.results);
+    sourcesFetchedOk = evidence.fetchedOk;
+    sourcesFetchedFailed = evidence.fetchedFailed;
+    sourcesUrlCount = evidence.urls.length;
+    sourcesFetchErrors = evidence.fetchErrors.slice(0, 20);
+    console.log(
+      `UUTS sources-box research for ${campaignId}: ${evidence.urls.length} urls, ${sourcesFetchedOk} ok, ${sourcesFetchedFailed} failed, groundedEligible=${Object.keys(evidenceIndex).length}`
+    );
+    if (sourcesFetchErrors.length) {
+      console.warn(
+        `UUTS sources-box fetch failures for ${campaignId}:`,
+        sourcesFetchErrors.map((row) => `${row.url} → ${row.error}`).join(' | ')
+      );
+    }
+  }
+
+  const prompt = buildPrompt(promptSource.template, campaign, {
+    externalResearch,
+    evidencePack: externalResearch ? evidencePack : undefined,
+  });
   const category = text(campaign.category);
   let attempts = 0;
 
@@ -960,12 +2420,22 @@ export async function runUutsPrescreenAndPersist({
     uuts_prescreen_status: 'in_progress',
     uuts_prescreen_attempts: attempts,
     uuts_prescreen_error: null,
+    uuts_prescreen_model: modelOption.id,
+    uuts_prescreen_provider: modelOption.provider,
+    uuts_prescreen_external_research: externalResearch,
+    uuts_prescreen_research_mode: externalResearch ? 'sources-box' : null,
+    uuts_prescreen_sources_fetched_ok: externalResearch ? sourcesFetchedOk : null,
+    uuts_prescreen_sources_fetched_failed: externalResearch ? sourcesFetchedFailed : null,
+    uuts_prescreen_sources_url_count: externalResearch ? sourcesUrlCount : null,
+    uuts_prescreen_sources_fetch_errors: externalResearch ? sourcesFetchErrors : null,
+    uuts_prescreen_prompt_source: promptSource.source,
+    uuts_prescreen_prompt_version: promptSource.promptVersion ?? null,
     uuts_prescreen_started_at: nowIso(),
     uuts_prescreen_updated_at: nowIso(),
   });
 
   try {
-    let snapshot: ScoreSnapshot | null = null;
+    let generation: PrescreenGenerationResult | null = null;
     let lastError: unknown = null;
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
@@ -975,7 +2445,19 @@ export async function runUutsPrescreenAndPersist({
         uuts_prescreen_updated_at: nowIso(),
       });
       try {
-        snapshot = await generatePrescreen(vertexAI, prompt, category);
+        generation = await generatePrescreen(
+          vertexAI,
+          modelOption,
+          prompt,
+          category,
+          campaignId,
+          promptSource,
+          {
+            externalResearch,
+            sourcesBox: sourceList(campaign.campaign_sources ?? campaign.sources),
+            evidenceIndex,
+          }
+        );
         break;
       } catch (error) {
         lastError = error;
@@ -986,9 +2468,11 @@ export async function runUutsPrescreenAndPersist({
       }
     }
 
-    if (!snapshot) {
+    if (!generation) {
       throw lastError || new Error('UUTS pre-screen failed');
     }
+
+    const { snapshot, langfuseTraceId } = generation;
 
     const result = await upsertTrustReport(db, campaignId, {
       initial: snapshot,
@@ -999,9 +2483,17 @@ export async function runUutsPrescreenAndPersist({
         assignedReviewer: null,
         decision: 'pending',
         reviewedAt: nowIso(),
-        reviewer: 'UUTS Pre-screening skill',
+        decidedAt: null,
+        reviewer: null,
+        layers: {
+          factCheck: { aiReviewed: true, humanReviewed: false },
+          commsIntegrity: { aiReviewed: true, humanReviewed: false },
+          sharedReality: { aiReviewed: true, humanReviewed: false },
+        },
       },
-      createdBy: 'uuts-prescreen',
+      createdBy: externalResearch ? 'uuts-prescreen-external-research' : 'uuts-prescreen',
+      model: modelOption.id,
+      provider: modelOption.provider,
       refresh: true,
       publish: false,
     });
@@ -1015,19 +2507,177 @@ export async function runUutsPrescreenAndPersist({
       uuts_prescreen_confidence_factor: snapshot.confidenceFactor ?? null,
       uuts_prescreen_version_id: result.versionId,
       uuts_prescreen_version_number: result.version,
+      uuts_prescreen_model: modelOption.id,
+      uuts_prescreen_provider: modelOption.provider,
+      uuts_prescreen_external_research: externalResearch,
+      uuts_prescreen_prompt_source: promptSource.source,
+      uuts_prescreen_prompt_version: promptSource.promptVersion ?? null,
+      uuts_prescreen_langfuse_trace_id: langfuseTraceId,
       uuts_prescreen_completed_at: nowIso(),
       uuts_prescreen_updated_at: nowIso(),
       updatedAt: nowIso(),
+    });
+
+    await notifyUutsPrescreenSlack({
+      status: 'complete',
+      campaignId,
+      title: text(campaign.title, campaignId),
+      category: text(campaign.category),
+      composite: snapshot.composite,
+      model: modelOption.id,
+      provider: modelOption.provider,
+      externalResearch,
+      sourcesFetchedOk: externalResearch ? sourcesFetchedOk : null,
+      sourcesFetchedFailed: externalResearch ? sourcesFetchedFailed : null,
+      sourcesUrlCount: externalResearch ? sourcesUrlCount : null,
+      versionNumber: result.version,
     });
   } catch (error) {
     await campaignRef.update({
       uuts_prescreen_status: 'manual_required',
       uuts_prescreen_attempts: attempts,
       uuts_prescreen_error: errorMessage(error).slice(0, 1000),
+      uuts_prescreen_external_research: externalResearch,
       uuts_prescreen_failed_at: nowIso(),
       uuts_prescreen_updated_at: nowIso(),
       updatedAt: nowIso(),
     });
+
+    await notifyUutsPrescreenSlack({
+      status: 'manual_required',
+      campaignId,
+      title: text(campaign.title, campaignId),
+      category: text(campaign.category),
+      model: modelOption.id,
+      provider: modelOption.provider,
+      externalResearch,
+      sourcesFetchedOk: externalResearch ? sourcesFetchedOk : null,
+      sourcesFetchedFailed: externalResearch ? sourcesFetchedFailed : null,
+      sourcesUrlCount: externalResearch ? sourcesUrlCount : null,
+      error: errorMessage(error).slice(0, 500),
+    });
+
     throw error;
   }
+}
+
+export interface RunUutsSchedulerOptions {
+  db: Firestore;
+  vertexAI: VertexAI;
+  dryRun?: boolean;
+  limit?: number;
+  campaignIds?: string[];
+  model?: string | null;
+  promptDocId?: string;
+  externalResearch?: boolean;
+}
+
+/**
+ * Batch UUTS re-score for Cloud Scheduler. Creates draft versions only (never publishes).
+ * Gated by isUutsSchedulerEnabled() at the HTTP layer.
+ */
+export async function runUutsPrescreenScheduler(
+  options: RunUutsSchedulerOptions
+): Promise<{
+  ok: boolean;
+  dryRun: boolean;
+  schedulerEnabled: true;
+  model: string;
+  provider: UutsProvider;
+  externalResearch: boolean;
+  considered: number;
+  queued: number;
+  skipped: number;
+  results: Array<{ campaignId: string; action: 'queued' | 'would_queue' | 'skipped'; reason?: string }>;
+}> {
+  const {
+    db,
+    vertexAI,
+    dryRun = false,
+    limit = 20,
+    campaignIds,
+    model,
+    promptDocId,
+    externalResearch: externalResearchRaw,
+  } = options;
+  const modelOption = resolveUutsModel(model);
+  const externalResearch = externalResearchRaw === true;
+  const results: Array<{
+    campaignId: string;
+    action: 'queued' | 'would_queue' | 'skipped';
+    reason?: string;
+  }> = [];
+
+  let docs: QueryDocumentSnapshot[] = [];
+  if (campaignIds && campaignIds.length > 0) {
+    const snaps = await Promise.all(
+      campaignIds.slice(0, Math.max(1, limit)).map((id) => db.collection('campaigns').doc(id).get())
+    );
+    docs = snaps.filter((s) => s.exists) as QueryDocumentSnapshot[];
+  } else {
+    const snap = await db.collection('campaigns').limit(Math.max(1, Math.min(limit, 100))).get();
+    docs = snap.docs;
+  }
+
+  let queued = 0;
+  let skipped = 0;
+
+  for (const doc of docs) {
+    const campaignId = doc.id;
+    const data = doc.data() || {};
+    const status = String(data.status || '');
+    // Skip campaigns already mid-run to avoid duplicate draft versions.
+    if (data.uuts_prescreen_status === 'in_progress' || data.uuts_prescreen_status === 'queued') {
+      skipped += 1;
+      results.push({ campaignId, action: 'skipped', reason: `status=${data.uuts_prescreen_status}` });
+      continue;
+    }
+    if (status && !['Approved', 'Pending', 'Completed', 'Draft'].includes(status)) {
+      skipped += 1;
+      results.push({ campaignId, action: 'skipped', reason: `campaign status=${status}` });
+      continue;
+    }
+
+    if (dryRun) {
+      results.push({ campaignId, action: 'would_queue' });
+      queued += 1;
+      continue;
+    }
+
+    const queuedAt = nowIso();
+    await doc.ref.update({
+      uuts_prescreen_status: 'queued',
+      uuts_prescreen_attempts: 0,
+      uuts_prescreen_error: null,
+      uuts_prescreen_external_research: externalResearch,
+      uuts_prescreen_updated_at: queuedAt,
+      updatedAt: queuedAt,
+    });
+
+    void runUutsPrescreenAndPersist({
+      db,
+      vertexAI,
+      campaignId,
+      campaign: { id: campaignId, ...data },
+      promptDocId,
+      model: modelOption.id,
+      externalResearch,
+    }).catch((err) => console.error(`UUTS scheduler background error for ${campaignId}:`, err));
+
+    queued += 1;
+    results.push({ campaignId, action: 'queued' });
+  }
+
+  return {
+    ok: true,
+    dryRun,
+    schedulerEnabled: true,
+    model: modelOption.id,
+    provider: modelOption.provider,
+    externalResearch,
+    considered: docs.length,
+    queued,
+    skipped,
+    results,
+  };
 }

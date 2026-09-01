@@ -1,17 +1,18 @@
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import morgan from 'morgan';
-import dotenv from 'dotenv';
 import rateLimit from 'express-rate-limit';
+import dotenv from 'dotenv';
 import { initializeApp, applicationDefault, getApp } from 'firebase-admin/app';
 import { FieldValue, getFirestore } from 'firebase-admin/firestore';
 import { getAuth } from 'firebase-admin/auth';
-import { WebClient } from '@slack/web-api'; 
+import { WebClient } from '@slack/web-api';
 import { VertexAI } from '@google-cloud/vertexai';
 import { Storage } from '@google-cloud/storage';
 import Stripe from 'stripe';
 import { PostHog } from 'posthog-node';
 import { randomUUID } from 'crypto';
+import sanitizeHtml from 'sanitize-html';
 import {
   computeCumulativePersonalImpactSnapshot,
   computePerCampaignPersonalImpactSnapshot,
@@ -30,24 +31,91 @@ import {
 import { runCampaignReportDrips, parseCampaignReportDripRequest } from './campaignReportDrips';
 import { runCampaignUrgentWindow, parseUrgentWindowRequest } from './campaignUrgentWindow';
 import { sendContributionReceipt, AD_AMPLIFICATION_SPLIT } from './contributionReceipt';
+import { createRedditAdCampaign, verifyRedditAdsConnection } from './redditAds';
 import {
+  isAutoSyndicationEnabled,
+  publishCampaignToReddit,
+  publishCampaignToX,
+  syndicateApprovedCampaign,
+} from './socialSyndication';
+import {
+  audienceSizeToCampaignPatch,
+  DEFAULT_FACEBOOK_TARGETING,
+  fetchAudienceSizeEstimateSafe,
   fetchFacebookAdInsights,
   insightsToCampaignPatch,
   syncAllPublishedCampaignFacebookInsights,
   syncCampaignFacebookInsights,
 } from './facebookInsights';
 import {
+  IMPACT_OG_HEIGHT,
+  IMPACT_OG_WIDTH,
   type ImpactShareCardPayload,
   renderImpactOgPng,
 } from './impactOgImage';
 import {
+  TRUST_OG_HEIGHT,
+  TRUST_OG_WIDTH,
+  type TrustReportOgPayload,
+  renderTrustReportOgPng,
+} from './trustReportOgImage';
+import {
+  campaignReviewDenorm,
+  getLatestTrustReportReview,
   getPublishedTrustReport,
   getTrustReportVersion,
+  isAcceptedDecision,
   listTrustReportVersions,
   publishTrustReport,
+  saveTrustReportReview,
   upsertTrustReport,
+  type TrustReportPayload,
 } from './trustReport';
-import { isUutsPrescreenEnabled, runUutsPrescreenAndPersist } from './uutsPrescreen';
+import {
+  getUutsConfig,
+  isUutsPrescreenEnabled,
+  isUutsPublishLiveEnabled,
+  isUutsSchedulerEnabled,
+  parseExternalResearchFlag,
+  resolveUutsModel,
+  runUutsPrescreenAndPersist,
+  runUutsPrescreenScheduler,
+} from './uutsPrescreen';
+import { generateCampaignDraft } from './campaignDraftGenerator';
+import {
+  extractVertexUsage,
+  forceFlushLangfuse,
+  initLangfuse,
+  metaStr,
+  traceGeminiCall,
+} from './langfuseInstrumentation';
+import {
+  dismissPoll,
+  getMyPollResponses,
+  isPollQuestionId,
+  loadPollConfig,
+  mergePollConfig,
+  resolveRespondent,
+  summarizePollAggregates,
+  upsertPollAnswer,
+} from './campaignPolls';
+import {
+  createComment,
+  listCheckoutTestimonials,
+  listComments,
+  MAX_COMMENT_LENGTH,
+  removeComment,
+  sanitizeCommentText,
+} from './campaignComments';
+import {
+  attributeShareBack,
+  createOrGetShareLink,
+  getShareAttributionWindowDays,
+  isShareSurface,
+  loadShareStatsForUser,
+  recordShareLinkVisit,
+  sanitizeShareRef,
+} from './shareAttribution';
 import {
   validatePartnerApplication,
   validateJobApplication,
@@ -69,6 +137,7 @@ declare global {
 
 // Load environment variables
 dotenv.config();
+initLangfuse();
 
 // Initialize Firebase Admin (uses default credentials on Cloud Run)
 initializeApp({
@@ -83,6 +152,30 @@ const usersDb = getFirestore(getApp());
 
 // Initialize Slack client
 const slack = new WebClient(process.env.SLACK_BOT_TOKEN);
+
+/**
+ * Sanitize a value for a Slack block text field. Slack rejects any block text over
+ * 3000 characters, which makes chat.postMessage throw — and our Slack posts swallow
+ * that error, so a single over-long field silently drops the whole notification.
+ * Campaign descriptions (rich HTML) routinely exceed 3000 chars, which is what stalled
+ * the #moderation feed (UE-211). This strips HTML/entities and hard-caps the length so
+ * a post can never be rejected for size.
+ */
+function toSlackText(value: unknown, max = 2800): string {
+  const text = (value == null ? '' : String(value))
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#0?39;/gi, "'")
+    .replace(/[ \t ]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  if (text.length <= max) return text;
+  return `${text.slice(0, max - 14).trimEnd()}… (truncated)`;
+}
 
 // Initialize Vertex AI and Cloud Storage
 const vertexAI = new VertexAI({ project: 'unravelreserchagent', location: 'us-central1' });
@@ -124,6 +217,11 @@ interface BackingInput {
   amountDiscount: number; // cents
   utmSource: string | null;
   utmCampaign: string | null;
+  utmMedium: string | null;
+  utmTerm: string | null;
+  utmContent: string | null;
+  /** UE-188: per-user share ref carried through checkout metadata */
+  shareRef: string | null;
   source: string; // which event produced this
 }
 
@@ -155,12 +253,35 @@ async function upsertBacking(input: BackingInput): Promise<void> {
       amount_discount: input.amountDiscount,
       utm_source: input.utmSource,
       utm_campaign: input.utmCampaign,
+      utm_medium: input.utmMedium,
+      utm_term: input.utmTerm,
+      utm_content: input.utmContent,
+      ...(input.shareRef ? { share_ref: input.shareRef } : {}),
       source: input.source,
       created_at: new Date().toISOString(),
     });
   });
 
   if (!isNew) return; // only the first delivery emits the event
+
+  // UE-188: attribute the back to the sharer's ref when within the config window.
+  try {
+    await attributeShareBack(
+      db,
+      {
+        shareRef: input.shareRef,
+        campaignId: input.campaignId,
+        // Gross contribution: charged + discount (zero-balance coupon path has charged=0).
+        amountCents: (input.amountTotal || 0) + (input.amountDiscount || 0),
+        backerUid: input.firebaseUid,
+        backerDistinctId: input.distinctId,
+        paymentIdKey: input.idKey,
+      },
+      getPostHog()
+    );
+  } catch (e) {
+    console.warn('[share] attributeShareBack failed:', e instanceof Error ? e.message : e);
+  }
 
   // Best-effort is_first_backing for logged-in users: any earlier coupon backing?
   let isFirstBacking = false;
@@ -177,6 +298,37 @@ async function upsertBacking(input: BackingInput): Promise<void> {
     }
   }
 
+  // UE-158 review: stamp the backer's username onto the PostHog person so the
+  // dashboard's backer list shows it next to the email. Usernames live only in
+  // the Firestore user profile (UE-75) — guests have none, so theirs stays unset.
+  let username: string | null = null;
+  if (input.firebaseUid) {
+    try {
+      const userDoc = await usersDb.collection('users').doc(input.firebaseUid).get();
+      if (userDoc.exists) {
+        username =
+          String((userDoc.data() as Record<string, unknown>)?.username || '').trim() || null;
+      }
+    } catch {
+      /* lookup failure — the person simply stays email-only */
+    }
+  }
+
+  // Stamp the readable campaign title so PostHog breakdowns show names, not just
+  // the campaign_id slug — parity with the client campaign_viewed/donate events.
+  let campaignTitle: string | null = null;
+  if (input.campaignId) {
+    try {
+      const campaignDoc = await db.collection('campaigns').doc(input.campaignId).get();
+      if (campaignDoc.exists) {
+        const data = campaignDoc.data() as Record<string, unknown>;
+        campaignTitle = String(data?.title || data?.name || '').trim() || null;
+      }
+    } catch {
+      /* lookup failure — the event simply stays campaign_id-only */
+    }
+  }
+
   const ph = getPostHog();
   if (ph && input.distinctId) {
     ph.capture({
@@ -188,10 +340,18 @@ async function upsertBacking(input: BackingInput): Promise<void> {
         amount_total: input.amountTotal,
         amount_discount: input.amountDiscount,
         campaign_id: input.campaignId,
+        campaign_title: campaignTitle,
         is_guest: input.isGuest,
         is_first_backing: isFirstBacking,
         utm_source: input.utmSource,
         utm_campaign: input.utmCampaign,
+        utm_medium: input.utmMedium,
+        utm_term: input.utmTerm,
+        utm_content: input.utmContent,
+        ...(input.shareRef ? { share_ref: input.shareRef } : {}),
+        // $set rides the same event, so the person — and this event's person
+        // snapshot — carry the username the moment the backing is ingested.
+        ...(username ? { $set: { username } } : {}),
       },
     });
     try {
@@ -233,6 +393,10 @@ async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session):
     amountDiscount: session.total_details?.amount_discount ?? 0,
     utmSource: cleanStr(md.utm_source),
     utmCampaign: cleanStr(md.utm_campaign),
+    utmMedium: cleanStr(md.utm_medium),
+    utmTerm: cleanStr(md.utm_term),
+    utmContent: cleanStr(md.utm_content),
+    shareRef: sanitizeShareRef(md.share_ref),
     source: 'checkout.session.completed',
   });
 }
@@ -264,6 +428,10 @@ async function handlePaymentIntentSucceeded(pi: Stripe.PaymentIntent): Promise<v
     amountDiscount: parseCents(md.discount_cents),
     utmSource: cleanStr(md.utm_source),
     utmCampaign: cleanStr(md.utm_campaign),
+    utmMedium: cleanStr(md.utm_medium),
+    utmTerm: cleanStr(md.utm_term),
+    utmContent: cleanStr(md.utm_content),
+    shareRef: sanitizeShareRef(md.share_ref),
     source: 'payment_intent.succeeded',
   });
 }
@@ -422,6 +590,56 @@ async function createStripeProductForApprovedCampaign(
   return { productId: product.id, donationPriceId };
 }
 
+// UE-223 — ToS 4.2 compliance word list ("Prohibited Content and Uses"). Mirrors
+// unravel-ui/src/constants/forbiddenWords.js — keep both lists in sync (no shared
+// package between the two repos). Server-side check is defense in depth behind the
+// client-side live check on the Create a Campaign wizard's Submit step.
+const FORBIDDEN_WORDS = ['verified', 'certified', 'guaranteed', 'truth-checked', 'fact-certified', 'endorsed'];
+
+function stripHtmlForWordScan(html: unknown): string {
+  return String(html ?? '').replace(/<[^>]*>/g, ' ');
+}
+
+/** Returns the FORBIDDEN_WORDS found (case-insensitive, tag-stripped) across the given fields. */
+function findForbiddenWords(...fields: unknown[]): string[] {
+  const haystack = fields.map(stripHtmlForWordScan).join(' ').toLowerCase();
+  return FORBIDDEN_WORDS.filter((word) => haystack.includes(word));
+}
+
+/** Same copy deck as unravel-ui/src/constants/forbiddenWords.js's forbiddenWordsMessage(). */
+function forbiddenWordsMessage(hits: string[]): string {
+  return `Language review: "${hits.join('", "')}" is not allowed on Unravel`;
+}
+
+// UE-223/C4 — long_description and why_backers_should_care are creator-authored TipTap HTML,
+// rendered raw via dangerouslySetInnerHTML on public pages. Allowlist matches exactly what the
+// editor's toolbar (StarterKit + Underline + Link + TextStyle/FontSize/Color + Youtube +
+// the custom SocialEmbed node, see unravel-ui/src/pages/CreateCampaign.jsx + extensions/SocialEmbed.js)
+// can actually produce — nothing else survives.
+const SANITIZE_HTML_OPTIONS: sanitizeHtml.IOptions = {
+  allowedTags: [
+    'p', 'br', 'strong', 'em', 'u', 's', 'blockquote', 'code', 'pre',
+    'h1', 'h2', 'h3', 'h4', 'ul', 'ol', 'li', 'a', 'img', 'span', 'div', 'iframe',
+  ],
+  allowedAttributes: {
+    a: ['href', 'target', 'rel'],
+    img: ['src', 'alt', 'width', 'height'],
+    span: ['style'],
+    div: ['data-type', 'data-embed-src', 'data-embed-type', 'class'],
+    iframe: ['src', 'width', 'height', 'frameborder', 'allowfullscreen', 'loading', 'class', 'title'],
+  },
+  allowedStyles: {
+    span: {
+      color: [/^#[0-9a-fA-F]{3,8}$/],
+      'font-size': [/^\d{1,3}px$/],
+    },
+  },
+  // Only the 3 embed providers CreateCampaign.jsx's toolbar can insert; blocks arbitrary iframe injection.
+  allowedIframeHostnames: ['www.youtube.com', 'platform.twitter.com', 'www.facebook.com'],
+  allowedSchemes: ['http', 'https', 'mailto'],
+  allowProtocolRelative: false,
+};
+
 // Function to analyze campaign content with AI moderation
 async function analyzeCampaignWithAI(title: string, description: string, tagline?: string): Promise<string> {
   try {
@@ -452,22 +670,44 @@ Tagline: ${tagline || 'N/A'}
       campaignContent + '\nEvaluate the campaign for:'
     );
     
-    const model = vertexAI.getGenerativeModel({
-      model: process.env.GEMINI_MODEL_AI_MODERATION || 'gemini-2.5-flash-lite',
+    const modelName = process.env.GEMINI_MODEL_AI_MODERATION || 'gemini-2.5-flash-lite';
+    const model = vertexAI.getGenerativeModel({ model: modelName });
+
+    const recommendation = await traceGeminiCall({
+      name: 'moderate-campaign',
+      model: modelName,
+      tags: ['ai-moderation'],
+      metadata: {
+        title: metaStr(title, 120),
+        contentChars: String(totalContentLength),
+      },
+      input: {
+        title: title || null,
+        tagline: tagline || null,
+        descriptionChars: description?.length || 0,
+        // Full prompt for debugging; trim very long campaigns in UI via Langfuse
+        prompt: prompt.length > 8000 ? `${prompt.slice(0, 8000)}…` : prompt,
+      },
+      run: async () => {
+        const result = await model.generateContent({
+          contents: [{
+            role: 'user',
+            parts: [{ text: prompt }],
+          }],
+        });
+        const text =
+          result.response.candidates?.[0]?.content?.parts?.[0]?.text ||
+          'AI moderation analysis unavailable';
+        const trimmed = text.trim();
+        return {
+          result: trimmed,
+          output: trimmed,
+          usageDetails: extractVertexUsage(result),
+        };
+      },
     });
 
-    const result = await model.generateContent({
-      contents: [{
-        role: 'user',
-        parts: [{ text: prompt }]
-      }],
-    });
-    
-    const response = result.response;
-    const recommendation = response.candidates?.[0]?.content?.parts?.[0]?.text || 
-                          'AI moderation analysis unavailable';
-    
-    return recommendation.trim();
+    return recommendation;
   } catch (error: any) {
     console.error('AI moderation error:', error);
     
@@ -479,6 +719,90 @@ Tagline: ${tagline || 'N/A'}
     
     return 'AI moderation unavavailable for this campaign. Please review manually.';
   }
+}
+
+// UE-223 — Create a Campaign wizard, Step 6 "The story, in summary" cards. Three
+// independent prompts (Chloe, 20 Aug sprint call) drafted from the creator's own copy;
+// the creator's edit always wins over a re-generate (never called automatically). Prompt
+// text lives in Firestore (ai_prompts/{doc}.campaign_summary.*, editable via
+// GET/PUT /ai-prompts/campaign-summary, same pattern as ai_moderation) so it can be tuned
+// without a deploy; these are the defaults the first call seeds if nothing is set yet.
+const DEFAULT_CAMPAIGN_SUMMARY_PROMPTS = {
+  what_this_is_about:
+    "Summarize this campaign in 2-3 plain sentences for someone skimming a feed. State the concrete problem or event, who's involved, and what the campaign is asking people to do. Use only facts from the text below; no adjectives about importance, no speculation. Write in third person, present tense.\n\n{{REFERENCE_TEXT}}",
+  who_its_for:
+    "In 1-2 sentences, describe the specific audience this campaign is meant to reach and their situation or identity, not demographics like age/income unless stated. Base it only on the target audience text below; do not invent a broader audience.\n\n{{REFERENCE_TEXT}}",
+  why_it_matters_to_you:
+    'In 2-3 sentences, explain why a backer should care, grounded in the stakes described below (who\'s affected, what changes if this gets attention). Do not use the forbidden compliance words (verified, certified, guaranteed, truth-checked, fact-certified, endorsed); use "reviewed" or "evaluated" instead if referencing review status. No hype language, no exclamation points.\n\n{{REFERENCE_TEXT}}',
+};
+
+type CampaignSummaryInput = {
+  title?: string;
+  category?: string;
+  short_description?: string;
+  long_description?: string;
+  target_audience?: string;
+  why_it_matters?: string;
+  why_backers_should_care?: string;
+};
+
+type CampaignSummaryResult = {
+  what_this_is_about: string;
+  who_its_for: string;
+  why_it_matters_to_you: string;
+};
+
+async function generateCampaignSummary(input: CampaignSummaryInput): Promise<CampaignSummaryResult> {
+  const promptDoc = await db.collection('ai_prompts').doc(AI_PROMPTS_DOC_ID).get();
+  const stored = (promptDoc.exists ? promptDoc.data()?.campaign_summary : null) as
+    | Partial<typeof DEFAULT_CAMPAIGN_SUMMARY_PROMPTS>
+    | null
+    | undefined;
+  const prompts = { ...DEFAULT_CAMPAIGN_SUMMARY_PROMPTS, ...(stored ?? {}) };
+
+  const referenceText = {
+    what_this_is_about: [
+      `Campaign title: ${input.title || 'N/A'}`,
+      `Category: ${input.category || 'N/A'}`,
+      `Short description: ${input.short_description || 'N/A'}`,
+      `Full campaign description: ${stripHtmlForWordScan(input.long_description) || 'N/A'}`,
+    ].join('\n'),
+    who_its_for: [
+      `Target audience: ${input.target_audience || 'N/A'}`,
+      `Why would it matter to them: ${input.why_it_matters || 'N/A'}`,
+    ].join('\n'),
+    why_it_matters_to_you: `Why should backers care: ${stripHtmlForWordScan(input.why_backers_should_care) || 'N/A'}`,
+  };
+
+  const modelName = process.env.GEMINI_MODEL_CAMPAIGN_SUMMARY || 'gemini-2.5-flash-lite';
+  const model = vertexAI.getGenerativeModel({ model: modelName });
+
+  const runOne = (cardKey: keyof CampaignSummaryResult) =>
+    traceGeminiCall({
+      name: `campaign-summary-${cardKey}`,
+      model: modelName,
+      tags: ['campaign-summary'],
+      metadata: { title: metaStr(input.title, 120), card: cardKey },
+      input: { prompt: prompts[cardKey].replace('{{REFERENCE_TEXT}}', referenceText[cardKey]) },
+      run: async () => {
+        const result = await model.generateContent({
+          contents: [{
+            role: 'user',
+            parts: [{ text: prompts[cardKey].replace('{{REFERENCE_TEXT}}', referenceText[cardKey]) }],
+          }],
+        });
+        const text = (result.response.candidates?.[0]?.content?.parts?.[0]?.text || '').trim();
+        return { result: text, output: text, usageDetails: extractVertexUsage(result) };
+      },
+    });
+
+  const [what_this_is_about, who_its_for, why_it_matters_to_you] = await Promise.all([
+    runOne('what_this_is_about'),
+    runOne('who_its_for'),
+    runOne('why_it_matters_to_you'),
+  ]);
+
+  return { what_this_is_about, who_its_for, why_it_matters_to_you };
 }
 
 // Bias wheel: evidence, facts, perspective, tone (1-5), direction (categorical)
@@ -503,7 +827,8 @@ const VALID_DIRECTIONS = ['none', 'left-leaning', 'centrist', 'right-leaning', '
 async function analyzeBiasWheel(
   title: string,
   shortDescription: string,
-  longDescription: string
+  longDescription: string,
+  campaignId?: string
 ): Promise<BiasWheel> {
   try {
     const content = [title, shortDescription, longDescription].filter(Boolean).join('\n\n');
@@ -559,37 +884,68 @@ ${content}
 `;
     const prompt = campaignContent + promptTemplate;
 
-    const model = vertexAI.getGenerativeModel({
-      model: process.env.GEMINI_MODEL_BIAS_WHEEL || 'gemini-2.5-flash-lite',
+    const modelName = process.env.GEMINI_MODEL_BIAS_WHEEL || 'gemini-2.5-flash-lite';
+    const model = vertexAI.getGenerativeModel({ model: modelName });
+
+    return await traceGeminiCall({
+      name: 'score-bias-wheel',
+      model: modelName,
+      tags: ['bias-wheel'],
+      metadata: {
+        contentChars: String(content.trim().length),
+        title: metaStr(title, 120),
+        ...(campaignId ? { campaignId: metaStr(campaignId) } : {}),
+      },
+      input: {
+        title: title || null,
+        shortDescriptionChars: shortDescription?.length || 0,
+        longDescriptionChars: longDescription?.length || 0,
+        prompt: prompt.length > 8000 ? `${prompt.slice(0, 8000)}…` : prompt,
+      },
+      run: async () => {
+        const result = await model.generateContent({
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        });
+
+        const text = result.response?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
+        const jsonMatch = text.match(/\{[\s\S]*\}/);
+        if (!jsonMatch) {
+          console.warn('Bias wheel: no JSON in AI response, text:', text?.substring(0, 200));
+          return {
+            result: DEFAULT_BIAS_WHEEL,
+            output: { parseError: 'no-json', raw: text.slice(0, 500) },
+            usageDetails: extractVertexUsage(result),
+          };
+        }
+
+        let parsed: Record<string, unknown>;
+        try {
+          parsed = JSON.parse(jsonMatch[0]) as Record<string, unknown>;
+        } catch (parseErr) {
+          console.warn('Bias wheel: JSON parse failed:', parseErr, 'raw:', jsonMatch[0]);
+          return {
+            result: DEFAULT_BIAS_WHEEL,
+            output: { parseError: 'invalid-json', raw: jsonMatch[0].slice(0, 500) },
+            usageDetails: extractVertexUsage(result),
+          };
+        }
+        const evidence = Math.min(5, Math.max(1, Number(parsed.evidence) || 1));
+        const facts = Math.min(5, Math.max(1, Number(parsed.facts) || 1));
+        const perspective = Math.min(5, Math.max(1, Number(parsed.perspective) || 1));
+        const tone = Math.min(5, Math.max(1, Number(parsed.tone) || 1));
+        const direction =
+          typeof parsed.direction === 'string' && VALID_DIRECTIONS.includes(parsed.direction.toLowerCase())
+            ? parsed.direction.toLowerCase()
+            : 'none';
+
+        const biasWheel: BiasWheel = { evidence, facts, perspective, tone, direction };
+        return {
+          result: biasWheel,
+          output: biasWheel,
+          usageDetails: extractVertexUsage(result),
+        };
+      },
     });
-
-    const result = await model.generateContent({
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    });
-
-    const text = result.response?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
-      console.warn('Bias wheel: no JSON in AI response, text:', text?.substring(0, 200));
-      return DEFAULT_BIAS_WHEEL;
-    }
-
-    let parsed: Record<string, unknown>;
-    try {
-      parsed = JSON.parse(jsonMatch[0]) as Record<string, unknown>;
-    } catch (parseErr) {
-      console.warn('Bias wheel: JSON parse failed:', parseErr, 'raw:', jsonMatch[0]);
-      return DEFAULT_BIAS_WHEEL;
-    }
-    const evidence = Math.min(5, Math.max(1, Number(parsed.evidence) || 1));
-    const facts = Math.min(5, Math.max(1, Number(parsed.facts) || 1));
-    const perspective = Math.min(5, Math.max(1, Number(parsed.perspective) || 1));
-    const tone = Math.min(5, Math.max(1, Number(parsed.tone) || 1));
-    const direction = typeof parsed.direction === 'string' && VALID_DIRECTIONS.includes(parsed.direction.toLowerCase())
-      ? parsed.direction.toLowerCase()
-      : 'none';
-
-    return { evidence, facts, perspective, tone, direction };
   } catch (error) {
     console.error('Bias wheel analysis error:', error);
     return DEFAULT_BIAS_WHEEL;
@@ -601,8 +957,8 @@ async function analyzeBiasWheelAndUpdate(campaignId: string, data: Record<string
     const title = (data.title as string) || '';
     const shortDescription = (data.short_description as string) || '';
     const longDescription = (data.long_description as string) || '';
-    console.log('Bias wheel input:', { titleLen: title.length, shortLen: shortDescription.length, longLen: longDescription.length });
-    const biasWheel = await analyzeBiasWheel(title, shortDescription, longDescription);
+    console.log('Bias wheel input:', { titleLen: title.length, shortLen: shortDescription.length, longLen: longDescription.length, campaignId });
+    const biasWheel = await analyzeBiasWheel(title, shortDescription, longDescription, campaignId);
     await db.collection('campaigns').doc(campaignId).update({
       bias_wheel: biasWheel,
       updatedAt: new Date().toISOString(),
@@ -705,6 +1061,32 @@ app.get('/config/analytics', (_req: Request, res: Response) => {
   });
 });
 
+/**
+ * UE-188: share-ref attribution window (default 7 days).
+ * Client persists `ref` for this many days and the server uses the same window
+ * when attributing completed backs to a share link.
+ */
+app.get('/config/attribution', (_req: Request, res: Response) => {
+  const windowDays = getShareAttributionWindowDays();
+  res.json({
+    windowDays,
+    windowMs: windowDays * 24 * 60 * 60 * 1000,
+    docs:
+      'Share refs (?ref=) persist first-touch for windowDays. Completed backs carrying share_ref within the window attribute to the sharer (link visits, backs driven, reach driven).',
+  });
+});
+
+/** Public poll UI config (Story triggers + funding popup rate). */
+app.get('/config/polls', async (_req: Request, res: Response) => {
+  try {
+    const cfg = mergePollConfig(await loadPollConfig(db));
+    res.json(cfg);
+  } catch (error) {
+    console.error('Error loading poll config:', error);
+    res.status(500).json({ error: 'Failed to load poll config' });
+  }
+});
+
 // API Key validation - required for all routes below (except /images/ for img src, /og/ for share previews)
 // Use header `x-api-key` only so `Authorization: Bearer <Firebase ID token>` can be used for users/campaigns.
 const validateApiKey = (req: Request, res: Response, next: NextFunction) => {
@@ -722,6 +1104,14 @@ const validateApiKey = (req: Request, res: Response, next: NextFunction) => {
   }
   // Public shareable personal impact cards (no API key for recipients)
   if (req.path.startsWith('/public/impact/')) {
+    return next();
+  }
+  // UE-188: public share-link visit beacon (ref persistence path)
+  if (req.path.startsWith('/public/share-links/') && req.method === 'POST') {
+    return next();
+  }
+  // Attribution config is public (window days for client persistence)
+  if (req.path === '/config/attribution') {
     return next();
   }
 
@@ -1368,9 +1758,12 @@ app.get('/users/me/impact', async (req: Request, res: Response) => {
       rangeId,
     });
 
+    const shareStats = await loadShareStatsForUser(db, uid);
+
     res.json({
       rangeId,
       impact,
+      shareStats,
     });
   } catch (error) {
     console.error('GET /users/me/impact:', error);
@@ -1407,6 +1800,7 @@ app.get('/users/me/impact/:campaignId', async (req: Request, res: Response) => {
         rangeId,
         campaign: publicCampaignSummary(campaign),
         impact: null,
+        shareStats: await loadShareStatsForUser(db, uid, campaignId),
         similarCampaigns: [],
         hasContributions: false,
       });
@@ -1441,6 +1835,7 @@ app.get('/users/me/impact/:campaignId', async (req: Request, res: Response) => {
       rangeId,
       campaign: publicCampaignSummary(campaign),
       impact,
+      shareStats: await loadShareStatsForUser(db, uid, campaignId),
       similarCampaigns: similarCampaigns.map(publicCampaignSummary),
       hasContributions: true,
     });
@@ -1619,11 +2014,37 @@ app.post('/users/me/share-cards', async (req: Request, res: Response) => {
       thumbnailUrl,
     });
 
+    // UE-188: attach a per-user share ref so impact-card links attribute visits/backs
+    let shareRef: string | null = null;
+    try {
+      const { link } = await createOrGetShareLink(
+        db,
+        {
+          campaignId: campaignId || null,
+          surface: 'impact_card',
+          scope,
+          shareCardToken: token,
+          sharerUid: uid,
+        },
+        getPostHog()
+      );
+      shareRef = link.ref;
+    } catch (e) {
+      console.warn('[share] impact-card share link create failed:', e instanceof Error ? e.message : e);
+    }
+
     const frontendBase = (process.env.FRONTEND_PUBLIC_URL || 'https://unravel.network').replace(/\/$/, '');
+    const pageUrl = shareRef
+      ? `${frontendBase}/impact/share/${token}?ref=${encodeURIComponent(shareRef)}`
+      : `${frontendBase}/impact/share/${token}`;
+    const ogUrl = shareRef
+      ? `${API_PUBLIC_BASE}/og/impact/${token}?ref=${encodeURIComponent(shareRef)}`
+      : `${API_PUBLIC_BASE}/og/impact/${token}`;
     res.status(201).json({
       token,
-      url: `${frontendBase}/impact/share/${token}`,
-      ogUrl: `${API_PUBLIC_BASE}/og/impact/${token}`,
+      ref: shareRef,
+      url: pageUrl,
+      ogUrl,
       cardImageUrl: doc.cardImageUrl,
       scope,
       displayName,
@@ -1716,6 +2137,112 @@ app.delete('/users/me/share-cards/:token', async (req: Request, res: Response) =
   } catch (error) {
     console.error('DELETE /users/me/share-cards/:token:', error);
     res.status(500).json({ error: 'Failed to revoke share card' });
+  }
+});
+
+/**
+ * UE-188: create (or reuse) a per-user share ref link.
+ * Auth optional — guests pass posthogDistinctId so the visitor path still works.
+ */
+app.post('/share-links', async (req: Request, res: Response) => {
+  try {
+    const surfaceRaw = req.body?.surface;
+    if (!isShareSurface(surfaceRaw)) {
+      return res.status(400).json({
+        error: 'surface must be campaign | interstitial | lander | impact_card',
+      });
+    }
+    const campaignId =
+      typeof req.body?.campaignId === 'string' && req.body.campaignId.trim()
+        ? req.body.campaignId.trim()
+        : null;
+    if ((surfaceRaw === 'campaign' || surfaceRaw === 'interstitial' || surfaceRaw === 'lander') && !campaignId) {
+      return res.status(400).json({ error: 'campaignId is required for this surface' });
+    }
+
+    const sharerUid =
+      typeof req.firebaseUid === 'string' && req.firebaseUid.trim() ? req.firebaseUid.trim() : null;
+    const guestDistinctId =
+      typeof req.body?.posthogDistinctId === 'string' && req.body.posthogDistinctId.trim()
+        ? req.body.posthogDistinctId.trim()
+        : null;
+    if (!sharerUid && !guestDistinctId) {
+      return res.status(400).json({ error: 'Sign in or provide posthogDistinctId for guest shares' });
+    }
+
+    const { link, created } = await createOrGetShareLink(
+      db,
+      {
+        campaignId,
+        surface: surfaceRaw,
+        scope: req.body?.scope === 'campaign' ? 'campaign' : req.body?.scope === 'cumulative' ? 'cumulative' : undefined,
+        shareCardToken:
+          typeof req.body?.shareCardToken === 'string' ? req.body.shareCardToken.trim() : null,
+        sharerUid,
+        guestDistinctId,
+      },
+      getPostHog()
+    );
+
+    const frontendBase = (process.env.FRONTEND_PUBLIC_URL || 'https://unravel.network').replace(/\/$/, '');
+    const path = campaignId ? `/campaign/${encodeURIComponent(campaignId)}` : '/campaign-feed';
+    const url = `${frontendBase}${path}?ref=${encodeURIComponent(link.ref)}`;
+
+    try {
+      await getPostHog()?.flush();
+    } catch {
+      /* non-fatal */
+    }
+
+    res.status(created ? 201 : 200).json({
+      ref: link.ref,
+      url,
+      campaignId: link.campaignId,
+      surface: link.surface,
+      created,
+      attributionWindowDays: getShareAttributionWindowDays(),
+    });
+  } catch (error) {
+    console.error('POST /share-links:', error);
+    res.status(500).json({ error: 'Failed to create share link' });
+  }
+});
+
+/** UE-188: record a non-crawler visit to a share ref (public beacon). */
+app.post('/public/share-links/:ref/visit', async (req: Request, res: Response) => {
+  try {
+    const ref = sanitizeShareRef(req.params.ref);
+    if (!ref) return res.status(400).json({ error: 'Invalid ref' });
+
+    const ua = String(req.get('user-agent') || '');
+    const isCrawler = isSharePreviewCrawler(ua);
+    const visitorDistinctId =
+      typeof req.body?.posthogDistinctId === 'string' && req.body.posthogDistinctId.trim()
+        ? req.body.posthogDistinctId.trim()
+        : null;
+    const visitorUid =
+      typeof req.firebaseUid === 'string' && req.firebaseUid.trim()
+        ? req.firebaseUid.trim()
+        : typeof req.body?.firebaseUid === 'string' && req.body.firebaseUid.trim()
+          ? req.body.firebaseUid.trim()
+          : null;
+
+    const result = await recordShareLinkVisit(
+      db,
+      { ref, visitorDistinctId, visitorUid, isCrawler },
+      getPostHog()
+    );
+
+    try {
+      await getPostHog()?.flush();
+    } catch {
+      /* non-fatal */
+    }
+
+    res.json({ ok: result.ok, campaignId: result.campaignId });
+  } catch (error) {
+    console.error('POST /public/share-links/:ref/visit:', error);
+    res.status(500).json({ error: 'Failed to record visit' });
   }
 });
 
@@ -1981,39 +2508,51 @@ async function enrichCampaignCreators(
 
     const uid = String(data.created_by ?? data.created_by_uid ?? '').trim();
     const user = uid ? byUid.get(uid) : undefined;
-    if (user) {
-      const fields = creatorFieldsFromUserProfile(user);
-      // Prefer live username for public display when available.
+    const fields = creatorFieldsFromUserProfile(user);
+
+    // Display precedence (UE-104 / UE-204):
+    //   1. name an admin explicitly set on the campaign (flagged on write),
+    //   2. the creator's LIVE profile (username, else current first/last name),
+    //   3. the submission-time snapshot only when the profile doc is gone.
+    // `admin_creator_name` is response-only so admin editors can show/edit the
+    // override itself instead of the derived display value.
+    const overrideName =
+      data.creator_name_admin_override === true
+        ? String(data.creator_name ?? data.creator ?? '').trim()
+        : '';
+    data.admin_creator_name = overrideName;
+
+    if (overrideName) {
+      data.creator = overrideName;
+      data.creator_name = overrideName;
+      // The UI prefers creator_username, so it must not outrank the override.
+      delete data.creator_username;
+    } else if (user) {
       if (fields.creator_username) {
         data.creator_username = fields.creator_username;
         data.creator = fields.creator_username;
         data.creator_name = fields.creator_username;
-      } else if (!campaignHasCreatorDisplay(data)) {
-        Object.assign(data, fields);
-      }
-      if (!data.creator_first_name && fields.creator_first_name) {
-        data.creator_first_name = fields.creator_first_name;
-      }
-      if (!data.creator_last_name && fields.creator_last_name) {
-        data.creator_last_name = fields.creator_last_name;
-      }
-      if (!data.creator_email && fields.creator_email) {
-        data.creator_email = fields.creator_email;
-      }
-      if (fields.creator_avatar_url) {
-        data.creator_avatar_url = fields.creator_avatar_url;
       } else {
-        delete data.creator_avatar_url;
+        // The profile has no username (anymore) - a stored one must not win.
+        delete data.creator_username;
+        if (fields.creator_name) {
+          data.creator = fields.creator_name;
+          data.creator_name = fields.creator_name;
+        } else if (!campaignHasCreatorDisplay(data)) {
+          Object.assign(data, fields);
+        }
       }
-    } else {
-      delete data.creator_avatar_url;
+      if (fields.creator_first_name) data.creator_first_name = fields.creator_first_name;
+      if (fields.creator_last_name) data.creator_last_name = fields.creator_last_name;
     }
 
-    // Prefer stored username over a name-only snapshot when both exist.
-    const storedUsername = String(data.creator_username ?? '').trim();
-    if (storedUsername) {
-      data.creator = storedUsername;
-      data.creator_name = storedUsername;
+    if (!data.creator_email && fields.creator_email) {
+      data.creator_email = fields.creator_email;
+    }
+    if (fields.creator_avatar_url) {
+      data.creator_avatar_url = fields.creator_avatar_url;
+    } else {
+      delete data.creator_avatar_url;
     }
 
     return enrichCampaignResponse(data);
@@ -2239,6 +2778,25 @@ app.put('/data/campaigns/:id/trust-report', async (req: Request, res: Response) 
       return res.status(404).json({ error: 'Campaign not found' });
     }
     const body = (req.body || {}) as Record<string, unknown>;
+    if (body.publish === true && !isUutsPublishLiveEnabled()) {
+      return res.status(403).json({
+        error: 'UUTS live publish is disabled',
+        publishLiveEnabled: false,
+        hint: 'Set UUTS_PUBLISH_LIVE_ENABLED=true to connect publish to the live pipeline',
+      });
+    }
+    if (body.publish === true) {
+      const latest = await getLatestTrustReportReview(db, campaignId);
+      const incomingDecision =
+        body.review && typeof body.review === 'object'
+          ? (body.review as Record<string, unknown>).decision
+          : latest?.review?.decision;
+      if (!isAcceptedDecision(incomingDecision)) {
+        return res.status(409).json({
+          error: 'Trust report can only be published after an Accepted review decision',
+        });
+      }
+    }
     const result = await upsertTrustReport(db, campaignId, {
       initial: body.initial,
       final: body.final,
@@ -2261,6 +2819,79 @@ app.put('/data/campaigns/:id/trust-report', async (req: Request, res: Response) 
     }
     console.error('PUT /data/campaigns/:id/trust-report:', error);
     res.status(500).json({ error: 'Failed to upsert trust report' });
+  }
+});
+
+/**
+ * PUT human review: per-component scores + AI/human acknowledgements + reviewer + decision.
+ * An Accepted decision publishes the trust report.
+ * Body: { layerScores?, final?, review: { layers, assignedReviewer, decision, ... } }
+ */
+app.put('/data/campaigns/:id/trust-report/review', async (req: Request, res: Response) => {
+  try {
+    const campaignId = String(req.params.id || '').trim();
+    if (!campaignId) {
+      return res.status(400).json({ error: 'Campaign id is required' });
+    }
+    const campaignRef = db.collection('campaigns').doc(campaignId);
+    const campaignSnap = await campaignRef.get();
+    if (!campaignSnap.exists) {
+      return res.status(404).json({ error: 'Campaign not found' });
+    }
+    const campaign: Record<string, unknown> = {
+      id: campaignSnap.id,
+      ...(campaignSnap.data() as Record<string, unknown>),
+    };
+    const body = (req.body || {}) as Record<string, unknown>;
+    const layerScoresRaw = body.layerScores;
+    const layerScores =
+      layerScoresRaw && typeof layerScoresRaw === 'object'
+        ? (layerScoresRaw as { factCheck?: number | null; commsIntegrity?: number | null; sharedReality?: number | null })
+        : undefined;
+
+    const saved = await saveTrustReportReview(db, campaignId, {
+      layerScores,
+      final: body.final,
+      review: body.review,
+      createdBy:
+        body.createdBy != null ? String(body.createdBy) : req.firebaseEmail || req.firebaseUid || null,
+    });
+
+    let published: { versionId: string; version: number } | null = null;
+    if (isAcceptedDecision(saved.review.decision)) {
+      try {
+        published = await publishTrustReport(db, campaignId, saved.versionId);
+      } catch (publishErr: any) {
+        const status = typeof publishErr?.status === 'number' ? publishErr.status : 500;
+        if (status >= 400 && status < 500) {
+          return res.status(status).json({ error: publishErr.message || 'Could not publish trust report' });
+        }
+        throw publishErr;
+      }
+    }
+
+    const report = await getTrustReportVersion(db, campaignId, campaign, saved.versionId);
+    const effectiveComposite = report?.composite ?? saved.final.composite ?? null;
+    await campaignRef.set(campaignReviewDenorm(saved.review, { trustScore: effectiveComposite }), {
+      merge: true,
+    });
+
+    res.json({
+      message: isAcceptedDecision(saved.review.decision)
+        ? 'Review saved. Accepted — trust report published.'
+        : 'Review saved',
+      ...saved,
+      published,
+      publishEligible: isAcceptedDecision(saved.review.decision),
+      report,
+    });
+  } catch (error: any) {
+    const status = typeof error?.status === 'number' ? error.status : 500;
+    if (status >= 400 && status < 500) {
+      return res.status(status).json({ error: error.message || 'Bad request' });
+    }
+    console.error('PUT /data/campaigns/:id/trust-report/review:', error);
+    res.status(500).json({ error: 'Failed to save trust report review' });
   }
 });
 
@@ -2288,7 +2919,13 @@ app.post('/data/campaigns/:id/trust-report/refresh', async (req: Request, res: R
         assignedReviewer: null,
         decision: 'pending',
         reviewedAt: null,
+        decidedAt: null,
         reviewer: null,
+        layers: {
+          factCheck: { aiReviewed: true, humanReviewed: false },
+          commsIntegrity: { aiReviewed: true, humanReviewed: false },
+          sharedReality: { aiReviewed: true, humanReviewed: false },
+        },
       },
       createdBy: body.createdBy != null ? String(body.createdBy) : req.firebaseEmail || req.firebaseUid || null,
       refresh: true,
@@ -2315,6 +2952,9 @@ app.post('/data/campaigns/:id/trust-report/refresh', async (req: Request, res: R
  * POST enqueue a new async UUTS pre-screen run for an existing campaign.
  * Always allowed (manual Admin test path). Auto-run on submit remains gated by
  * UUTS_PRESCREEN_ENABLED — this endpoint does not require that flag.
+ * Body (optional): { model?: string, externalResearch?: boolean }
+ *   - externalResearch: when true, fetch Sources-box URLs only and score Fact-Check
+ *     against that pack (no open-web search; description-only citations are ignored).
  */
 app.post('/data/campaigns/:id/uuts-prescreen/refresh', async (req: Request, res: Response) => {
   try {
@@ -2322,6 +2962,15 @@ app.post('/data/campaigns/:id/uuts-prescreen/refresh', async (req: Request, res:
     if (!campaignId) {
       return res.status(400).json({ error: 'Campaign id is required' });
     }
+    const body = (req.body || {}) as Record<string, unknown>;
+    let modelOption;
+    try {
+      modelOption = resolveUutsModel(body.model != null ? String(body.model) : null);
+    } catch (err: any) {
+      const status = typeof err?.status === 'number' ? err.status : 400;
+      return res.status(status).json({ error: err.message || 'Invalid model' });
+    }
+    const externalResearch = parseExternalResearchFlag(body.externalResearch);
     const campaignRef = db.collection('campaigns').doc(campaignId);
     const campaignSnap = await campaignRef.get();
     if (!campaignSnap.exists) {
@@ -2333,6 +2982,9 @@ app.post('/data/campaigns/:id/uuts-prescreen/refresh', async (req: Request, res:
       uuts_prescreen_status: 'queued',
       uuts_prescreen_attempts: 0,
       uuts_prescreen_error: null,
+      uuts_prescreen_model: modelOption.id,
+      uuts_prescreen_provider: modelOption.provider,
+      uuts_prescreen_external_research: externalResearch,
       uuts_prescreen_updated_at: queuedAt,
       updatedAt: queuedAt,
     });
@@ -2343,6 +2995,8 @@ app.post('/data/campaigns/:id/uuts-prescreen/refresh', async (req: Request, res:
       campaignId,
       campaign,
       promptDocId: AI_PROMPTS_DOC_ID,
+      model: modelOption.id,
+      externalResearch,
     }).catch((err) =>
       console.error('UUTS pre-screen refresh background task error:', err)
     );
@@ -2351,6 +3005,9 @@ app.post('/data/campaigns/:id/uuts-prescreen/refresh', async (req: Request, res:
       message: 'UUTS pre-screen refresh queued',
       campaignId,
       uuts_prescreen_status: 'queued',
+      model: modelOption.id,
+      provider: modelOption.provider,
+      externalResearch,
       source: 'manual',
     });
   } catch (error) {
@@ -2359,9 +3016,91 @@ app.post('/data/campaigns/:id/uuts-prescreen/refresh', async (req: Request, res:
   }
 });
 
-/** POST publish latest draft (or body.versionId). Archives previous published version. */
+/**
+ * GET UUTS admin config: available models + feature flags (publish live, scheduler).
+ */
+app.get('/uuts-prescreen/config', async (_req: Request, res: Response) => {
+  try {
+    res.json(getUutsConfig());
+  } catch (error) {
+    console.error('GET /uuts-prescreen/config:', error);
+    res.status(500).json({ error: 'Failed to load UUTS config' });
+  }
+});
+
+/**
+ * POST batch UUTS re-score (Cloud Scheduler). Creates draft versions only.
+ * Gated by UUTS_SCHEDULER_ENABLED (default off).
+ * Body/query: dryRun, limit, campaignId(s), model, externalResearch.
+ */
+app.post('/uuts-prescreen/run', async (req: Request, res: Response) => {
+  try {
+    if (!isUutsSchedulerEnabled()) {
+      return res.status(503).json({
+        error: 'UUTS scheduler is disabled',
+        schedulerEnabled: false,
+        hint: 'Set UUTS_SCHEDULER_ENABLED=true to enable',
+      });
+    }
+    const body = (req.body || {}) as Record<string, unknown>;
+    const query = req.query as Record<string, unknown>;
+    const dryRun =
+      body.dryRun === true ||
+      query.dryRun === 'true' ||
+      query.dryRun === '1';
+    const limitRaw = body.limit ?? query.limit;
+    const limit = Math.max(1, Math.min(Number(limitRaw) || 20, 100));
+    const campaignIdsRaw = body.campaignIds ?? body.campaignId ?? query.campaignIds ?? query.campaignId;
+    const campaignIds = Array.isArray(campaignIdsRaw)
+      ? campaignIdsRaw.map((id) => String(id).trim()).filter(Boolean)
+      : typeof campaignIdsRaw === 'string' && campaignIdsRaw.trim()
+        ? campaignIdsRaw.split(',').map((s) => s.trim()).filter(Boolean)
+        : [];
+    const model =
+      body.model != null
+        ? String(body.model)
+        : typeof query.model === 'string'
+          ? query.model
+          : null;
+    const externalResearch = parseExternalResearchFlag(
+      body.externalResearch ?? query.externalResearch
+    );
+
+    const result = await runUutsPrescreenScheduler({
+      db,
+      vertexAI,
+      dryRun,
+      limit,
+      campaignIds,
+      model,
+      externalResearch,
+      promptDocId: AI_PROMPTS_DOC_ID,
+    });
+    res.json(result);
+  } catch (error: any) {
+    const status = typeof error?.status === 'number' ? error.status : 500;
+    if (status >= 400 && status < 500) {
+      return res.status(status).json({ error: error.message || 'Bad request' });
+    }
+    console.error('POST /uuts-prescreen/run:', error);
+    res.status(500).json({ error: 'Failed to run UUTS scheduler' });
+  }
+});
+
+/**
+ * POST publish latest draft (or body.versionId). Archives previous published version.
+ * Gated by UUTS_PUBLISH_LIVE_ENABLED (default off) so republish does not hit the live
+ * public trust-report pipeline until explicitly enabled.
+ */
 app.post('/data/campaigns/:id/trust-report/publish', async (req: Request, res: Response) => {
   try {
+    if (!isUutsPublishLiveEnabled()) {
+      return res.status(403).json({
+        error: 'UUTS live publish is disabled',
+        publishLiveEnabled: false,
+        hint: 'Set UUTS_PUBLISH_LIVE_ENABLED=true to connect republish to the live pipeline',
+      });
+    }
     const campaignId = String(req.params.id || '').trim();
     if (!campaignId) {
       return res.status(400).json({ error: 'Campaign id is required' });
@@ -2373,8 +3112,31 @@ app.post('/data/campaigns/:id/trust-report/publish', async (req: Request, res: R
     const body = (req.body || {}) as Record<string, unknown>;
     const versionId = body.versionId != null ? String(body.versionId) : null;
     const result = await publishTrustReport(db, campaignId, versionId);
-    const campaign = { id: campaignSnap.id, ...(campaignSnap.data() as Record<string, unknown>) };
+    const campaign: Record<string, unknown> = {
+      id: campaignSnap.id,
+      ...(campaignSnap.data() as Record<string, unknown>),
+    };
     const report = await getPublishedTrustReport(db, campaignId, campaign);
+
+    // Queue for human annotation when AI initial vs human final diverge materially.
+    try {
+      const initialComposite = report?.initial?.composite ?? null;
+      const finalComposite = report?.final?.composite ?? null;
+      const { compositeDelta, enqueueUutsDisagreement } = await import('./uutsLangfuseEval');
+      const delta = compositeDelta(initialComposite, finalComposite);
+      const traceRaw = campaign.uuts_prescreen_langfuse_trace_id;
+      const traceId = typeof traceRaw === 'string' ? traceRaw : null;
+      if (delta != null && traceId) {
+        await enqueueUutsDisagreement({
+          traceId,
+          delta,
+          reason: `publish AI vs human Δ=${delta} campaign=${campaignId}`,
+        });
+      }
+    } catch (enqueueErr) {
+      console.warn('UUTS annotation enqueue after publish failed:', enqueueErr);
+    }
+
     res.json({
       message: 'Trust report published',
       ...result,
@@ -2449,6 +3211,9 @@ app.get('/data/:collection/:id', async (req: Request, res: Response) => {
       out.facebook_frequency = data.facebook_frequency ?? null;
       out.facebook_spend = data.facebook_spend ?? null;
       out.facebook_insights_updated_at = data.facebook_insights_updated_at ?? null;
+      out.facebook_audience_size_lower_bound = data.facebook_audience_size_lower_bound ?? null;
+      out.facebook_audience_size_upper_bound = data.facebook_audience_size_upper_bound ?? null;
+      out.facebook_audience_size_updated_at = data.facebook_audience_size_updated_at ?? null;
     }
 
     const response =
@@ -2460,6 +3225,397 @@ app.get('/data/:collection/:id', async (req: Request, res: Response) => {
   } catch (error) {
     console.error('Error fetching document:', error);
     res.status(500).json({ error: 'Failed to fetch document' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// UE-186 — Social proof: backer count + recent backer activity
+// ---------------------------------------------------------------------------
+
+/**
+ * Display thresholds, editable WITHOUT a deploy via Firestore: settings/engagement
+ * (unravel DB, same singleton-doc pattern as passkey / ai_prompts). A missing doc
+ * or field falls back to these defaults.
+ */
+const SOCIAL_PROOF_DEFAULTS = {
+  // Tim: show social proof once a campaign has 3+ backers (was 5).
+  social_proof_min_backers: 3,
+  social_proof_activity_max_hours: 72,
+};
+
+async function getEngagementSettings(): Promise<typeof SOCIAL_PROOF_DEFAULTS> {
+  try {
+    const doc = await db.collection('settings').doc('engagement').get();
+    if (!doc.exists) return { ...SOCIAL_PROOF_DEFAULTS };
+    const data = doc.data() as Record<string, unknown>;
+    const minBackers = Number(data.social_proof_min_backers);
+    const maxHours = Number(data.social_proof_activity_max_hours);
+    return {
+      social_proof_min_backers:
+        Number.isFinite(minBackers) && minBackers >= 0
+          ? minBackers
+          : SOCIAL_PROOF_DEFAULTS.social_proof_min_backers,
+      social_proof_activity_max_hours:
+        Number.isFinite(maxHours) && maxHours > 0
+          ? maxHours
+          : SOCIAL_PROOF_DEFAULTS.social_proof_activity_max_hours,
+    };
+  } catch {
+    return { ...SOCIAL_PROOF_DEFAULTS };
+  }
+}
+
+// GET anonymized social proof for a campaign (public; UE-186).
+// Privacy is enforced HERE, server-side: below the min-backer threshold nothing
+// leaves the API; emails and last names never leave it at all; first names only
+// with an explicit opt-in (show_name on the backing record, captured at checkout);
+// timestamps are coarsened to whole hours (no exact times).
+app.get('/data/campaigns/:id/backers', async (req: Request, res: Response) => {
+  try {
+    const campaignId = String(req.params.id || '').trim();
+    if (!campaignId) return res.status(400).json({ error: 'Campaign id is required' });
+
+    const settings = await getEngagementSettings();
+    const snapshot = await db
+      .collection('stripe_checkout_records')
+      .where('campaignId', '==', campaignId)
+      .get();
+
+    // One entry per distinct backer (uid, else email, else the record itself for
+    // fully anonymous guests) — a repeat backer counts once, keeping their most
+    // recent backing. Real records only; there is no simulated activity, ever.
+    type BackerAgg = {
+      donorUid?: string;
+      donorName?: string;
+      showName: boolean;
+      lastAt: number;
+      /** Gross contribution in cents (charged + coupon discount) for the latest backing. */
+      amountCents: number;
+    };
+    const byBacker = new Map<string, BackerAgg>();
+    for (const doc of snapshot.docs) {
+      const data = doc.data() as Record<string, unknown>;
+      const at = Date.parse(String(data.recordedAt || ''));
+      if (!Number.isFinite(at)) continue;
+      const donorUid = String(data.donor_uid || '').trim() || undefined;
+      const email = String(data.donor_email || '').trim().toLowerCase();
+      const key = donorUid || (email ? `e:${email}` : `r:${doc.id}`);
+      const donorName = String(data.donor_name || '').trim() || undefined;
+      const amountCents =
+        (Number(data.amount_total) || 0) + (Number(data.amount_discount) || 0);
+      const prev = byBacker.get(key);
+      if (!prev || at > prev.lastAt) {
+        byBacker.set(key, {
+          donorUid: donorUid || prev?.donorUid,
+          donorName: donorName || prev?.donorName,
+          // The opt-in follows the most recent backing, so a backer can change
+          // their mind on a later contribution.
+          showName: data.show_name === true,
+          lastAt: at,
+          amountCents: amountCents > 0 ? amountCents : prev?.amountCents || 0,
+        });
+      }
+    }
+
+    const backerCount = byBacker.size;
+    if (backerCount < settings.social_proof_min_backers) {
+      // Below threshold: hide everything and send nothing else — young campaigns
+      // must not look dead ("1 backer, 5 days ago").
+      return res.json({ visible: false });
+    }
+
+    const now = Date.now();
+    // UE-216 ticker panel needs a slightly longer list than the quiet activity line.
+    const recent = [...byBacker.values()].sort((a, b) => b.lastAt - a.lastAt).slice(0, 12);
+
+    // Resolve first names ONLY for opted-in backers. Stripe-path records carry no
+    // donor_name, so fall back to the user profile for logged-in donors.
+    const recentBackers: { firstName: string | null; hoursAgo: number; amountCents: number }[] =
+      [];
+    for (const b of recent) {
+      let firstName: string | null = null;
+      if (b.showName) {
+        firstName = (b.donorName || '').split(/\s+/)[0] || null;
+        if (!firstName && b.donorUid) {
+          try {
+            const userDoc = await usersDb.collection('users').doc(b.donorUid).get();
+            if (userDoc.exists) {
+              firstName =
+                String((userDoc.data() as Record<string, unknown>)?.firstName || '').trim() || null;
+            }
+          } catch {
+            /* lookup failure → stays anonymous */
+          }
+        }
+      }
+      recentBackers.push({
+        firstName, // null renders as "Someone" / "Anonymous" on the client
+        hoursAgo: Math.max(0, Math.floor((now - b.lastAt) / 3_600_000)),
+        amountCents: Math.max(0, Math.round(b.amountCents || 0)),
+      });
+    }
+
+    const lastAt = recent[0]?.lastAt ?? 0;
+    const showActivity =
+      lastAt > 0 && now - lastAt <= settings.social_proof_activity_max_hours * 3_600_000;
+
+    res.json({ visible: true, backerCount, showActivity, recentBackers });
+  } catch (error) {
+    console.error('Error fetching campaign backers:', error);
+    res.status(500).json({ error: 'Failed to fetch campaign backers' });
+  }
+});
+
+/**
+ * UE-185 (Tim, Aug 3): capture WHY a backer funded, right after they contribute.
+ * Stored against the campaign in `campaign_backer_feedback` so the team can read it.
+ * Optional + length-capped; identity is best-effort (uid/email from the auth token,
+ * session_id from the Stripe backing). Plain text only.
+ */
+const BACKER_FEEDBACK_MAX_CHARS = 500;
+app.post('/data/campaigns/:id/backer-feedback', async (req: Request, res: Response) => {
+  try {
+    const campaignId = String(req.params.id || '').trim();
+    if (!campaignId) return res.status(400).json({ error: 'Campaign id is required' });
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const feedback = String(body.feedback ?? '').trim().slice(0, BACKER_FEEDBACK_MAX_CHARS);
+    if (!feedback) return res.status(400).json({ error: 'Feedback text is required' });
+    const sessionId = String(body.sessionId ?? '').trim() || undefined;
+    await db.collection('campaign_backer_feedback').add({
+      campaignId,
+      feedback,
+      ...(req.firebaseUid ? { donor_uid: req.firebaseUid } : {}),
+      ...(req.firebaseEmail ? { donor_email: req.firebaseEmail } : {}),
+      ...(sessionId ? { session_id: sessionId } : {}),
+      createdAt: new Date().toISOString(),
+    });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error saving backer feedback:', error);
+    res.status(500).json({ error: 'Failed to save backer feedback' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Campaign one-tap polls — perception-shift / content-quality signals
+// ---------------------------------------------------------------------------
+
+/** Upsert one answer per respondent per campaign per question. */
+app.post('/data/campaigns/:id/polls', async (req: Request, res: Response) => {
+  try {
+    const campaignId = String(req.params.id || '').trim();
+    if (!campaignId) return res.status(400).json({ error: 'Campaign id is required' });
+    if (!req.firebaseUid) {
+      return res.status(401).json({ error: 'Sign in required to submit feedback' });
+    }
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const questionId = body.questionId ?? body.question_id;
+    if (!isPollQuestionId(questionId)) {
+      return res.status(400).json({ error: 'Invalid or missing questionId' });
+    }
+    const answer = body.answer;
+    const placement = typeof body.placement === 'string' ? body.placement : undefined;
+    const resolved = resolveRespondent(req.firebaseUid, body.fingerprint ?? body.posthogDistinctId);
+    if (resolved.error || !resolved.respondent || resolved.respondent.type !== 'user') {
+      return res.status(401).json({ error: 'Sign in required to submit feedback' });
+    }
+
+    const result = await upsertPollAnswer(db, {
+      campaignId,
+      questionId,
+      answer: String(answer ?? ''),
+      respondent: resolved.respondent,
+      placement,
+    });
+    if (!result.ok) return res.status(result.status).json({ error: result.error });
+    res.json({
+      ok: true,
+      questionId,
+      answer: result.answer,
+      changed: result.changed,
+      aggregates: result.aggregates,
+    });
+  } catch (error) {
+    console.error('Error saving poll answer:', error);
+    res.status(500).json({ error: 'Failed to save poll answer' });
+  }
+});
+
+/** Dismiss a poll without answering (still counts toward one-shot UI). */
+app.post('/data/campaigns/:id/polls/dismiss', async (req: Request, res: Response) => {
+  try {
+    const campaignId = String(req.params.id || '').trim();
+    if (!campaignId) return res.status(400).json({ error: 'Campaign id is required' });
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const questionId = body.questionId ?? body.question_id;
+    if (!isPollQuestionId(questionId)) {
+      return res.status(400).json({ error: 'Invalid or missing questionId' });
+    }
+    const placement = typeof body.placement === 'string' ? body.placement : undefined;
+    const resolved = resolveRespondent(req.firebaseUid, body.fingerprint ?? body.posthogDistinctId);
+    if (resolved.error || !resolved.respondent) {
+      return res.status(400).json({ error: resolved.error || 'Respondent identity required' });
+    }
+
+    const result = await dismissPoll(db, {
+      campaignId,
+      questionId,
+      respondent: resolved.respondent,
+      placement,
+    });
+    if (!result.ok) return res.status(result.status).json({ error: result.error });
+    res.json({ ok: true, alreadyAnswered: result.alreadyAnswered });
+  } catch (error) {
+    console.error('Error dismissing poll:', error);
+    res.status(500).json({ error: 'Failed to dismiss poll' });
+  }
+});
+
+/** Caller’s answers/dismissals for this campaign. */
+app.get('/data/campaigns/:id/polls/me', async (req: Request, res: Response) => {
+  try {
+    const campaignId = String(req.params.id || '').trim();
+    if (!campaignId) return res.status(400).json({ error: 'Campaign id is required' });
+
+    const fingerprint = req.query.fingerprint ?? req.query.posthogDistinctId;
+    const resolved = resolveRespondent(req.firebaseUid, fingerprint);
+    if (resolved.error || !resolved.respondent) {
+      return res.status(400).json({ error: resolved.error || 'Respondent identity required' });
+    }
+
+    const responses = await getMyPollResponses(db, campaignId, resolved.respondent);
+    const config = mergePollConfig(await loadPollConfig(db));
+    res.json({ responses, config });
+  } catch (error) {
+    console.error('Error fetching poll responses:', error);
+    res.status(500).json({ error: 'Failed to fetch poll responses' });
+  }
+});
+
+/** Public aggregates per question for a campaign. */
+app.get('/data/campaigns/:id/polls/summary', async (req: Request, res: Response) => {
+  try {
+    const campaignId = String(req.params.id || '').trim();
+    if (!campaignId) return res.status(400).json({ error: 'Campaign id is required' });
+
+    const snap = await db.collection('campaigns').doc(campaignId).get();
+    if (!snap.exists) return res.status(404).json({ error: 'Campaign not found' });
+    const data = snap.data() as Record<string, unknown>;
+    const aggregates = summarizePollAggregates(data.poll_aggregates);
+    res.json({
+      campaignId,
+      aggregates,
+      perception_shift_actual: data.perception_shift_actual ?? null,
+      thumbs_up: data.thumbs_up ?? null,
+      thumbs_down: data.thumbs_down ?? null,
+      net_rating: data.net_rating ?? null,
+      config: mergePollConfig(await loadPollConfig(db)),
+    });
+  } catch (error) {
+    console.error('Error fetching poll summary:', error);
+    res.status(500).json({ error: 'Failed to fetch poll summary' });
+  }
+});
+
+/** Campaign comments (UE-80). v1: any signed-in Unravel account can comment. */
+
+/** 8 comments per 15 minutes per IP — generous for real use, blunt against spam bursts. */
+const commentSubmissionLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 8,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many comments from this device. Please try again in a few minutes.' },
+});
+
+/** GET newest-first page of visible comments. ?cursor=<lastCommentId>&limit=20 */
+app.get('/data/campaigns/:id/comments', async (req: Request, res: Response) => {
+  try {
+    const campaignId = String(req.params.id || '').trim();
+    if (!campaignId) return res.status(400).json({ error: 'Campaign id is required' });
+
+    const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : null;
+    const limit = req.query.limit != null ? Number(req.query.limit) : undefined;
+    const result = await listComments(db, campaignId, { cursor, limit });
+    res.json(result);
+  } catch (error) {
+    console.error('Error fetching campaign comments:', error);
+    res.status(500).json({ error: 'Failed to fetch comments' });
+  }
+});
+
+/** POST a new comment. Requires a Firebase-authed account (req.firebaseUid). */
+app.post('/data/campaigns/:id/comments', commentSubmissionLimiter, async (req: Request, res: Response) => {
+  try {
+    const campaignId = String(req.params.id || '').trim();
+    if (!campaignId) return res.status(400).json({ error: 'Campaign id is required' });
+    if (!req.firebaseUid) {
+      return res.status(401).json({ error: 'Sign in required to comment' });
+    }
+
+    const { text, error } = sanitizeCommentText((req.body ?? {}).text);
+    if (error || !text) {
+      return res.status(400).json({ error: error || `Comment text is required (max ${MAX_COMMENT_LENGTH} chars)` });
+    }
+
+    const profileSnap = await usersDb.collection('users').doc(req.firebaseUid).get();
+    const profile = profileSnap.exists ? (profileSnap.data() as Record<string, unknown>) : {};
+    const firstName = typeof profile.firstName === 'string' ? profile.firstName.trim() : '';
+    const lastName = typeof profile.lastName === 'string' ? profile.lastName.trim() : '';
+    const authorName = [firstName, lastName].filter(Boolean).join(' ') || 'Unravel member';
+    const authorAvatarUrl = typeof profile.avatarUrl === 'string' && profile.avatarUrl.trim() ? profile.avatarUrl.trim() : null;
+
+    const result = await createComment(db, {
+      campaignId,
+      authorUid: req.firebaseUid,
+      authorName,
+      authorAvatarUrl,
+      text,
+    });
+    if (!result.ok) return res.status(result.status).json({ error: result.error });
+    res.json({ ok: true, comment: result.comment });
+  } catch (error) {
+    console.error('Error posting campaign comment:', error);
+    res.status(500).json({ error: 'Failed to post comment' });
+  }
+});
+
+/** DELETE (soft) a comment — only the comment's own author, in v1. */
+app.delete('/data/campaigns/:id/comments/:commentId', async (req: Request, res: Response) => {
+  try {
+    const campaignId = String(req.params.id || '').trim();
+    const commentId = String(req.params.commentId || '').trim();
+    if (!campaignId || !commentId) {
+      return res.status(400).json({ error: 'Campaign id and comment id are required' });
+    }
+    if (!req.firebaseUid) {
+      return res.status(401).json({ error: 'Sign in required' });
+    }
+    const result = await removeComment(db, { campaignId, commentId, requesterUid: req.firebaseUid });
+    if (!result.ok) return res.status(result.status).json({ error: result.error });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error removing campaign comment:', error);
+    res.status(500).json({ error: 'Failed to remove comment' });
+  }
+});
+
+/**
+ * GET checkout-page testimonials — comments from backers who opted in to show their name
+ * (same UE-186 consent flag as the backer-count widget). Public; no auth required to read.
+ */
+app.get('/data/campaigns/:id/testimonials', async (req: Request, res: Response) => {
+  try {
+    const campaignId = String(req.params.id || '').trim();
+    if (!campaignId) return res.status(400).json({ error: 'Campaign id is required' });
+    const limit = req.query.limit != null ? Number(req.query.limit) : undefined;
+    const testimonials = await listCheckoutTestimonials(db, campaignId, { limit });
+    res.json({ testimonials });
+  } catch (error) {
+    console.error('Error fetching campaign testimonials:', error);
+    res.status(500).json({ error: 'Failed to fetch testimonials' });
   }
 });
 
@@ -2537,6 +3693,19 @@ function resolveThumbnailUrl(raw: unknown, apiBase: string): string {
 }
 
 app.get('/og/campaign/:id', async (req: Request, res: Response) => {
+  await sendCampaignOg(req, res, { pathSuffix: '' });
+});
+
+/** Audience-view share target — same preview card, human click lands on /campaign/:id/audience. */
+app.get('/og/campaign/:id/audience', async (req: Request, res: Response) => {
+  await sendCampaignOg(req, res, { pathSuffix: '/audience' });
+});
+
+async function sendCampaignOg(
+  req: Request,
+  res: Response,
+  { pathSuffix }: { pathSuffix: '' | '/audience' },
+): Promise<void> {
   try {
     const { id } = req.params;
     const doc = await db.collection('campaigns').doc(id).get();
@@ -2550,15 +3719,20 @@ app.get('/og/campaign/:id', async (req: Request, res: Response) => {
     // Always resolve image paths against the API's own public URL (not forwarded host —
     // requests arrive here via nginx proxy from unravel.network, which doesn't host /images/).
     const image = resolveThumbnailUrl(data?.thumbnail_url, API_PUBLIC_BASE);
-    const canonicalUrl = `${ogRedirectBase(req)}/campaign/${id}`;
+    const canonicalUrl = `${ogRedirectBase(req)}/campaign/${id}${pathSuffix}`;
     // Use the canonical frontend URL for FB preview display.
     // Otherwise the OG endpoint URL leaks as the visible "source" domain.
     const ogPageUrl = canonicalUrl;
+    // UE-185: carry the share link's query (utm_source / utm_medium / …) through to
+    // the frontend so attribution survives the click-through. og:url stays clean so
+    // crawlers collapse every share of a campaign onto one preview object.
+    const qsIndex = req.originalUrl.indexOf('?');
+    const forwardedQuery = qsIndex >= 0 ? req.originalUrl.slice(qsIndex) : '';
     const ua = String(req.get('user-agent') || '');
     const isCrawler = isSharePreviewCrawler(ua);
     // Diagnostic log so we can confirm which crawler (if any) is hitting /og/campaign/:id in prod.
     // Safe to leave on — low volume, no PII. Remove once preview-card issue is verified fixed.
-    console.log(`[og/campaign] id=${id} ua="${ua}" crawler=${isCrawler} image=${image}`);
+    console.log(`[og/campaign${pathSuffix}] id=${id} ua="${ua}" crawler=${isCrawler} image=${image}`);
 
     const ogHtml = `<!DOCTYPE html>
 <html lang="en">
@@ -2584,15 +3758,16 @@ app.get('/og/campaign/:id', async (req: Request, res: Response) => {
     if (isCrawler) {
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
       res.setHeader('Cache-Control', 'public, max-age=300');
-      return res.send(ogHtml);
+      res.send(ogHtml);
+      return;
     }
 
-    return res.redirect(302, canonicalUrl);
+    res.redirect(302, `${canonicalUrl}${forwardedQuery}`);
   } catch (error) {
     console.error('OG campaign error:', error);
     res.status(500).send('Error loading campaign');
   }
-});
+}
 
 /** Campaign id from a path or full URL containing `/campaign/:id` (matches unravel-ui lander helpers). */
 function extractCampaignIdFromUrl(raw: unknown): string | null {
@@ -2641,6 +3816,9 @@ app.get('/og/lander/:id', async (req: Request, res: Response) => {
 
     const canonicalUrl = `${ogRedirectBase(req)}/lander/${id}`;
     const ogPageUrl = canonicalUrl;
+    // UE-185: forward share-link UTMs through the human redirect (see /og/campaign).
+    const qsIndex = req.originalUrl.indexOf('?');
+    const forwardedQuery = qsIndex >= 0 ? req.originalUrl.slice(qsIndex) : '';
     const ua = String(req.get('user-agent') || '');
     const isCrawler = isSharePreviewCrawler(ua);
     console.log(`[og/lander] id=${id} ua="${ua}" crawler=${isCrawler} campaignId=${campaignId || 'none'} image=${image}`);
@@ -2672,7 +3850,7 @@ app.get('/og/lander/:id', async (req: Request, res: Response) => {
       return res.send(ogHtml);
     }
 
-    return res.redirect(302, canonicalUrl);
+    return res.redirect(302, `${canonicalUrl}${forwardedQuery}`);
   } catch (error) {
     console.error('OG lander error:', error);
     res.status(500).send('Error loading lander');
@@ -2706,6 +3884,11 @@ function impactOgDescription(payload: ImpactShareCardPayload): string {
   const shift = metrics.perceptionShift ?? metrics.avgPerceptionShift;
   const shiftLabel = shift != null ? ` · +${shift}% perception shift` : '';
   return `Helped reach ${reached} people${shiftLabel} through evaluated campaigns.`;
+}
+
+/** Wide social preview PNG — always on the API host (same rule as campaign thumbnails). */
+function impactOgImageUrl(token: string): string {
+  return `${API_PUBLIC_BASE}/og/impact/${encodeURIComponent(token)}/image`;
 }
 
 async function loadImpactShareCardForOg(token: string): Promise<
@@ -2753,11 +3936,15 @@ app.get('/og/impact/:token', async (req: Request, res: Response) => {
 
     const title = impactOgTitle(loaded.payload);
     const description = impactOgDescription(loaded.payload);
+    const image = impactOgImageUrl(token);
     const canonicalUrl = `${ogRedirectBase(req)}/impact/share/${token}`;
     const ogPageUrl = canonicalUrl;
+    // UE-188: forward ?ref= (and any utm_*) through the crawler→human hop
+    const qsIndex = req.originalUrl.indexOf('?');
+    const forwardedQuery = qsIndex >= 0 ? req.originalUrl.slice(qsIndex) : '';
     const ua = String(req.get('user-agent') || '');
     const isCrawler = isSharePreviewCrawler(ua);
-    console.log(`[og/impact] token=${token} ua="${ua}" crawler=${isCrawler}`);
+    console.log(`[og/impact] token=${token} ua="${ua}" crawler=${isCrawler} image=${image}`);
 
     const ogHtml = `<!DOCTYPE html>
 <html lang="en">
@@ -2767,13 +3954,19 @@ app.get('/og/impact/:token', async (req: Request, res: Response) => {
   <title>${escapeHtml(title)} | Unravel</title>
   <meta property="og:title" content="${escapeHtml(title)}">
   <meta property="og:description" content="${escapeHtml(description)}">
+  <meta property="og:image" content="${escapeHtml(image)}">
+  <meta property="og:image:secure_url" content="${escapeHtml(image)}">
+  <meta property="og:image:width" content="${IMPACT_OG_WIDTH}">
+  <meta property="og:image:height" content="${IMPACT_OG_HEIGHT}">
+  <meta property="og:image:type" content="image/png">
   <meta property="og:url" content="${escapeHtml(ogPageUrl)}">
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="Unravel">
   <meta property="fb:app_id" content="${escapeHtml(FB_APP_ID)}">
-  <meta name="twitter:card" content="summary">
+  <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="${escapeHtml(title)}">
   <meta name="twitter:description" content="${escapeHtml(description)}">
+  <meta name="twitter:image" content="${escapeHtml(image)}">
 </head>
 <body><p>${escapeHtml(title)}</p></body>
 </html>`;
@@ -2783,10 +3976,144 @@ app.get('/og/impact/:token', async (req: Request, res: Response) => {
       return res.send(ogHtml);
     }
 
-    return res.redirect(302, canonicalUrl);
+    return res.redirect(302, `${canonicalUrl}${forwardedQuery}`);
   } catch (error) {
     console.error('OG impact error:', error);
     res.status(500).send('Error loading impact share card');
+  }
+});
+
+/**
+ * UE-175 — share-to-social Trust Score card.
+ * /og/report/:id serves crawlers a preview whose image is the rendered score card
+ * (each component's score + campaign/assessment summary) and 302s humans to the
+ * report page. Works without a published report too: the card then shows the
+ * "Review in progress" state instead of scores, so shared links never break.
+ */
+const TRUST_OG_LAYERS: Array<{ key: 'factCheck' | 'commsIntegrity' | 'sharedReality'; label: string; weightPct: number }> = [
+  { key: 'factCheck', label: 'Fact-Checking', weightPct: 45 },
+  { key: 'commsIntegrity', label: 'Communications Integrity', weightPct: 30 },
+  { key: 'sharedReality', label: 'Shared Reality', weightPct: 25 },
+];
+
+function trustReportOgPayload(
+  campaign: Record<string, unknown>,
+  report: TrustReportPayload | null,
+): TrustReportOgPayload {
+  const summaryRaw = String(campaign.short_description ?? campaign.tagline ?? '')
+    .replace(/<[^>]*>/g, '')
+    .trim();
+  return {
+    campaignTitle: String(campaign.title ?? 'Campaign'),
+    category: campaign.category ? String(campaign.category) : null,
+    composite: report?.composite ?? null,
+    band: report?.band ?? null,
+    layers: TRUST_OG_LAYERS.map(({ key, label, weightPct }) => {
+      const layer = report?.[key];
+      const scored = layer?.status === 'scored' && layer.score != null && Number.isFinite(Number(layer.score));
+      return { label, weightPct, score: scored ? Number(layer!.score) : null };
+    }),
+    summary: summaryRaw || null,
+  };
+}
+
+function trustReportOgDescription(payload: TrustReportOgPayload): string {
+  const scores = payload.layers
+    .map((l) => `${l.label} ${l.score != null ? `${Math.round(l.score)}/100` : 'not yet scored'}`)
+    .join(' · ');
+  const lead = payload.band ? `${payload.band}. ` : 'Independent review in progress. ';
+  return `${lead}${scores}.${payload.summary ? ` ${payload.summary}` : ''}`.slice(0, 300);
+}
+
+async function loadTrustReportForOg(
+  campaignId: string,
+): Promise<{ ok: false; status: number; message: string } | { ok: true; campaign: Record<string, unknown>; report: TrustReportPayload | null }> {
+  const doc = await db.collection('campaigns').doc(campaignId).get();
+  if (!doc.exists) return { ok: false, status: 404, message: 'Campaign not found' };
+  const campaign = { id: doc.id, ...(doc.data() as Record<string, unknown>) };
+  let report: TrustReportPayload | null = null;
+  try {
+    report = await getPublishedTrustReport(db, campaignId, campaign);
+  } catch (e) {
+    console.error('[og/report] published report load failed; serving unscored card', e);
+  }
+  return { ok: true, campaign, report };
+}
+
+app.get('/og/report/:id/image', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const loaded = await loadTrustReportForOg(id);
+    if (!loaded.ok) {
+      res.status(loaded.status).send(loaded.message);
+      return;
+    }
+    const png = renderTrustReportOgPng(trustReportOgPayload(loaded.campaign, loaded.report));
+    res.setHeader('Content-Type', 'image/png');
+    // Reports can be re-reviewed and republished — cache briefly, never immutable.
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.send(png);
+  } catch (error) {
+    console.error('OG report image error:', error);
+    res.status(500).send('Error generating trust report share image');
+  }
+});
+
+app.get('/og/report/:id', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const loaded = await loadTrustReportForOg(id);
+    if (!loaded.ok) {
+      res.status(loaded.status).send(loaded.message);
+      return;
+    }
+    const payload = trustReportOgPayload(loaded.campaign, loaded.report);
+    const title =
+      payload.composite != null
+        ? `Trust Score ${Math.round(payload.composite)}/100 — ${payload.campaignTitle}`
+        : `Trust Score Report — ${payload.campaignTitle}`;
+    const description = trustReportOgDescription(payload);
+    const image = `${API_PUBLIC_BASE}/og/report/${encodeURIComponent(id)}/image`;
+    const canonicalUrl = `${ogRedirectBase(req)}/campaign/${id}/report`;
+    // Forward share-link UTMs through the crawler→human hop (same as /og/campaign).
+    const qsIndex = req.originalUrl.indexOf('?');
+    const forwardedQuery = qsIndex >= 0 ? req.originalUrl.slice(qsIndex) : '';
+    const ua = String(req.get('user-agent') || '');
+    const isCrawler = isSharePreviewCrawler(ua);
+
+    const ogHtml = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${escapeHtml(title)} | Unravel</title>
+  <meta property="og:title" content="${escapeHtml(title)}">
+  <meta property="og:description" content="${escapeHtml(description)}">
+  <meta property="og:image" content="${escapeHtml(image)}">
+  <meta property="og:image:secure_url" content="${escapeHtml(image)}">
+  <meta property="og:image:width" content="${TRUST_OG_WIDTH}">
+  <meta property="og:image:height" content="${TRUST_OG_HEIGHT}">
+  <meta property="og:url" content="${escapeHtml(canonicalUrl)}">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Unravel">
+  <meta property="fb:app_id" content="${escapeHtml(FB_APP_ID)}">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="${escapeHtml(title)}">
+  <meta name="twitter:description" content="${escapeHtml(description)}">
+  <meta name="twitter:image" content="${escapeHtml(image)}">
+</head>
+<body><p>${escapeHtml(title)}</p></body>
+</html>`;
+    if (isCrawler) {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.setHeader('Cache-Control', 'public, max-age=300');
+      return res.send(ogHtml);
+    }
+
+    return res.redirect(302, `${canonicalUrl}${forwardedQuery}`);
+  } catch (error) {
+    console.error('OG report error:', error);
+    res.status(500).send('Error loading trust report share card');
   }
 });
 
@@ -2925,6 +4252,50 @@ app.put('/ai-prompts/bias-wheel', async (req: Request, res: Response) => {
   }
 });
 
+// GET - Fetch the UE-223 campaign-summary prompts (3 sub-prompts) from Firestore,
+// falling back to the built-in defaults when nothing has been saved yet.
+app.get('/ai-prompts/campaign-summary', async (req: Request, res: Response) => {
+  try {
+    const doc = await db.collection('ai_prompts').doc(AI_PROMPTS_DOC_ID).get();
+    const stored = (doc.exists ? doc.data()?.campaign_summary : null) as
+      | Partial<typeof DEFAULT_CAMPAIGN_SUMMARY_PROMPTS>
+      | null
+      | undefined;
+    res.json({ campaign_summary: { ...DEFAULT_CAMPAIGN_SUMMARY_PROMPTS, ...(stored ?? {}) } });
+  } catch (error: unknown) {
+    const err = error as { message?: string; code?: number };
+    console.error('Error fetching campaign summary prompts:', err?.message ?? error, err?.code);
+    res.status(500).json({ error: 'Failed to fetch campaign summary prompts', detail: err?.message ?? String(error) });
+  }
+});
+
+// PUT - Update one or more of the 3 campaign-summary sub-prompts (merge, not replace-all).
+app.put('/ai-prompts/campaign-summary', async (req: Request, res: Response) => {
+  try {
+    const { campaign_summary } = req.body;
+    if (!campaign_summary || typeof campaign_summary !== 'object') {
+      return res.status(400).json({ error: 'campaign_summary object is required in request body' });
+    }
+    const allowedKeys = Object.keys(DEFAULT_CAMPAIGN_SUMMARY_PROMPTS);
+    const update: Record<string, string> = {};
+    for (const key of allowedKeys) {
+      const v = (campaign_summary as Record<string, unknown>)[key];
+      if (v !== undefined) {
+        if (typeof v !== 'string') {
+          return res.status(400).json({ error: `campaign_summary.${key} must be a string` });
+        }
+        update[key] = v;
+      }
+    }
+    await db.collection('ai_prompts').doc(AI_PROMPTS_DOC_ID).set({ campaign_summary: update }, { merge: true });
+    res.json({ campaign_summary: update, message: 'Campaign summary prompts updated successfully' });
+  } catch (error: unknown) {
+    const err = error as { message?: string; code?: number };
+    console.error('Error updating campaign summary prompts:', err?.message ?? error, err?.code);
+    res.status(500).json({ error: 'Failed to update campaign summary prompts', detail: err?.message ?? String(error) });
+  }
+});
+
 // Delete files from GCS by their public image URLs (e.g. .../images/fileName.png)
 async function deleteGeneratedImagesFromGcs(imageUrls: string[]): Promise<void> {
   if (!imageUrls?.length) return;
@@ -2997,7 +4368,7 @@ function sanitizeCampaignContentFields(data: Record<string, unknown>): void {
             : undefined;
           const youtubeUrl = s.youtubeUrl ? String(s.youtubeUrl).trim().slice(0, 500) : undefined;
           const imageUrl = s.imageUrl ? String(s.imageUrl).trim().slice(0, 2048) : undefined;
-          if (!description) return null;
+          // Caption is optional (UE-216); media is required.
           if (youtubeVideoId || youtubeUrl) {
             const out: Record<string, string> = { description };
             if (youtubeUrl) out.youtubeUrl = youtubeUrl;
@@ -3021,6 +4392,47 @@ function sanitizeCampaignContentFields(data: Record<string, unknown>): void {
   if (data.short_description !== undefined && data.short_description !== null) {
     data.short_description = String(data.short_description).trim().slice(0, 500);
   }
+
+  // UE-223 — new wizard fields. Rich-text fields (creator-authored HTML, rendered raw via
+  // dangerouslySetInnerHTML on the public pages) are sanitized here, the single write path
+  // both fields go through.
+  if (data.long_description !== undefined && data.long_description !== null) {
+    data.long_description = sanitizeHtml(String(data.long_description), SANITIZE_HTML_OPTIONS);
+  }
+  if (data.why_backers_should_care !== undefined && data.why_backers_should_care !== null) {
+    data.why_backers_should_care = sanitizeHtml(String(data.why_backers_should_care), SANITIZE_HTML_OPTIONS);
+  }
+
+  if (data.organization_name !== undefined && data.organization_name !== null) {
+    const v = String(data.organization_name).trim().slice(0, 120);
+    if (v) data.organization_name = v;
+    else delete data.organization_name;
+  }
+  if (data.target_audience !== undefined && data.target_audience !== null) {
+    data.target_audience = String(data.target_audience).trim().slice(0, 1000);
+  }
+
+  for (const key of ['what_this_is_about', 'who_its_for', 'why_it_matters_to_you', 'why_it_matters_backer'] as const) {
+    if (data[key] !== undefined && data[key] !== null) {
+      const v = String(data[key]).trim().slice(0, 600);
+      if (v) data[key] = v;
+      else delete data[key];
+    }
+  }
+  if (data.same_why_it_matters !== undefined) {
+    data.same_why_it_matters = Boolean(data.same_why_it_matters);
+  }
+  if (data.image_rights_confirmed !== undefined) {
+    data.image_rights_confirmed = Boolean(data.image_rights_confirmed);
+  }
+  if (data.terms_attested !== undefined) {
+    // Note: this function runs on both create (.add(), no FieldValue.delete() allowed) and
+    // update (.update(), where it would be allowed) — so un-attesting just leaves any prior
+    // terms_attested_at in place rather than clearing it; not a real path in this feature.
+    data.terms_attested = Boolean(data.terms_attested);
+    if (data.terms_attested) data.terms_attested_at = new Date().toISOString();
+    else delete data.terms_attested_at;
+  }
 }
 
 // POST - Create a new document
@@ -3032,6 +4444,47 @@ app.post('/data/:collection', async (req: Request, res: Response) => {
     // AI moderation for campaigns
     let aiModerationRecommendation = '';
     if (collection === 'campaigns') {
+      // UE-223 — ToS 4.2 gate, checked before anything else (no AI call, no Slack post,
+      // no write, if the creator's own copy contains a banned word). Client-side check
+      // on the wizard's Submit step is the same list; this is defense in depth.
+      const bannedHits = findForbiddenWords(data.title, data.short_description, data.long_description);
+      if (bannedHits.length) {
+        return res.status(400).json({ error: forbiddenWordsMessage(bannedHits), forbiddenWords: bannedHits });
+      }
+
+      // Creator UID from verified Firebase token only (not client-supplied).
+      // Admin-created campaigns may set a public display name via creator_name.
+      const isAdminCreated = data.admin_created === true || data.admin_created === 'true';
+      const adminCreatorDisplay = isAdminCreated
+        ? String(data.creator_name ?? data.creator ?? '').trim().slice(0, 120)
+        : '';
+
+      // Funding goal: admin sets it separately at approval (existing behavior, default 0).
+      // Public creator flow (UE-223 wizard) sets it up front and it's authoritative — admin
+      // can still override before Approve — so it's re-validated server-side here, not trusted.
+      if (!isAdminCreated) {
+        if (data.funding_goal === undefined || data.funding_goal === null) {
+          return res.status(400).json({ error: 'funding_goal is required and must be at least $100' });
+        }
+        const goal = Number(data.funding_goal);
+        if (!Number.isFinite(goal) || goal < 100) {
+          return res.status(400).json({ error: 'funding_goal must be at least $100' });
+        }
+        data.funding_goal = goal;
+      } else if (data.funding_goal === undefined || data.funding_goal === null) {
+        data.funding_goal = 0;
+      }
+
+      // Funding window (14/30/45/60 days) reuses the same validator the admin approval
+      // PATCH path already relies on (applyCampaignDurationPatch) — see UE-223 plan.
+      if (data.duration_days !== undefined) {
+        const durationResult = applyCampaignDurationPatch(data, {});
+        if (!durationResult.ok) {
+          return res.status(400).json({ error: durationResult.error });
+        }
+        Object.assign(data, durationResult.patch);
+      }
+
       try {
         console.log('Running AI moderation analysis...');
         // Frontend sends short_description and long_description; combine for AI
@@ -3048,14 +4501,10 @@ app.post('/data/:collection', async (req: Request, res: Response) => {
         console.error('AI moderation failed:', aiError);
         aiModerationRecommendation = 'AI moderation analysis unavailable. Please review manually.';
       }
-      
+
       // Set default status to "Pending" if not provided
       if (!data.status) {
         data.status = 'Pending';
-      }
-      // Funding goal is set by admin on approve; default to 0 when user creates campaign
-      if (data.funding_goal === undefined || data.funding_goal === null) {
-        data.funding_goal = 0;
       }
       // Set default funding_current to 0 (how much money was given to campaign)
       if (data.funding_current === undefined) {
@@ -3075,13 +4524,6 @@ app.post('/data/:collection', async (req: Request, res: Response) => {
       delete data.unusedGeneratedImageUrls; // do not store in Firestore
 
       sanitizeCampaignContentFields(data);
-
-      // Creator UID from verified Firebase token only (not client-supplied).
-      // Admin-created campaigns may set a public display name via creator_name.
-      const isAdminCreated = data.admin_created === true || data.admin_created === 'true';
-      const adminCreatorDisplay = isAdminCreated
-        ? String(data.creator_name ?? data.creator ?? '').trim().slice(0, 120)
-        : '';
       delete data.created_by;
       delete data.created_by_uid;
       delete data.creator;
@@ -3090,6 +4532,7 @@ app.post('/data/:collection', async (req: Request, res: Response) => {
       delete data.creator_last_name;
       delete data.creator_email;
       delete data.creator_username;
+      delete data.creator_name_admin_override;
       if (req.firebaseUid) {
         data.created_by = req.firebaseUid;
         data.created_by_uid = req.firebaseUid;
@@ -3180,6 +4623,8 @@ app.post('/data/:collection', async (req: Request, res: Response) => {
     if (collection === 'campaigns') {
       try {
         await slack.chat.postMessage({
+          // Campaign submissions route to #moderation. #query is reserved for
+          // Contact Us + Careers notifications only.
           channel: process.env.SLACK_CHANNEL || 'moderation',
           text: `🆕 New Campaign Submitted for Moderation`,
           blocks: [
@@ -3190,24 +4635,24 @@ app.post('/data/:collection', async (req: Request, res: Response) => {
             {
               type: 'section',
               fields: [
-                { type: 'mrkdwn', text: `*Title:*\n${data.title || 'N/A'}` },
-                { type: 'mrkdwn', text: `*Category:*\n${data.category || 'N/A'}` },
+                { type: 'mrkdwn', text: `*Title:*\n${toSlackText(data.title, 200) || 'N/A'}` },
+                { type: 'mrkdwn', text: `*Category:*\n${toSlackText(data.category, 80) || 'N/A'}` },
                 { type: 'mrkdwn', text: `*Funding Goal:*\n$${data.funding_goal || 0}` }
               ]
             },
             {
               type: 'section',
-              text: { type: 'mrkdwn', text: `*Short Description:*\n${data.short_description || 'N/A'}` }
+              text: { type: 'mrkdwn', text: `*Short Description:*\n${toSlackText(data.short_description, 600) || 'N/A'}` }
             },
             {
               type: 'section',
-              text: { type: 'mrkdwn', text: `*Long Description:*\n${data.long_description || 'No description'}` }
+              text: { type: 'mrkdwn', text: `*Long Description:*\n${toSlackText(data.long_description, 1500) || 'No description'}` }
             },
             {
               type: 'section',
               text: { 
                 type: 'mrkdwn', 
-                text: `*🤖 AI Moderation Recommendation:*\n${aiModerationRecommendation || 'Analysis pending...'}` 
+                text: `*🤖 AI Moderation Recommendation:*\n${toSlackText(aiModerationRecommendation, 2800) || 'Analysis pending...'}` 
               }
             },
             {
@@ -3223,8 +4668,18 @@ app.post('/data/:collection', async (req: Request, res: Response) => {
         });
         console.log('Slack notification sent to #moderation');
       } catch (slackError) {
-        console.error('Slack notification failed:', slackError);
-        // Don't fail the request if Slack fails
+        // UE-211: never let #moderation go silent. If the rich card fails to post for
+        // any reason, fall back to a minimal plain-text notice so the team still sees
+        // the submission. Never fail the request because of Slack.
+        console.error('Slack notification failed, attempting minimal fallback:', slackError);
+        try {
+          await slack.chat.postMessage({
+            channel: process.env.SLACK_CHANNEL || 'moderation',
+            text: `🆕 New campaign submitted for moderation: *${toSlackText(data.title, 200) || 'Untitled'}* — ID \`${docRef.id}\` (rich preview could not be rendered).`,
+          });
+        } catch (fallbackError) {
+          console.error('Slack fallback notification also failed:', fallbackError);
+        }
       }
       // Bias wheel: run in background only. Do not await — user gets "campaign submitted" after AI moderation, not after bias wheel.
       void analyzeBiasWheelAndUpdate(docRef.id, data).catch((err) =>
@@ -3275,12 +4730,25 @@ app.put('/data/:collection/:id', async (req: Request, res: Response) => {
       }
       const prev = snap.data() as Record<string, unknown>;
       sanitizeCampaignContentFields(data);
+      // The admin-override flag is only ever set by the PATCH admin editor path.
+      delete data.creator_name_admin_override;
       const durationResult = applyCampaignDurationPatch(data, prev);
       if (!durationResult.ok) {
         return res.status(400).json({ error: durationResult.error });
       }
       data = durationResult.patch;
       durationDeleteFields = durationResult.deleteFields;
+      if (data.status === 'Approved' && prev.status !== 'Approved') {
+        const latestReview = await getLatestTrustReportReview(db, id);
+        if (!isAcceptedDecision(latestReview?.review?.decision)) {
+          return res.status(409).json({
+            error: 'Campaign cannot be published until the UUTS review decision is Accepted',
+            message: 'Campaign cannot be published until the UUTS review decision is Accepted',
+            uuts_review_decision: latestReview?.review?.decision ?? 'pending',
+            publishEligible: false,
+          });
+        }
+      }
     }
 
     const updatePayload = buildCampaignUpdatePayload(data, durationDeleteFields);
@@ -3309,6 +4777,9 @@ app.patch('/data/:collection/:id', async (req: Request, res: Response) => {
     let stripeProductId: string | undefined;
     let stripeDonationPriceId: string | undefined;
     let durationDeleteFields: string[] = [];
+    // Set on the Pending -> Approved transition; acted on after the write lands,
+    // because syndication re-reads the campaign and requires status 'Approved'.
+    let syndicateAfterUpdate = false;
 
     if (collection === 'campaigns') {
       const ref = db.collection(collection).doc(id);
@@ -3317,6 +4788,28 @@ app.patch('/data/:collection/:id', async (req: Request, res: Response) => {
         return res.status(404).json({ error: 'Document not found' });
       }
       const prev = snap.data() as Record<string, unknown>;
+
+      // UE-223 — same ToS 4.2 gate as create, checked against the post-patch effective
+      // values (this patch's fields win, else fall back to what's already stored) so an
+      // edit can't sneak a banned word in one field at a time across multiple PATCHes.
+      const bannedHits = findForbiddenWords(
+        data.title ?? prev.title,
+        data.short_description ?? prev.short_description,
+        data.long_description ?? prev.long_description
+      );
+      if (bannedHits.length) {
+        return res.status(400).json({ error: forbiddenWordsMessage(bannedHits), forbiddenWords: bannedHits });
+      }
+
+      // Public creator PATCH (edit/resubmit) re-validates funding_goal the same way create
+      // does; admin PATCH (no firebaseUid) may still set/clear it directly at approval.
+      if (req.firebaseUid && data.funding_goal !== undefined && data.funding_goal !== null) {
+        const goal = Number(data.funding_goal);
+        if (!Number.isFinite(goal) || goal < 100) {
+          return res.status(400).json({ error: 'funding_goal must be at least $100' });
+        }
+        data.funding_goal = goal;
+      }
 
       const unusedGeneratedImageUrls = data.unusedGeneratedImageUrls;
       if (Array.isArray(unusedGeneratedImageUrls) && unusedGeneratedImageUrls.length > 0) {
@@ -3341,15 +4834,39 @@ app.patch('/data/:collection/:id', async (req: Request, res: Response) => {
       }
       Object.assign(data, impactMetricsResult.patch);
 
-      // Admin editor: allow setting/clearing the public creator display name.
-      if (data.creator_name !== undefined || data.creator !== undefined) {
+      const becomingApproved = data.status === 'Approved' && prev.status !== 'Approved';
+      syndicateAfterUpdate = becomingApproved;
+      if (becomingApproved) {
+        const latestReview = await getLatestTrustReportReview(db, id);
+        if (!isAcceptedDecision(latestReview?.review?.decision)) {
+          return res.status(409).json({
+            error: 'Campaign cannot be published until the UUTS review decision is Accepted',
+            message: 'Campaign cannot be published until the UUTS review decision is Accepted',
+            uuts_review_decision: latestReview?.review?.decision ?? 'pending',
+            publishEligible: false,
+          });
+        }
+      }
+
+      // Never trust a client-supplied override flag.
+      delete data.creator_name_admin_override;
+      if (req.firebaseUid) {
+        // Signed-in creator edits must not touch the public display-name fields.
+        delete data.creator_name;
+        delete data.creator;
+      } else if (data.creator_name !== undefined || data.creator !== undefined) {
+        // Admin editor: allow setting/clearing the public creator display name.
+        // The flag marks it as a deliberate override so the read path shows it
+        // instead of the creator's live profile name (UE-204).
         const display = String(data.creator_name ?? data.creator ?? '').trim().slice(0, 120);
         if (display) {
           data.creator_name = display;
           data.creator = display;
+          data.creator_name_admin_override = true;
         } else {
           data.creator_name = FieldValue.delete();
           data.creator = FieldValue.delete();
+          data.creator_name_admin_override = FieldValue.delete();
         }
       }
 
@@ -3387,12 +4904,35 @@ app.patch('/data/:collection/:id', async (req: Request, res: Response) => {
 
     await db.collection(collection).doc(id).update(updatePayload);
 
+    // Cross-post the freshly approved campaign to Unravel's X and Reddit accounts.
+    // Awaited so the admin sees the outcome, but it never throws: a platform
+    // outage must not turn a successful approval into a 500.
+    const syndication =
+      syndicateAfterUpdate && isAutoSyndicationEnabled()
+        ? await syndicateApprovedCampaign(db, id)
+        : undefined;
+
+    // Create the Reddit ad for a freshly approved campaign. Always PAUSED, and
+    // never fatal: an ads outage must not turn a successful approval into a 500.
+    let redditAd: Awaited<ReturnType<typeof createRedditAdCampaign>> | undefined;
+    if (syndicateAfterUpdate) {
+      try {
+        redditAd = await createRedditAdCampaign(db, id);
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(`[reddit-ads] campaign ${id} failed:`, message);
+        redditAd = { status: 'failed', error: message };
+      }
+    }
+
     const responseBody: Record<string, unknown> = {
       message: 'Document updated',
       id,
       ...data,
       ...(stripeProductId ? { stripe_product_id: stripeProductId } : {}),
       ...(stripeDonationPriceId ? { stripe_donation_price_id: stripeDonationPriceId } : {}),
+      ...(syndication ? { syndication } : {}),
+      ...(redditAd ? { redditAd } : {}),
     };
 
     res.json(
@@ -3441,6 +4981,23 @@ app.delete('/data/:collection/:id', async (req: Request, res: Response) => {
 });
 
 // POST - Upload a campaign image (base64 data URL or raw base64 → GCS, same bucket as generated images)
+/** Sniffs magic bytes to confirm `buffer` is actually one of these 4 image formats. */
+function sniffImageFormat(buffer: Buffer): 'jpeg' | 'png' | 'webp' | 'gif' | null {
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return 'jpeg';
+  if (
+    buffer.length >= 8 &&
+    buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47 &&
+    buffer[4] === 0x0d && buffer[5] === 0x0a && buffer[6] === 0x1a && buffer[7] === 0x0a
+  ) return 'png';
+  if (
+    buffer.length >= 12 &&
+    buffer.toString('ascii', 0, 4) === 'RIFF' &&
+    buffer.toString('ascii', 8, 12) === 'WEBP'
+  ) return 'webp';
+  if (buffer.length >= 6 && buffer.toString('ascii', 0, 6).match(/^GIF8[79]a$/)) return 'gif';
+  return null;
+}
+
 app.post('/upload-campaign-image', async (req: Request, res: Response) => {
   try {
     const { imageBase64 } = req.body as { imageBase64?: string };
@@ -3460,6 +5017,15 @@ app.post('/upload-campaign-image', async (req: Request, res: Response) => {
     }
     if (buffer.length < 32) {
       return res.status(400).json({ error: 'Invalid image data' });
+    }
+    // UE-223/C9 — verify the bytes are actually one of the image formats the endpoint
+    // serves back out (unravel-api's /images/:fileName route makes this public), not just
+    // trusting the client-declared mimeType. Shared by every uploader on the site (campaign
+    // visuals/ad, hero slideshow, profile photo, etc.) so this checks magic bytes for the
+    // formats already supported below rather than narrowing what's accepted.
+    const sniffedFormat = sniffImageFormat(buffer);
+    if (!sniffedFormat) {
+      return res.status(400).json({ error: 'File is not a valid JPG, PNG, WebP or GIF image' });
     }
     const bucketName = process.env.GCS_BUCKET || 'unravel-generated-images';
     const bucket = storage.bucket(bucketName);
@@ -3490,64 +5056,144 @@ type GeneratedImage = { imageBase64: string; imageUrl: string; storagePath: stri
 
 // Generate a single image (one API call). Returns null on any failure (API error, no image, safety block).
 async function generateSingleImage(description: string): Promise<GeneratedImage | null> {
+  const modelName = process.env.GEMINI_MODEL_IMAGE_GENERATION || 'gemini-2.0-flash-exp';
   try {
-    const imagenModel = vertexAI.getGenerativeModel({
-      model: process.env.GEMINI_MODEL_IMAGE_GENERATION || 'gemini-2.0-flash-exp',
-      generationConfig: {
-        responseModalities: ['TEXT', 'IMAGE'],
-      } as any,
-    });
+    return await traceGeminiCall({
+      name: 'generate-campaign-image',
+      model: modelName,
+      tags: ['image-generation'],
+      metadata: {
+        descriptionChars: String(description?.length || 0),
+      },
+      input: {
+        description: description.length > 2000 ? `${description.slice(0, 2000)}…` : description,
+      },
+      run: async () => {
+        const imagenModel = vertexAI.getGenerativeModel({
+          model: modelName,
+          generationConfig: {
+            responseModalities: ['TEXT', 'IMAGE'],
+          } as any,
+        });
 
-    const result = await imagenModel.generateContent({
-      contents: [{
-        role: 'user',
-        parts: [{ text: `Generate an image of: ${description}. Only respond with the image.` }]
-      }],
-    });
+        const result = await imagenModel.generateContent({
+          contents: [{
+            role: 'user',
+            parts: [{ text: `Generate an image of: ${description}. Only respond with the image.` }],
+          }],
+        });
 
-    const response = result.response;
-    let imageData: string | null = null;
-    let mimeType = 'image/png';
+        const response = result.response;
+        let imageData: string | null = null;
+        let mimeType = 'image/png';
 
-    const candidates = response.candidates || [];
-    for (const candidate of candidates) {
-      const parts = candidate.content?.parts || [];
-      for (const part of parts) {
-        const inlineData = (part as { inlineData?: { data: string; mimeType?: string } }).inlineData;
-        if (inlineData?.data) {
-          imageData = inlineData.data;
-          mimeType = inlineData.mimeType || 'image/png';
-          break;
+        const candidates = response.candidates || [];
+        for (const candidate of candidates) {
+          const parts = candidate.content?.parts || [];
+          for (const part of parts) {
+            const inlineData = (part as { inlineData?: { data: string; mimeType?: string } }).inlineData;
+            if (inlineData?.data) {
+              imageData = inlineData.data;
+              mimeType = inlineData.mimeType || 'image/png';
+              break;
+            }
+          }
+          if (imageData) break;
         }
-      }
-      if (imageData) break;
-    }
 
-    if (!imageData) {
-      console.warn('Image generation returned no image data (possible safety filter or empty response)');
-      return null;
-    }
+        if (!imageData) {
+          console.warn('Image generation returned no image data (possible safety filter or empty response)');
+          return {
+            result: null,
+            output: { imageGenerated: false, reason: 'no-image-data' },
+            usageDetails: extractVertexUsage(result),
+          };
+        }
 
-    const bucketName = process.env.GCS_BUCKET || 'unravel-generated-images';
-    const bucket = storage.bucket(bucketName);
-    const fileName = `generated-${Date.now()}-${Math.random().toString(36).substring(7)}.png`;
-    const file = bucket.file(fileName);
-    await file.save(Buffer.from(imageData, 'base64'), {
-      metadata: { contentType: mimeType },
+        const bucketName = process.env.GCS_BUCKET || 'unravel-generated-images';
+        const bucket = storage.bucket(bucketName);
+        const fileName = `generated-${Date.now()}-${Math.random().toString(36).substring(7)}.png`;
+        const file = bucket.file(fileName);
+        await file.save(Buffer.from(imageData, 'base64'), {
+          metadata: { contentType: mimeType },
+        });
+
+        const generated: GeneratedImage = {
+          imageBase64: `data:${mimeType};base64,${imageData}`,
+          imageUrl: '',
+          storagePath: `gs://${bucketName}/${fileName}`,
+          fileName,
+        };
+        return {
+          result: generated,
+          // Never log raw base64 into Langfuse
+          output: {
+            imageGenerated: true,
+            mimeType,
+            fileName,
+            storagePath: generated.storagePath,
+          },
+          usageDetails: extractVertexUsage(result),
+        };
+      },
     });
-
-    return {
-      imageBase64: `data:${mimeType};base64,${imageData}`,
-      imageUrl: '',
-      storagePath: `gs://${bucketName}/${fileName}`,
-      fileName,
-    };
   } catch (error: unknown) {
     const err = error as { message?: string; code?: number };
     console.error('Error generating single image:', err?.message ?? error, err?.code);
     return null;
   }
 }
+
+// POST - UE-223: draft the 3 "story, in summary" cards from the creator's own copy.
+// Stateless (no draft/campaign id required — the wizard can call this before a draft
+// even exists). Auth required so this can't be scraped as a free Gemini proxy.
+app.post('/generate-campaign-summary', async (req: Request, res: Response) => {
+  const uid = await requireFirebaseUid(req, res);
+  if (!uid) return;
+  try {
+    const {
+      title, category, short_description, long_description,
+      target_audience, why_it_matters, why_backers_should_care,
+    } = req.body ?? {};
+    const summary = await generateCampaignSummary({
+      title, category, short_description, long_description, target_audience, why_it_matters, why_backers_should_care,
+    });
+    res.json(summary);
+  } catch (error: unknown) {
+    const err = error as { message?: string; code?: number };
+    console.error('POST /generate-campaign-summary:', err?.message ?? error, err?.code);
+    res.status(500).json({ error: 'Failed to generate campaign summary', detail: err?.message ?? String(error) });
+  }
+});
+
+// ============ CAMPAIGN DRAFT GENERATION ============
+
+/** 6 requests per 15 minutes per IP — this is a paid multi-hundred-token Claude call, keep it tight. */
+const campaignDraftLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 6,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many campaign drafts requested from this device. Please try again in a few minutes.' },
+});
+
+// POST - Analyze a free-form campaign description and generate structured content for every
+// section of the campaign builder (basics, story, sources, ad copy, image prompts, slides).
+app.post('/generate-campaign-draft', campaignDraftLimiter, async (req: Request, res: Response) => {
+  try {
+    const { description } = req.body as { description?: string };
+    if (!description || typeof description !== 'string' || description.trim().length < 30) {
+      return res.status(400).json({ error: 'A campaign description of at least 30 characters is required' });
+    }
+
+    const draft = await generateCampaignDraft(description.trim());
+    res.json({ draft });
+  } catch (error: unknown) {
+    const err = error as { message?: string; status?: number };
+    console.error('Error generating campaign draft:', err?.message ?? error);
+    res.status(err?.status || 500).json({ error: 'Failed to generate campaign draft', details: err?.message });
+  }
+});
 
 // POST - Generate 3 images using Vertex AI and store in Cloud Storage
 app.post('/generate-image', async (req: Request, res: Response) => {
@@ -3973,9 +5619,14 @@ async function recordCouponOnlyBacking(input: {
   donorUid?: string;
   donorEmail?: string;
   donorName?: string;
+  showName?: boolean;
   posthogDistinctId?: string;
   utmSource?: string;
   utmCampaign?: string;
+  utmMedium?: string;
+  utmTerm?: string;
+  utmContent?: string;
+  shareRef?: string;
   isGuest: boolean;
 }): Promise<{ funding_current: number }> {
   const redemptionId = 'cpn_' + randomUUID();
@@ -4007,6 +5658,7 @@ async function recordCouponOnlyBacking(input: {
       ...(input.donorUid ? { donor_uid: input.donorUid } : {}),
       ...(input.donorEmail ? { donor_email: input.donorEmail } : {}),
       ...(input.donorName ? { donor_name: input.donorName } : {}),
+      ...(input.showName ? { show_name: true } : {}), // UE-186 social-proof opt-in
     });
   });
 
@@ -4049,6 +5701,10 @@ async function recordCouponOnlyBacking(input: {
     amountDiscount: input.discountCents,
     utmSource: input.utmSource ?? null,
     utmCampaign: input.utmCampaign ?? null,
+    utmMedium: input.utmMedium ?? null,
+    utmTerm: input.utmTerm ?? null,
+    utmContent: input.utmContent ?? null,
+    shareRef: sanitizeShareRef(input.shareRef),
     source: 'coupon_zero_balance',
   });
 
@@ -4205,25 +5861,76 @@ app.post('/coupons', async (req: Request, res: Response) => {
   }
 });
 
-// PATCH - Update a coupon (admin) — e.g. activate/deactivate, adjust expiry/cap.
+// PATCH - Update a coupon (admin). Any subset of the editable fields may be sent; the code
+// itself is the doc id and is never renamed, and times_redeemed/created_at are never touched.
 app.patch('/coupons/:code', async (req: Request, res: Response) => {
   try {
     const code = String(req.params.code || '').trim().toUpperCase();
     const ref = db.collection('coupons').doc(code);
-    if (!(await ref.get()).exists) {
+    const snap = await ref.get();
+    if (!snap.exists) {
       return res.status(404).json({ error: 'Coupon not found' });
     }
-    const b = req.body as { active?: boolean; expiresAt?: string | null; maxRedemptions?: number | null };
+    const existing = snap.data() as Record<string, unknown>;
+    const b = req.body as {
+      active?: boolean;
+      type?: string;
+      value?: number;
+      campaignScope?: unknown; // 'all' | string | string[]
+      expiresAt?: string | null;
+      maxRedemptions?: number | null;
+      oncePerUser?: boolean;
+      fundingSource?: string | null;
+    };
     const patch: Record<string, unknown> = {};
+
     if (typeof b.active === 'boolean') patch.active = b.active;
+    if (typeof b.oncePerUser === 'boolean') patch.once_per_user = b.oncePerUser;
+
+    // type + value validate together: the value's ceiling depends on the (possibly new) type.
+    const effectiveType = b.type !== undefined ? b.type : (existing.type as string);
+    if (b.type !== undefined) {
+      if (b.type !== 'amount_off' && b.type !== 'percent_off') {
+        return res.status(400).json({ error: "type must be 'amount_off' or 'percent_off'" });
+      }
+      patch.type = b.type;
+    }
+    if (b.value !== undefined) {
+      const value = Number(b.value);
+      if (!Number.isInteger(value) || value <= 0) {
+        return res.status(400).json({ error: 'value must be a positive integer (cents for amount_off, percent for percent_off)' });
+      }
+      if (effectiveType === 'percent_off' && value > 100) {
+        return res.status(400).json({ error: 'percent_off value must be between 1 and 100' });
+      }
+      patch.value = value;
+    }
+
+    if (b.campaignScope !== undefined) {
+      const scope = b.campaignScope;
+      if (Array.isArray(scope) && scope.length && scope.every((s) => typeof s === 'string')) {
+        patch.campaign_scope = scope as string[];
+      } else if (typeof scope === 'string' && scope.trim() && scope.trim() !== 'all') {
+        patch.campaign_scope = [scope.trim()];
+      } else {
+        patch.campaign_scope = 'all';
+      }
+    }
+
     if (b.expiresAt === null || typeof b.expiresAt === 'string') {
       patch.expires_at = b.expiresAt && b.expiresAt.trim() ? b.expiresAt.trim() : null;
     }
     if (b.maxRedemptions === null || (typeof b.maxRedemptions === 'number' && Number.isInteger(b.maxRedemptions))) {
-      patch.max_redemptions = b.maxRedemptions ?? null;
+      patch.max_redemptions =
+        typeof b.maxRedemptions === 'number' && b.maxRedemptions > 0 ? b.maxRedemptions : null;
     }
+    if (b.fundingSource !== undefined) {
+      patch.funding_source =
+        typeof b.fundingSource === 'string' && b.fundingSource.trim() ? b.fundingSource.trim() : null;
+    }
+
     if (Object.keys(patch).length === 0) {
-      return res.status(400).json({ error: 'No updatable fields provided (active, expiresAt, maxRedemptions)' });
+      return res.status(400).json({ error: 'No updatable fields provided' });
     }
     patch.updatedAt = new Date().toISOString();
     await ref.update(patch);
@@ -4266,9 +5973,11 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
       promoCode?: string;
       posthogDistinctId?: string;
       utm?: Record<string, unknown>;
+      shareRef?: string;
       couponCode?: string;
       email?: string;
       name?: string;
+      showName?: boolean;
     };
     const { amount: amountCents, campaignId, currency = 'usd' } = body;
     const cur = (currency || 'usd').toLowerCase();
@@ -4300,6 +6009,9 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
       // Full name for the receipt + trust-score email. Guests supply it on the lander form.
       const donorName =
         typeof body.name === 'string' && body.name.trim() ? body.name.trim() : undefined;
+      // UE-186 social proof: explicit opt-in to show the first name as a recent
+      // backer. Default is anonymous ("Someone") — only an explicit true opts in.
+      const showName = body.showName === true;
 
       // Acquisition + identity context (UE-154), stamped on the session so a redemption is
       // fully recoverable from the webhook.
@@ -4307,6 +6019,10 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
       const utmIn = body.utm && typeof body.utm === 'object' ? body.utm : {};
       const utmSource = sanitizeMetaValue(utmIn.utm_source);
       const utmCampaign = sanitizeMetaValue(utmIn.utm_campaign);
+      const utmMedium = sanitizeMetaValue(utmIn.utm_medium);
+      const utmTerm = sanitizeMetaValue(utmIn.utm_term);
+      const utmContent = sanitizeMetaValue(utmIn.utm_content);
+      const shareRef = sanitizeShareRef(body.shareRef) || undefined;
       const isGuest = !donorUid;
       // Canonical distinct id everywhere: Firebase UID for logged-in users, else the guest's
       // PostHog distinct id. campaignId is preserved in metadata (below).
@@ -4343,9 +6059,14 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
           donorUid,
           donorEmail,
           donorName,
+          showName,
           posthogDistinctId: posthogDistinctId || undefined,
           utmSource: utmSource || undefined,
           utmCampaign: utmCampaign || undefined,
+          utmMedium: utmMedium || undefined,
+          utmTerm: utmTerm || undefined,
+          utmContent: utmContent || undefined,
+          shareRef,
           isGuest,
         });
         return res.json({ ok: true, zeroBalance: true, funding_current });
@@ -4373,9 +6094,14 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
         checkoutMetadata.firebase_uid = donorUid; // canonical key per the Eng Brief
       }
       if (promoCode) checkoutMetadata.promo_code = promoCode;
+      if (showName) checkoutMetadata.show_name = 'true'; // UE-186 social-proof opt-in
       if (posthogDistinctId) checkoutMetadata.posthog_distinct_id = posthogDistinctId;
       if (utmSource) checkoutMetadata.utm_source = utmSource;
       if (utmCampaign) checkoutMetadata.utm_campaign = utmCampaign;
+      if (utmMedium) checkoutMetadata.utm_medium = utmMedium;
+      if (utmTerm) checkoutMetadata.utm_term = utmTerm;
+      if (utmContent) checkoutMetadata.utm_content = utmContent;
+      if (shareRef) checkoutMetadata.share_ref = shareRef;
       if (coupon) {
         // We charge the net, but the fund must still credit the gross — carry both so the
         // recorder uses gross_cents (Stripe's amount_subtotal would only equal the net here).
@@ -4399,7 +6125,9 @@ app.post('/payments/create-payment-intent', async (req: Request, res: Response) 
       const sessionCommon = {
         mode: 'payment' as const,
         ...(canonicalRef ? { client_reference_id: canonicalRef } : {}),
-        success_url: `${base}/campaign/${encodeURIComponent(cidTrim)}?donation=success&session_id={CHECKOUT_SESSION_ID}`,
+        // UE-185: land on the full-screen thank-you interstitial (it records the
+        // session, shows verified impact, and offers the share module).
+        success_url: `${base}/campaign/${encodeURIComponent(cidTrim)}/thanks?session_id={CHECKOUT_SESSION_ID}`,
         cancel_url: `${base}${cancelRel}`,
         submit_type: 'pay' as const,
         // A stamped Customer and customer_email are mutually exclusive in Checkout.
@@ -4530,7 +6258,9 @@ app.post('/payments/record-checkout-session', async (req: Request, res: Response
       expand: ['invoice'],
     });
     if (session.payment_status !== 'paid') {
-      return res.status(400).json({ error: 'This checkout session is not paid yet.' });
+      // UE-185: `pending` lets the thank-you page render its optimistic
+      // "Confirming your contribution…" state and retry, instead of failing.
+      return res.status(400).json({ error: 'This checkout session is not paid yet.', pending: true });
     }
     const campaignId = session.metadata?.campaignId;
     if (!campaignId || typeof campaignId !== 'string') {
@@ -4572,6 +6302,8 @@ app.post('/payments/record-checkout-session', async (req: Request, res: Response
     // especially for guests (who have no uid).
     const donorEmail =
       (session.customer_details?.email || session.customer_email || '').trim().toLowerCase() || undefined;
+    // UE-186 social-proof opt-in, carried through the Checkout Session metadata.
+    const showName = session.metadata?.show_name === 'true';
     const recordedAt = new Date().toISOString();
 
     const recordRef = db.collection('stripe_checkout_records').doc(sid);
@@ -4611,6 +6343,7 @@ app.post('/payments/record-checkout-session', async (req: Request, res: Response
         ...(couponCode ? { coupon_code: couponCode } : {}),
         ...(donorUid ? { donor_uid: donorUid } : {}),
         ...(donorEmail ? { donor_email: donorEmail } : {}),
+        ...(showName ? { show_name: true } : {}), // UE-186 social-proof opt-in
       });
       t.update(campaignRef, {
         funding_current: newFunding,
@@ -4685,6 +6418,12 @@ app.post('/payments/record-checkout-session', async (req: Request, res: Response
     res.json({
       ok: true,
       funding_current,
+      // UE-185: server-verified figures for the thank-you interstitial — the
+      // impact statement renders from these, never from client-side state.
+      campaignId: campaignId.trim(),
+      amount_gross_cents: amountGrossCents,
+      amount_charged_cents: amountChargedCents,
+      amount_discount_cents: amountDiscountCents,
       receipt: {
         invoicePdf,
         hostedInvoiceUrl,
@@ -4866,16 +6605,65 @@ function resolveCreativeImageUrlForFacebookAd(data: any, thumbnailOverride?: str
   return 'https://www.facebook.com/images/fb_icon_325x325.png';
 }
 
+const FACEBOOK_OBJECTIVE_PRESETS = {
+  traffic: {
+    key: 'traffic',
+    label: 'Objective: Traffic · Optimized: Link clicks',
+    objective: 'OUTCOME_TRAFFIC',
+    optimization_goal: 'LINK_CLICKS',
+    billing_event: 'IMPRESSIONS',
+  },
+  reach: {
+    key: 'reach',
+    label: 'Objective: Awareness · Optimized: Reach',
+    objective: 'OUTCOME_AWARENESS',
+    optimization_goal: 'REACH',
+    billing_event: 'IMPRESSIONS',
+  },
+  awareness: {
+    key: 'awareness',
+    label: 'Objective: Awareness · Optimized: Impressions',
+    objective: 'OUTCOME_AWARENESS',
+    optimization_goal: 'IMPRESSIONS',
+    billing_event: 'IMPRESSIONS',
+  },
+  engagement: {
+    key: 'engagement',
+    label: 'Objective: Engagement · Optimized: Post engagement',
+    objective: 'OUTCOME_ENGAGEMENT',
+    optimization_goal: 'POST_ENGAGEMENT',
+    billing_event: 'IMPRESSIONS',
+  },
+} as const;
+
+type FacebookObjectivePresetKey = keyof typeof FACEBOOK_OBJECTIVE_PRESETS;
+
+function resolveFacebookObjectivePreset(
+  raw: unknown
+): (typeof FACEBOOK_OBJECTIVE_PRESETS)[FacebookObjectivePresetKey] {
+  const key = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  if (key && key in FACEBOOK_OBJECTIVE_PRESETS) {
+    return FACEBOOK_OBJECTIVE_PRESETS[key as FacebookObjectivePresetKey];
+  }
+  if (raw == null || raw === '') {
+    return FACEBOOK_OBJECTIVE_PRESETS.traffic;
+  }
+  const allowed = Object.keys(FACEBOOK_OBJECTIVE_PRESETS).join(', ');
+  throw new Error(`Invalid objective_preset. Allowed: ${allowed}`);
+}
+
 async function publishFacebookAdForCampaign(
   campaignId: string,
-  thumbnailOverride?: string
-): Promise<{ campaignId: string; adId: string }> {
+  thumbnailOverride?: string,
+  objectivePresetRaw?: unknown
+): Promise<{ campaignId: string; adId: string; objective_preset: string }> {
   const bizSdk = require('facebook-nodejs-business-sdk');
   const AdAccount = bizSdk.AdAccount;
   const accessToken = process.env.FACEBOOK_ACCESS_TOKEN;
   const adAccountId = process.env.FACEBOOK_AD_ACCOUNT_ID;
   const pageId = process.env.FACEBOOK_PAGE_ID;
   const frontendBaseUrl = (process.env.FRONTEND_BASE_URL || '').replace(/\/$/, '');
+  const preset = resolveFacebookObjectivePreset(objectivePresetRaw);
 
   if (!accessToken || !adAccountId || !pageId || !frontendBaseUrl) {
     throw new Error('Facebook ad config missing: set FACEBOOK_ACCESS_TOKEN, FACEBOOK_AD_ACCOUNT_ID, FACEBOOK_PAGE_ID, FRONTEND_BASE_URL in .env');
@@ -4907,12 +6695,12 @@ async function publishFacebookAdForCampaign(
   try {
     const campaign = await account.createCampaign([], {
       name: baseName + ' Campaign',
-      objective: 'OUTCOME_TRAFFIC',
-status: 'PAUSED',
-    special_ad_categories: [],
-    is_adset_budget_sharing_enabled: false,
-  });
-  fbCampaignId = campaign.id;
+      objective: preset.objective,
+      status: 'PAUSED',
+      special_ad_categories: [],
+      is_adset_budget_sharing_enabled: false,
+    });
+    fbCampaignId = campaign.id;
   } catch (err: any) {
     console.error('Facebook createCampaign failed:', err?.response ?? err);
     throw new Error(getFacebookErrorMessage(err, 'Create Campaign'));
@@ -4921,11 +6709,7 @@ status: 'PAUSED',
   const start = new Date();
   const end = new Date();
   end.setDate(end.getDate() + 3);
-  const targeting = {
-    geo_locations: { countries: ['US'] },
-    publisher_platforms: ['facebook', 'audience_network'],
-    facebook_positions: ['feed'],
-  };
+  const targeting = { ...DEFAULT_FACEBOOK_TARGETING };
   let adSetId: string;
   try {
     const adSet = await account.createAdSet([], {
@@ -4935,8 +6719,8 @@ status: 'PAUSED',
       bid_amount: '10',
       start_time: toISO(start),
       end_time: toISO(end),
-      billing_event: 'IMPRESSIONS',
-      optimization_goal: 'LINK_CLICKS',
+      billing_event: preset.billing_event,
+      optimization_goal: preset.optimization_goal,
       targeting: JSON.stringify(targeting),
       status: 'PAUSED',
     });
@@ -4981,34 +6765,113 @@ status: 'PAUSED',
     throw new Error(getFacebookErrorMessage(err, 'Create Ad'));
   }
 
+  const audienceSize = await fetchAudienceSizeEstimateSafe(
+    accessToken,
+    targeting as unknown as Record<string, unknown>
+  );
+
   await db.collection('campaigns').doc(campaignId).update({
     facebook_ad_id: adId,
     facebook_campaign_id: fbCampaignId,
     facebook_ad_set_id: adSetId,
     facebook_published_at: new Date(),
+    facebook_objective_preset: preset.key,
+    facebook_objective: preset.objective,
+    facebook_optimization_goal: preset.optimization_goal,
+    ...(audienceSize ? audienceSizeToCampaignPatch(audienceSize) : {}),
   });
 
-  return { campaignId: fbCampaignId, adId };
+  return { campaignId: fbCampaignId, adId, objective_preset: preset.key };
 }
 
 app.post('/facebook/publish-ad', async (req: Request, res: Response) => {
-  const { campaignId, thumbnail_url } = req.body;
+  const { campaignId, thumbnail_url, objective_preset } = req.body;
   if (!campaignId || typeof campaignId !== 'string') {
     return res.status(400).json({ error: 'campaignId is required' });
   }
   const thumbnailOverride =
     typeof thumbnail_url === 'string' && thumbnail_url.trim() ? thumbnail_url.trim() : undefined;
   try {
-    const result = await publishFacebookAdForCampaign(campaignId, thumbnailOverride);
+    const result = await publishFacebookAdForCampaign(campaignId, thumbnailOverride, objective_preset);
     return res.json({ ok: true, ...result });
   } catch (error: any) {
     const message = error?.message || 'Failed to publish ad to Facebook';
+    const status = typeof message === 'string' && message.startsWith('Invalid objective_preset') ? 400 : 500;
     console.error('Facebook publish-ad error:', message, error);
-    return res.status(500).json({ error: message });
+    return res.status(status).json({ error: message });
   }
 });
 
 // GET Facebook ad insights for a campaign (impressions, reach, clicks, spend, etc.)
+/**
+ * Manually cross-post an approved campaign to X and/or Reddit.
+ *
+ * Approval already syndicates automatically; these exist to retry after a token
+ * expiry or an outage, and to post campaigns approved before this shipped.
+ * `force: true` bypasses the already-posted guard and will create a duplicate.
+ */
+app.post('/social/publish', async (req: Request, res: Response) => {
+  const { campaignId, platform, force, subreddit } = req.body ?? {};
+  if (!campaignId || typeof campaignId !== 'string') {
+    return res.status(400).json({ error: 'campaignId is required' });
+  }
+  const target = typeof platform === 'string' ? platform.toLowerCase() : 'all';
+  if (!['x', 'reddit', 'all'].includes(target)) {
+    return res.status(400).json({ error: "platform must be 'x', 'reddit' or 'all'" });
+  }
+
+  const options = {
+    force: force === true,
+    subreddit: typeof subreddit === 'string' && subreddit.trim() ? subreddit.trim() : undefined,
+  };
+
+  try {
+    if (target === 'all') {
+      const results = await syndicateApprovedCampaign(db, campaignId, options);
+      const failed = results.find(r => r.status === 'failed');
+      // Surface a partial failure rather than reporting a clean success.
+      return res.status(failed ? 502 : 200).json({ ok: !failed, results });
+    }
+    const result =
+      target === 'x'
+        ? await publishCampaignToX(db, campaignId, options)
+        : await publishCampaignToReddit(db, campaignId, options);
+    return res.json({ ok: true, ...result });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : 'Failed to publish';
+    console.error(`Social publish error (${target}):`, message);
+    return res.status(500).json({ error: message });
+  }
+});
+
+/**
+ * Create the Reddit ad for an approved campaign by hand.
+ *
+ * Approval does this automatically; this is the retry path, and the way to cover
+ * campaigns approved before the integration shipped. The ad is always created
+ * PAUSED — a human activates it in Reddit Ads Manager.
+ */
+app.post('/reddit-ads/publish', async (req: Request, res: Response) => {
+  const { campaignId, force } = req.body ?? {};
+  if (!campaignId || typeof campaignId !== 'string') {
+    return res.status(400).json({ error: 'campaignId is required' });
+  }
+  try {
+    const result = await createRedditAdCampaign(db, campaignId, { force: force === true });
+    return res.json({ ok: result.status !== 'failed', ...result });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : 'Failed to create Reddit ad';
+    console.error('Reddit ads publish error:', message);
+    return res.status(500).json({ error: message });
+  }
+});
+
+/** Read-only health check for the Reddit Ads connection. Creates nothing. */
+app.get('/reddit-ads/status', async (_req: Request, res: Response) => {
+  const result = await verifyRedditAdsConnection();
+  return res.status(result.ok ? 200 : 503).json(result);
+});
+
 app.get('/facebook/campaign/:campaignId/insights', async (req: Request, res: Response) => {
   const { campaignId } = req.params;
   const accessToken = process.env.FACEBOOK_ACCESS_TOKEN;
@@ -5027,13 +6890,33 @@ app.get('/facebook/campaign/:campaignId/insights', async (req: Request, res: Res
     }
 
     const { summary, rows } = await fetchFacebookAdInsights(facebookAdId, accessToken);
+    const audienceSize = await fetchAudienceSizeEstimateSafe(accessToken);
 
     // Persist latest metrics so GET /data/campaigns/:id and impact reports use real numbers.
     try {
-      await db.collection('campaigns').doc(campaignId).update(insightsToCampaignPatch(summary));
+      await db.collection('campaigns').doc(campaignId).update({
+        ...insightsToCampaignPatch(summary),
+        ...(audienceSize ? audienceSizeToCampaignPatch(audienceSize) : {}),
+      });
     } catch (persistErr) {
       console.error('Failed to persist Facebook insights to campaign:', persistErr);
     }
+
+    const storedLower = Number(data?.facebook_audience_size_lower_bound ?? 0);
+    const storedUpper = Number(data?.facebook_audience_size_upper_bound ?? 0);
+    const audienceSizePayload = audienceSize
+      ? {
+          lower_bound: audienceSize.lowerBound,
+          upper_bound: audienceSize.upperBound,
+          estimate_ready: audienceSize.estimateReady,
+        }
+      : storedLower > 0 && storedUpper > 0
+        ? {
+            lower_bound: storedLower,
+            upper_bound: storedUpper,
+            estimate_ready: data?.facebook_audience_size_estimate_ready !== false,
+          }
+        : null;
 
     return res.json({
       campaignId,
@@ -5056,6 +6939,7 @@ app.get('/facebook/campaign/:campaignId/insights', async (req: Request, res: Res
         total_actions: summary.totalActions,
         actions: summary.actions,
       },
+      audience_size: audienceSizePayload,
       rows,
     });
   } catch (error: any) {
@@ -5079,6 +6963,13 @@ app.post('/facebook/campaign/:campaignId/sync-insights', async (req: Request, re
       campaignId: result.campaignId,
       facebookAdId: result.facebookAdId,
       insights: insightsToCampaignPatch(result.summary),
+      audience_size: result.audienceSize
+        ? {
+            lower_bound: result.audienceSize.lowerBound,
+            upper_bound: result.audienceSize.upperBound,
+            estimate_ready: result.audienceSize.estimateReady,
+          }
+        : null,
       breakdowns: Object.fromEntries(
         Object.entries(result.breakdowns).map(([key, rows]) => [key, rows?.length ?? 0])
       ),
@@ -5260,7 +7151,8 @@ app.post('/api/job-applications', formSubmissionLimiter, async (req: Request, re
 
     try {
       await slack.chat.postMessage({
-        channel: process.env.SLACK_CHANNEL || 'moderation',
+        // Careers applications route to #query, independent of the shared moderation channel.
+        channel: process.env.SLACK_CAREERS_CHANNEL || process.env.SLACK_CHANNEL || 'moderation',
         text: `📋 New Job Application — ${data.roleId || 'General talent pool'}`,
         blocks: [
           { type: 'header', text: { type: 'plain_text', text: '📋 New Job Application' } },
@@ -5325,7 +7217,8 @@ app.post('/api/contact', formSubmissionLimiter, async (req: Request, res: Respon
 
     try {
       await slack.chat.postMessage({
-        channel: process.env.SLACK_CHANNEL || 'moderation',
+        // Contact Us messages route to #query, independent of the shared moderation channel.
+        channel: process.env.SLACK_CONTACT_CHANNEL || process.env.SLACK_CHANNEL || 'moderation',
         text: `✉️ New Contact Message — ${data.topic}`,
         blocks: [
           { type: 'header', text: { type: 'plain_text', text: '✉️ New Contact Message' } },
@@ -5364,7 +7257,21 @@ app.post('/api/contact', formSubmissionLimiter, async (req: Request, res: Respon
 });
 
 // Start server
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
 });
+
+async function shutdown(signal: string) {
+  console.log(`${signal} received — flushing Langfuse and closing server`);
+  try {
+    await forceFlushLangfuse();
+  } catch (err) {
+    console.warn('[Langfuse] flush on shutdown failed:', err);
+  }
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 10_000).unref();
+}
+
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));
 

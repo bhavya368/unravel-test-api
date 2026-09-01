@@ -32,6 +32,23 @@ export const META_IMPACT_BREAKDOWNS = ['age', 'gender', 'publisher_platform', 'd
 
 export type MetaImpactBreakdown = (typeof META_IMPACT_BREAKDOWNS)[number];
 
+/**
+ * Default Meta targeting used when publishing Unravel ads.
+ * Kept in sync with `publishFacebookAdForCampaign` in index.ts — used for
+ * Estimated Audience Size (`/reachestimate`) when an ad-set targeting fetch fails.
+ */
+export const DEFAULT_FACEBOOK_TARGETING = {
+  geo_locations: { countries: ['US'] },
+  publisher_platforms: ['facebook', 'audience_network'],
+  facebook_positions: ['feed'],
+} as const;
+
+export interface AudienceSizeEstimate {
+  lowerBound: number;
+  upperBound: number;
+  estimateReady: boolean;
+}
+
 export interface MetaActionRow {
   action_type: string;
   value: number;
@@ -185,6 +202,91 @@ export function insightsToCampaignPatch(summary: NormalizedFacebookInsights): Re
   };
 }
 
+/** Persist Meta Estimated Audience Size bounds (lower/upper) for saturation. */
+export function audienceSizeToCampaignPatch(estimate: AudienceSizeEstimate): Record<string, unknown> {
+  return {
+    facebook_audience_size_lower_bound: estimate.lowerBound,
+    facebook_audience_size_upper_bound: estimate.upperBound,
+    facebook_audience_size_estimate_ready: estimate.estimateReady,
+    facebook_audience_size_updated_at: new Date().toISOString(),
+  };
+}
+
+function insightPayloadData(row: unknown): Record<string, unknown> {
+  if (!row || typeof row !== 'object') return {};
+  const r = row as { _data?: Record<string, unknown>; data?: Record<string, unknown> };
+  if (r._data && typeof r._data === 'object') return r._data;
+  if (r.data && typeof r.data === 'object' && !Array.isArray(r.data)) return r.data;
+  return row as Record<string, unknown>;
+}
+
+function parseAudienceSizeEstimate(raw: unknown): AudienceSizeEstimate | null {
+  const data = insightPayloadData(raw);
+  const nested =
+    data.data && typeof data.data === 'object' && !Array.isArray(data.data)
+      ? (data.data as Record<string, unknown>)
+      : data;
+  const lower = toNumber(nested.users_lower_bound ?? nested.estimate_mau_lower_bound);
+  const upper = toNumber(nested.users_upper_bound ?? nested.estimate_mau_upper_bound);
+  // Meta returns -1 when the estimate is unavailable for the audience.
+  if (!(lower > 0) || !(upper > 0)) return null;
+  return {
+    lowerBound: Math.min(lower, upper),
+    upperBound: Math.max(lower, upper),
+    estimateReady: nested.estimate_ready !== false,
+  };
+}
+
+/**
+ * Meta Estimated Audience Size via Ad Account `/reachestimate`.
+ * Uses a direct Graph call — the business SDK Cursor expects `data` to be an
+ * array, but reachestimate returns a single object (`users_lower_bound` /
+ * `users_upper_bound`), which crashes with `response.data.map is not a function`.
+ */
+export async function fetchAudienceSizeEstimate(
+  accessToken: string,
+  targetingSpec: Record<string, unknown> = DEFAULT_FACEBOOK_TARGETING as unknown as Record<
+    string,
+    unknown
+  >
+): Promise<AudienceSizeEstimate | null> {
+  const adAccountId = process.env.FACEBOOK_AD_ACCOUNT_ID?.trim();
+  if (!adAccountId) {
+    throw new Error('Facebook is not configured (FACEBOOK_AD_ACCOUNT_ID)');
+  }
+
+  const accountPath = adAccountId.startsWith('act_') ? adAccountId : `act_${adAccountId}`;
+  const params = new URLSearchParams({
+    targeting_spec: JSON.stringify(targetingSpec),
+    access_token: accessToken,
+  });
+  const url = `https://graph.facebook.com/v21.0/${accountPath}/reachestimate?${params.toString()}`;
+  const res = await fetch(url);
+  const json = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+  if (!res.ok) {
+    const errObj = json?.error as { message?: string } | undefined;
+    throw new Error(errObj?.message || `Meta reachestimate failed (${res.status})`);
+  }
+
+  return parseAudienceSizeEstimate(json);
+}
+
+/** Best-effort audience size fetch — never throws. */
+export async function fetchAudienceSizeEstimateSafe(
+  accessToken: string,
+  targetingSpec?: Record<string, unknown>
+): Promise<AudienceSizeEstimate | null> {
+  try {
+    return await fetchAudienceSizeEstimate(accessToken, targetingSpec);
+  } catch (err) {
+    console.warn(
+      'Facebook audience size estimate failed:',
+      err instanceof Error ? err.message : err
+    );
+    return null;
+  }
+}
+
 function normalizeBreakdownRow(
   row: unknown,
   breakdownKey: MetaImpactBreakdown
@@ -246,9 +348,14 @@ export async function persistCampaignFacebookInsights(
   db: Firestore,
   campaignId: string,
   summary: NormalizedFacebookInsights,
-  breakdowns?: Partial<Record<MetaImpactBreakdown, FacebookInsightsBreakdownRow[]>>
+  breakdowns?: Partial<Record<MetaImpactBreakdown, FacebookInsightsBreakdownRow[]>>,
+  audienceSize?: AudienceSizeEstimate | null
 ): Promise<void> {
-  await db.collection('campaigns').doc(campaignId).update(insightsToCampaignPatch(summary));
+  const patch: Record<string, unknown> = {
+    ...insightsToCampaignPatch(summary),
+    ...(audienceSize ? audienceSizeToCampaignPatch(audienceSize) : {}),
+  };
+  await db.collection('campaigns').doc(campaignId).update(patch);
 
   if (!breakdowns) return;
   const batch = db.batch();
@@ -270,12 +377,13 @@ export interface SyncCampaignFacebookInsightsResult {
   facebookAdId: string;
   summary: NormalizedFacebookInsights;
   breakdowns: Partial<Record<MetaImpactBreakdown, FacebookInsightsBreakdownRow[]>>;
+  audienceSize: AudienceSizeEstimate | null;
 }
 
 export async function syncCampaignFacebookInsights(
   db: Firestore,
   campaignId: string,
-  options: { includeBreakdowns?: boolean } = {}
+  options: { includeBreakdowns?: boolean; includeAudienceSize?: boolean } = {}
 ): Promise<SyncCampaignFacebookInsightsResult> {
   const accessToken = process.env.FACEBOOK_ACCESS_TOKEN?.trim();
   if (!accessToken) {
@@ -312,8 +420,13 @@ export async function syncCampaignFacebookInsights(
     }
   }
 
-  await persistCampaignFacebookInsights(db, campaignId, summary, breakdowns);
-  return { campaignId, facebookAdId, summary, breakdowns };
+  const audienceSize =
+    options.includeAudienceSize === false
+      ? null
+      : await fetchAudienceSizeEstimateSafe(accessToken);
+
+  await persistCampaignFacebookInsights(db, campaignId, summary, breakdowns, audienceSize);
+  return { campaignId, facebookAdId, summary, breakdowns, audienceSize };
 }
 
 export async function syncAllPublishedCampaignFacebookInsights(
