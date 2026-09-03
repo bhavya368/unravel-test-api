@@ -116,6 +116,7 @@ import {
   recordShareLinkVisit,
   sanitizeShareRef,
 } from './shareAttribution';
+import { generateCampaignVisual, VISUAL_SPECS, type VisualKind } from './campaignVisualGenerator';
 import {
   validatePartnerApplication,
   validateJobApplication,
@@ -4483,6 +4484,24 @@ app.post('/data/:collection', async (req: Request, res: Response) => {
         data.funding_goal = 0;
       }
 
+      // Ad platforms. Only integrations that actually exist may be stored — the wizard lists the
+      // others as "coming soon", and a client sending one anyway must not leave a campaign
+      // queued for a network nothing can publish to. Defaults to Reddit, the only one wired up.
+      const SUPPORTED_AD_PLATFORMS = ['reddit'];
+      if (data.ad_platforms !== undefined) {
+        const requested = Array.isArray(data.ad_platforms) ? data.ad_platforms.map(String) : [];
+        const unsupported = requested.filter((k: string) => !SUPPORTED_AD_PLATFORMS.includes(k));
+        if (unsupported.length) {
+          return res.status(400).json({
+            error: `These ad platforms are not available yet: ${unsupported.join(', ')}`,
+          });
+        }
+        data.ad_platforms = requested;
+      }
+      if (!Array.isArray(data.ad_platforms) || data.ad_platforms.length === 0) {
+        data.ad_platforms = ['reddit'];
+      }
+
       // Funding window (14/30/45/60 days) reuses the same validator the admin approval
       // PATCH path already relies on (applyCampaignDurationPatch) — see UE-223 plan.
       if (data.duration_days !== undefined) {
@@ -5054,7 +5073,10 @@ app.post('/upload-campaign-image', async (req: Request, res: Response) => {
   } catch (error: unknown) {
     const err = error as { message?: string };
     console.error('upload-campaign-image:', err?.message ?? error);
-    res.status(500).json({ error: err?.message || 'Upload failed' });
+    // Storage and auth failures arrive as raw provider JSON ({"error":"invalid_grant",...} with
+    // internal support URLs). That belongs in the log, not in front of a creator — and not on the
+    // wire either. The client gets a stable message it can show as-is.
+    res.status(500).json({ error: 'Could not upload that image. Please try again in a moment.' });
   }
 });
 
@@ -5171,6 +5193,71 @@ app.post('/generate-campaign-summary', async (req: Request, res: Response) => {
     const err = error as { message?: string; code?: number };
     console.error('POST /generate-campaign-summary:', err?.message ?? error, err?.code);
     res.status(500).json({ error: 'Failed to generate campaign summary', detail: err?.message ?? String(error) });
+  }
+});
+
+
+/** Image generation is the most expensive call on the platform and it is one click for the
+ *  creator, so the limit is tighter than the text generators'. */
+const campaignVisualLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 12,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many images requested from this device. Please try again in a few minutes.' },
+});
+
+// POST - Generate one campaign visual (cover, hero slide, or ad creative) plus the copy that sits
+// beside it, upload it to GCS, and return the URL. Auth required: images cost money per call.
+app.post('/generate-campaign-visual', campaignVisualLimiter, async (req: Request, res: Response) => {
+  const uid = await requireFirebaseUid(req, res);
+  if (!uid) return;
+  try {
+    const { kind, context } = req.body as { kind?: string; context?: Record<string, unknown> };
+    if (!kind || !(kind in VISUAL_SPECS)) {
+      return res.status(400).json({ error: `kind must be one of: ${Object.keys(VISUAL_SPECS).join(', ')}` });
+    }
+
+    const visual = await generateCampaignVisual(kind as VisualKind, {
+      title: String(context?.title ?? ''),
+      category: String(context?.category ?? ''),
+      shortDescription: String(context?.shortDescription ?? ''),
+      longDescription: String(context?.longDescription ?? ''),
+      targetAudience: String(context?.targetAudience ?? ''),
+      existingSlideCaptions: Array.isArray(context?.existingSlideCaptions)
+        ? (context!.existingSlideCaptions as unknown[]).map(String)
+        : [],
+      adHeadline: String(context?.adHeadline ?? ''),
+      adPrimaryText: String(context?.adPrimaryText ?? ''),
+    });
+
+    // Straight into the same bucket every manual upload goes to, so the rest of the pipeline
+    // cannot tell a generated image from an uploaded one.
+    const bucketName = process.env.GCS_BUCKET || 'unravel-generated-images';
+    const base64 = visual.imageBase64.replace(/^data:[^;]+;base64,/, '');
+    const buffer = Buffer.from(base64, 'base64');
+    const fileName = `generated-${kind}-${Date.now()}-${Math.random().toString(36).substring(2, 9)}.jpg`;
+    await storage.bucket(bucketName).file(fileName).save(buffer, {
+      metadata: { contentType: 'image/jpeg' },
+    });
+    const baseUrl = process.env.API_BASE_URL || `${req.protocol}://${req.get('host')}`;
+
+    res.json({
+      imageUrl: `${baseUrl}/images/${fileName}`,
+      fileName,
+      caption: visual.caption ?? '',
+      adHeadline: visual.adHeadline ?? '',
+      adPrimaryText: visual.adPrimaryText ?? '',
+      prompt: visual.prompt,
+      size: VISUAL_SPECS[kind as VisualKind],
+    });
+  } catch (error: unknown) {
+    const err = error as { message?: string; status?: number };
+    console.error('POST /generate-campaign-visual:', err?.message ?? error);
+    // These messages are written to be shown as-is; the provider's own text never reaches here.
+    res.status(err?.status && err.status < 600 ? err.status : 500).json({
+      error: err?.message || 'Could not generate that image. Please try again.',
+    });
   }
 });
 
